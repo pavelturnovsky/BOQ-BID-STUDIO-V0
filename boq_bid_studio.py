@@ -10,8 +10,8 @@ import plotly.express as px
 import streamlit as st
 
 # ------------- App Config -------------
-st.set_page_config(page_title="BoQ Bid Studio", layout="wide")
-st.title("🏗️ BoQ Bid Studio")
+st.set_page_config(page_title="BoQ Bid Studio V.01", layout="wide")
+st.title("🏗️ BoQ Bid Studio V.01")
 st.caption("Jedna aplikace pro nahrání, mapování, porovnání nabídek a vizualizace — bez exportů do Excelu.")
 
 # ------------- Helpers -------------
