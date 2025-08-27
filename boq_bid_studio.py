@@ -127,6 +127,8 @@ def mapping_ui(section_title: str, wb: WorkbookData) -> None:
                 header_names = obj.get("header_names", [])
             # Select boxes for mapping
             cols = list(range(len(header_names)))
+            if not cols:
+                cols = [0]
             def pick_default(key):
                 # try to find a column by heuristics
                 hints = HEADER_HINTS.get(key, [])
@@ -136,17 +138,51 @@ def mapping_ui(section_title: str, wb: WorkbookData) -> None:
                 # fallback to existing mapping
                 return mapping.get(key, 0)
 
+            def clamp(idx: int) -> int:
+                """Ensure index is within available column range."""
+                return max(0, min(idx, len(cols) - 1))
+
             c1, c2, c3, c4, c5 = st.columns(5)
             with c1:
-                code_idx = st.selectbox("Sloupec: code", cols, format_func=lambda i: header_names[i] if i < len(header_names) else "", index=pick_default("code"), key=f"map_code_{section_title}_{sheet}")
+                code_idx = st.selectbox(
+                    "Sloupec: code",
+                    cols,
+                    format_func=lambda i: header_names[i] if i < len(header_names) else "",
+                    index=clamp(pick_default("code")),
+                    key=f"map_code_{section_title}_{sheet}",
+                )
             with c2:
-                desc_idx = st.selectbox("Sloupec: description", cols, format_func=lambda i: header_names[i] if i < len(header_names) else "", index=pick_default("description"), key=f"map_desc_{section_title}_{sheet}")
+                desc_idx = st.selectbox(
+                    "Sloupec: description",
+                    cols,
+                    format_func=lambda i: header_names[i] if i < len(header_names) else "",
+                    index=clamp(pick_default("description")),
+                    key=f"map_desc_{section_title}_{sheet}",
+                )
             with c3:
-                unit_idx = st.selectbox("Sloupec: unit", cols, format_func=lambda i: header_names[i] if i < len(header_names) else "", index=min(pick_default("unit"), len(cols)-1) if cols else 0, key=f"map_unit_{section_title}_{sheet}")
+                unit_idx = st.selectbox(
+                    "Sloupec: unit",
+                    cols,
+                    format_func=lambda i: header_names[i] if i < len(header_names) else "",
+                    index=clamp(pick_default("unit")),
+                    key=f"map_unit_{section_title}_{sheet}",
+                )
             with c4:
-                qty_idx = st.selectbox("Sloupec: quantity", cols, format_func=lambda i: header_names[i] if i < len(header_names) else "", index=pick_default("quantity"), key=f"map_qty_{section_title}_{sheet}")
+                qty_idx = st.selectbox(
+                    "Sloupec: quantity",
+                    cols,
+                    format_func=lambda i: header_names[i] if i < len(header_names) else "",
+                    index=clamp(pick_default("quantity")),
+                    key=f"map_qty_{section_title}_{sheet}",
+                )
             with c5:
-                up_idx = st.selectbox("Sloupec: unit_price", cols, format_func=lambda i: header_names[i] if i < len(header_names) else "", index=min(pick_default("unit_price"), len(cols)-1) if cols else 0, key=f"map_up_{section_title}_{sheet}")
+                up_idx = st.selectbox(
+                    "Sloupec: unit_price",
+                    cols,
+                    format_func=lambda i: header_names[i] if i < len(header_names) else "",
+                    index=clamp(pick_default("unit_price")),
+                    key=f"map_up_{section_title}_{sheet}",
+                )
 
             # Rebuild normalized table with UI mapping
             ui_mapping = {"code": code_idx, "description": desc_idx, "unit": unit_idx, "quantity": qty_idx, "unit_price": up_idx}
