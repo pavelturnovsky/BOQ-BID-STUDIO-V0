@@ -10,8 +10,8 @@ import plotly.express as px
 import streamlit as st
 
 # ------------- App Config -------------
-st.set_page_config(page_title="BoQ Bid Studio V.01", layout="wide")
-st.title("🏗️ BoQ Bid Studio V.01")
+st.set_page_config(page_title="BoQ Bid Studio V.02", layout="wide")
+st.title("🏗️ BoQ Bid Studio V.02")
 st.caption("Jedna aplikace pro nahrání, mapování, porovnání nabídek a vizualizace — bez exportů do Excelu.")
 
 # ------------- Helpers -------------
@@ -23,10 +23,17 @@ HEADER_HINTS = {
     "quantity": ["quantity", "qty", "množství", "mnozstvi", "q"],
     "unit_price": ["unit price", "u.p.", "cena/jedn", "cena za jednotku", "jedn. cena", "unitprice", "rate", "sazba", "jednotková cena", "jednotkova cena"],
     # optional extras commonly seen
-    "item_id": ["item id", "itemid", "id položky", "id polozky", "kod", "kód", "číslo položky", "cislo polozky"]
+    "item_id": ["item id", "itemid", "id položky", "id polozky", "kod", "kód", "číslo položky", "cislo polozky"],
+    # extended optional columns for richer comparisons
+    "quantity_supplier": ["množství dodavatel", "mnozstvi dodavatel", "qty supplier", "quantity supplier"],
+    "unit_price_material": ["cena materiál", "cena material", "unit price material", "materiál", "material"],
+    "unit_price_install": ["cena montáž", "cena montaz", "unit price install", "montáž", "montaz"],
+    "total_price": ["cena celkem", "celková cena", "total price", "celkem"],
+    "section_total": ["celkem za oddíl", "section total", "součet za oddíl", "souhrn oddíl"]
 }
 
-REQUIRED_KEYS = ["code", "description", "quantity"]  # unit & unit_price can be optional at parse time
+# For některé souhrnné listy nemusí být množství dostupné
+REQUIRED_KEYS = ["code", "description"]  # unit & quantity & unit_price can be optional at parse time
 
 def normalize_col(c):
     if not isinstance(c, str):
@@ -71,7 +78,12 @@ def build_normalized_table(df: pd.DataFrame, mapping: Dict[str, int]) -> pd.Data
         "description": pick("description", ""),
         "unit": pick("unit", ""),
         "quantity": coerce_numeric(pick("quantity", 0)).fillna(0.0),
+        "quantity_supplier": coerce_numeric(pick("quantity_supplier", np.nan)),
+        "unit_price_material": coerce_numeric(pick("unit_price_material", np.nan)),
+        "unit_price_install": coerce_numeric(pick("unit_price_install", np.nan)),
         "unit_price": coerce_numeric(pick("unit_price", np.nan)),
+        "total_price": coerce_numeric(pick("total_price", np.nan)),
+        "section_total": coerce_numeric(pick("section_total", np.nan)),
     })
     # filter empty row heuristics
     mask = (out["code"].astype(str).str.strip() != "") | (out["description"].astype(str).str.strip() != "")
@@ -183,9 +195,61 @@ def mapping_ui(section_title: str, wb: WorkbookData) -> None:
                     index=clamp(pick_default("unit_price")),
                     key=f"map_up_{section_title}_{sheet}",
                 )
+            c6, c7, c8, c9, c10 = st.columns(5)
+            with c6:
+                qty_sup_idx = st.selectbox(
+                    "Sloupec: quantity_supplier",
+                    cols,
+                    format_func=lambda i: header_names[i] if i < len(header_names) else "",
+                    index=clamp(pick_default("quantity_supplier")),
+                    key=f"map_qtysup_{section_title}_{sheet}",
+                )
+            with c7:
+                upm_idx = st.selectbox(
+                    "Sloupec: unit_price_material",
+                    cols,
+                    format_func=lambda i: header_names[i] if i < len(header_names) else "",
+                    index=clamp(pick_default("unit_price_material")),
+                    key=f"map_upm_{section_title}_{sheet}",
+                )
+            with c8:
+                upi_idx = st.selectbox(
+                    "Sloupec: unit_price_install",
+                    cols,
+                    format_func=lambda i: header_names[i] if i < len(header_names) else "",
+                    index=clamp(pick_default("unit_price_install")),
+                    key=f"map_upi_{section_title}_{sheet}",
+                )
+            with c9:
+                total_idx = st.selectbox(
+                    "Sloupec: total_price",
+                    cols,
+                    format_func=lambda i: header_names[i] if i < len(header_names) else "",
+                    index=clamp(pick_default("total_price")),
+                    key=f"map_total_{section_title}_{sheet}",
+                )
+            with c10:
+                section_idx = st.selectbox(
+                    "Sloupec: section_total",
+                    cols,
+                    format_func=lambda i: header_names[i] if i < len(header_names) else "",
+                    index=clamp(pick_default("section_total")),
+                    key=f"map_section_{section_title}_{sheet}",
+                )
 
             # Rebuild normalized table with UI mapping
-            ui_mapping = {"code": code_idx, "description": desc_idx, "unit": unit_idx, "quantity": qty_idx, "unit_price": up_idx}
+            ui_mapping = {
+                "code": code_idx,
+                "description": desc_idx,
+                "unit": unit_idx,
+                "quantity": qty_idx,
+                "unit_price": up_idx,
+                "quantity_supplier": qty_sup_idx,
+                "unit_price_material": upm_idx,
+                "unit_price_install": upi_idx,
+                "total_price": total_idx,
+                "section_total": section_idx,
+            }
             if isinstance(raw, pd.DataFrame):
                 body = raw.iloc[header_row+1:].reset_index(drop=True)
                 body.columns = [normalize_col(x) for x in raw.iloc[header_row].tolist()]
@@ -211,7 +275,7 @@ def compare(master: WorkbookData, bids: Dict[str, WorkbookData], join_mode: str 
         mtab = mobj.get("table", pd.DataFrame())
         if mtab is None or mtab.empty:
             continue
-        base = mtab[["__key__", "code", "description", "unit", "quantity"]].copy()
+        base = mtab[["__key__", "code", "description", "unit", "quantity", "total_price"]].copy()
         base = base.drop_duplicates("__key__")
         comp = base.copy()
 
@@ -219,15 +283,24 @@ def compare(master: WorkbookData, bids: Dict[str, WorkbookData], join_mode: str 
             tobj = wb.sheets.get(sheet, {})
             ttab = tobj.get("table", pd.DataFrame())
             if ttab is None or ttab.empty:
+                comp[f"{sup_name} quantity"] = np.nan
                 comp[f"{sup_name} unit_price"] = np.nan
                 comp[f"{sup_name} total"] = np.nan
                 continue
-            # join by __key__ (we keep auto mode for now; Item ID support can be added when present in normalized table)
-            tt = ttab[["__key__", "unit_price"]].copy()
-            tt = tt.groupby("__key__", as_index=False)["unit_price"].mean()
-            comp = comp.merge(tt, on="__key__", how="left")
-            comp.rename(columns={"unit_price": f"{sup_name} unit_price"}, inplace=True)
-            comp[f"{sup_name} total"] = comp["quantity"] * comp[f"{sup_name} unit_price"]
+            # join by __key__ (manual mapping already built in normalized table)
+            sup_qty_col = "quantity_supplier" if "quantity_supplier" in ttab.columns else "quantity"
+            tt = ttab[["__key__", sup_qty_col, "unit_price_material", "unit_price_install", "unit_price", "total_price"]].copy()
+            tt["unit_price_combined"] = tt[["unit_price_material", "unit_price_install", "unit_price"]].sum(axis=1, min_count=1)
+            tt["calc_total"] = tt["total_price"]
+            mask = tt["calc_total"].isna()
+            tt.loc[mask, "calc_total"] = tt.loc[mask, sup_qty_col] * tt.loc[mask, "unit_price_combined"]
+            comp = comp.merge(tt[["__key__", sup_qty_col, "unit_price_combined", "calc_total"]], on="__key__", how="left")
+            comp.rename(columns={
+                sup_qty_col: f"{sup_name} quantity",
+                "unit_price_combined": f"{sup_name} unit_price",
+                "calc_total": f"{sup_name} total",
+            }, inplace=True)
+            comp[f"{sup_name} Δ qty"] = comp[f"{sup_name} quantity"] - comp["quantity"]
 
         total_cols = [c for c in comp.columns if c.endswith(" total")]
         if total_cols:
@@ -259,6 +332,27 @@ def summarize(results: Dict[str, pd.DataFrame]) -> pd.DataFrame:
         rows.append(row)
     out = pd.DataFrame(rows)
     return out
+
+
+def summarize_special(results: Dict[str, pd.DataFrame]) -> pd.DataFrame:
+    sheet_name = "Přehled_dílčí kapitoly"
+    if sheet_name not in results:
+        return pd.DataFrame()
+    df = results[sheet_name]
+    categories = {
+        "vedlejší rozpočtové náklady": "Vedlejší rozpočtové náklady",
+        "chybějící položky dle dodavatele": "Chybějící položky dle dodavatele",
+    }
+    rows = []
+    for pattern, label in categories.items():
+        row = {"category": label}
+        for col in df.columns:
+            if col.endswith(" total"):
+                supplier = col.replace(" total", "")
+                mask = df["description"].str.contains(pattern, case=False, na=False)
+                row[supplier] = df.loc[mask, col].sum(skipna=True)
+        rows.append(row)
+    return pd.DataFrame(rows)
 
 def qa_checks(master: WorkbookData, bids: Dict[str, WorkbookData]) -> Dict[str, Dict[str, pd.DataFrame]]:
     """ Return {sheet: {"missing": df, "extras": df, "duplicates": df}} """
@@ -366,6 +460,11 @@ with tab_compare:
         if not summary_df.empty:
             st.markdown("### 📌 Souhrn po listech")
             st.dataframe(summary_df)
+
+            special_df = summarize_special(results)
+            if not special_df.empty:
+                st.markdown("### 🧮 Speciální souhrny")
+                st.dataframe(special_df)
 
             # grand totals per supplier
             supplier_totals = {}
