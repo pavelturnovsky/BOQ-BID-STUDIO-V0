@@ -118,6 +118,30 @@ def read_workbook(upload, limit_sheets: Optional[List[str]] = None) -> WorkbookD
             wb.sheets[s] = {"raw": None, "mapping": {}, "header_row": -1, "table": pd.DataFrame(), "error": str(e), "header_names": []}
     return wb
 
+def apply_master_mapping(master: WorkbookData, target: WorkbookData) -> None:
+    """Copy mapping and header row from master workbook into target workbook."""
+    for sheet, mobj in master.sheets.items():
+        if sheet not in target.sheets:
+            continue
+        raw = target.sheets[sheet].get("raw")
+        mapping = mobj.get("mapping", {})
+        header_row = mobj.get("header_row", -1)
+        if not isinstance(raw, pd.DataFrame) or not mapping or header_row < 0:
+            continue
+        try:
+            header = [normalize_col(x) for x in raw.iloc[header_row].astype(str).tolist()]
+            body = raw.iloc[header_row+1:].reset_index(drop=True)
+            body.columns = header
+            table = build_normalized_table(body, mapping)
+            target.sheets[sheet].update({
+                "mapping": mapping,
+                "header_row": header_row,
+                "table": table,
+                "header_names": header,
+            })
+        except Exception:
+            continue
+
 def mapping_ui(section_title: str, wb: WorkbookData) -> None:
     st.subheader(section_title)
     tabs = st.tabs(list(wb.sheets.keys()))
@@ -333,26 +357,20 @@ def summarize(results: Dict[str, pd.DataFrame]) -> pd.DataFrame:
     out = pd.DataFrame(rows)
     return out
 
-
-def summarize_special(results: Dict[str, pd.DataFrame]) -> pd.DataFrame:
-    sheet_name = "Přehled_dílčí kapitoly"
+def overview_comparison(results: Dict[str, pd.DataFrame], sheet_name: str) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Return tables for section totals, indirect costs and supplier added costs."""
     if sheet_name not in results:
-        return pd.DataFrame()
-    df = results[sheet_name]
-    categories = {
-        "vedlejší rozpočtové náklady": "Vedlejší rozpočtové náklady",
-        "chybějící položky dle dodavatele": "Chybějící položky dle dodavatele",
-    }
-    rows = []
-    for pattern, label in categories.items():
-        row = {"category": label}
-        for col in df.columns:
-            if col.endswith(" total"):
-                supplier = col.replace(" total", "")
-                mask = df["description"].str.contains(pattern, case=False, na=False)
-                row[supplier] = df.loc[mask, col].sum(skipna=True)
-        rows.append(row)
-    return pd.DataFrame(rows)
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+    df = results[sheet_name].copy()
+    df.rename(columns={"total_price": "Master total"}, inplace=True)
+    total_cols = [c for c in df.columns if c.endswith(" total") or c == "Master total"]
+    view = df[["description"] + total_cols].copy()
+    indirect_mask = view["description"].str.contains("vedlejší", case=False, na=False)
+    added_mask = view["description"].str.contains("dodavat", case=False, na=False)
+    sections_df = view[~(indirect_mask | added_mask)]
+    indirect_df = view[indirect_mask]
+    added_df = view[added_mask]
+    return sections_df, indirect_df, added_df
 
 def qa_checks(master: WorkbookData, bids: Dict[str, WorkbookData]) -> Dict[str, Dict[str, pd.DataFrame]]:
     """ Return {sheet: {"missing": df, "extras": df, "duplicates": df}} """
@@ -401,6 +419,10 @@ master_wb = read_workbook(master_file)
 all_sheets = list(master_wb.sheets.keys())
 selected_sheets = st.sidebar.multiselect("Které listy zahrnout", all_sheets, default=all_sheets)
 
+# Sheet used for overview comparison
+default_overview = "Přehled_dílčí kapitoly" if "Přehled_dílčí kapitoly" in selected_sheets else (selected_sheets[0] if selected_sheets else "")
+overview_sheet = st.sidebar.selectbox("List pro sumarizační porovnání", selected_sheets, index=selected_sheets.index(default_overview) if default_overview in selected_sheets else 0)
+
 # Filter master to selected sheets
 master_wb.sheets = {s: master_wb.sheets[s] for s in selected_sheets}
 
@@ -413,10 +435,11 @@ if bid_files:
     for i, f in enumerate(bid_files, start=1):
         name = getattr(f, "name", f"Bid{i}")
         wb = read_workbook(f, limit_sheets=selected_sheets)
+        apply_master_mapping(master_wb, wb)
         bids_dict[name] = wb
 
 # ------------- Tabs -------------
-tab_data, tab_compare, tab_dashboard, tab_qa = st.tabs(["📑 Mapování", "⚖️ Porovnání", "📈 Dashboard", "🧪 QA kontroly"])
+tab_data, tab_compare, tab_overview, tab_dashboard, tab_qa = st.tabs(["📑 Mapování", "⚖️ Porovnání", "📊 Přehled", "📈 Dashboard", "🧪 QA kontroly"])
 
 with tab_data:
     mapping_ui("Master", master_wb)
@@ -460,12 +483,6 @@ with tab_compare:
         if not summary_df.empty:
             st.markdown("### 📌 Souhrn po listech")
             st.dataframe(summary_df)
-
-            special_df = summarize_special(results)
-            if not special_df.empty:
-                st.markdown("### 🧮 Speciální souhrny")
-                st.dataframe(special_df)
-
             # grand totals per supplier
             supplier_totals = {}
             for col in summary_df.columns:
@@ -486,6 +503,26 @@ with tab_compare:
                     st.plotly_chart(fig, use_container_width=True)
                 except Exception:
                     pass
+
+with tab_overview:
+    if not bids_dict:
+        st.info("Nahraj alespoň jednu nabídku dodavatele v levém panelu.")
+    else:
+        results = compare(master_wb, bids_dict, join_mode="auto")
+        sections_df, indirect_df, added_df = overview_comparison(results, overview_sheet)
+        if sections_df.empty and indirect_df.empty and added_df.empty:
+            st.info(f"List '{overview_sheet}' neobsahuje data pro porovnání.")
+        else:
+            st.subheader(f"Souhrnný list: {overview_sheet}")
+            if not sections_df.empty:
+                st.markdown("### Celkové ceny oddílů")
+                st.dataframe(sections_df)
+            if not indirect_df.empty:
+                st.markdown("### Vedlejší rozpočtové náklady")
+                st.dataframe(indirect_df)
+            if not added_df.empty:
+                st.markdown("### Náklady přidané dodavatelem")
+                st.dataframe(added_df)
 
 with tab_dashboard:
     if not bids_dict:
