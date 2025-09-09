@@ -92,15 +92,18 @@ def build_normalized_table(df: pd.DataFrame, mapping: Dict[str, int]) -> pd.Data
 
     # filter out summary rows to avoid double counting
     summary_patterns = r"(celkem za odd[ií]l|sou[cč]et za odd[ií]l|celkov[aá] cena za list|sou[cč]et za list)"
-    summary_mask = out["description"].str.contains(summary_patterns, case=False, na=False) & (
+    # ensure non-string descriptions do not break .str operations
+    desc_str = out["description"].fillna("").astype(str)
+    out["description"] = desc_str
+    summary_mask = desc_str.str.contains(summary_patterns, case=False) & (
         out["code"].astype(str).str.strip() == ""
     )
 
     # filter empty row heuristics
-    mask = ((out["code"].astype(str).str.strip() != "") | (out["description"].astype(str).str.strip() != "")) & (~summary_mask)
+    mask = ((out["code"].astype(str).str.strip() != "") | (desc_str.str.strip() != "")) & (~summary_mask)
     out = out[mask].copy()
     # canonical key (will be overridden if user picks dedicated Item ID)
-    out["__key__"] = out["code"].astype(str).str.strip() + " | " + out["description"].astype(str).str.strip()
+    out["__key__"] = out["code"].astype(str).str.strip() + " | " + desc_str.str.strip()
     return out
 
 
