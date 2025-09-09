@@ -10,8 +10,8 @@ import plotly.express as px
 import streamlit as st
 
 # ------------- App Config -------------
-st.set_page_config(page_title="BoQ Bid Studio V.02", layout="wide")
-st.title("🏗️ BoQ Bid Studio V.02")
+st.set_page_config(page_title="BoQ Bid Studio V.03", layout="wide")
+st.title("🏗️ BoQ Bid Studio V.03")
 st.caption("Jedna aplikace pro nahrání, mapování, porovnání nabídek a vizualizace — bez exportů do Excelu.")
 
 # ------------- Helpers -------------
@@ -85,12 +85,40 @@ def build_normalized_table(df: pd.DataFrame, mapping: Dict[str, int]) -> pd.Data
         "total_price": coerce_numeric(pick("total_price", np.nan)),
         "section_total": coerce_numeric(pick("section_total", np.nan)),
     })
+    # use section totals as fallback for total_price
+    out["total_price"] = out["total_price"].fillna(out["section_total"])
+    if "section_total" in out.columns:
+        out.drop(columns=["section_total"], inplace=True)
+
+    # filter out summary rows to avoid double counting
+    summary_patterns = r"(celkem za odd[ií]l|sou[cč]et za odd[ií]l|celkov[aá] cena za list|sou[cč]et za list)"
+    summary_mask = out["description"].str.contains(summary_patterns, case=False, na=False) & (
+        out["code"].astype(str).str.strip() == ""
+    )
+
     # filter empty row heuristics
-    mask = (out["code"].astype(str).str.strip() != "") | (out["description"].astype(str).str.strip() != "")
+    mask = ((out["code"].astype(str).str.strip() != "") | (out["description"].astype(str).str.strip() != "")) & (~summary_mask)
     out = out[mask].copy()
     # canonical key (will be overridden if user picks dedicated Item ID)
     out["__key__"] = out["code"].astype(str).str.strip() + " | " + out["description"].astype(str).str.strip()
     return out
+
+
+def format_number(x):
+    if pd.isna(x):
+        return ""
+    return f"{x:,.2f}".replace(",", " ").replace(".", ",")
+
+
+def show_df(df: pd.DataFrame) -> None:
+    if not isinstance(df, pd.DataFrame):
+        st.dataframe(df)
+        return
+    numeric_cols = df.select_dtypes(include=[np.number]).columns
+    if len(numeric_cols) == 0:
+        st.dataframe(df)
+    else:
+        st.dataframe(df.style.format({col: format_number for col in numeric_cols}))
 
 @dataclass
 class WorkbookData:
@@ -153,7 +181,7 @@ def mapping_ui(section_title: str, wb: WorkbookData) -> None:
             mapping = obj.get("mapping", {}).copy()
             hdr_preview = raw.head(10) if isinstance(raw, pd.DataFrame) else None
             if hdr_preview is not None:
-                st.dataframe(hdr_preview)
+                show_df(hdr_preview)
             # Header row selector
             header_row = st.number_input(f"Řádek s hlavičkou (0 = první řádek) — {sheet}", min_value=0, max_value=9, value=header_row if header_row >= 0 else 0, step=1, key=f"hdr_{section_title}_{sheet}")
             # Build header names for the selected row
@@ -286,7 +314,7 @@ def mapping_ui(section_title: str, wb: WorkbookData) -> None:
             wb.sheets[sheet]["table"] = table
 
             st.markdown("**Normalizovaná tabulka (náhled):**")
-            st.dataframe(table.head(50))
+            show_df(table.head(50))
 
 def compare(master: WorkbookData, bids: Dict[str, WorkbookData], join_mode: str = "auto") -> Dict[str, pd.DataFrame]:
     """
@@ -301,6 +329,7 @@ def compare(master: WorkbookData, bids: Dict[str, WorkbookData], join_mode: str 
             continue
         base = mtab[["__key__", "code", "description", "unit", "quantity", "total_price"]].copy()
         base = base.drop_duplicates("__key__")
+        base.rename(columns={"total_price": "Master total"}, inplace=True)
         comp = base.copy()
 
         for sup_name, wb in bids.items():
@@ -326,7 +355,7 @@ def compare(master: WorkbookData, bids: Dict[str, WorkbookData], join_mode: str 
             }, inplace=True)
             comp[f"{sup_name} Δ qty"] = comp[f"{sup_name} quantity"] - comp["quantity"]
 
-        total_cols = [c for c in comp.columns if c.endswith(" total")]
+        total_cols = [c for c in comp.columns if c.endswith(" total") and c != "Master total"]
         if total_cols:
             comp["LOWEST total"] = comp[total_cols].min(axis=1, skipna=True)
             for c in total_cols:
@@ -362,8 +391,9 @@ def overview_comparison(results: Dict[str, pd.DataFrame], sheet_name: str) -> Tu
     if sheet_name not in results:
         return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
     df = results[sheet_name].copy()
-    df.rename(columns={"total_price": "Master total"}, inplace=True)
-    total_cols = [c for c in df.columns if c.endswith(" total") or c == "Master total"]
+    if "total_price" in df.columns:
+        df.rename(columns={"total_price": "Master total"}, inplace=True)
+    total_cols = [c for c in df.columns if c.endswith(" total")]
     view = df[["description"] + total_cols].copy()
     indirect_mask = view["description"].str.contains("vedlejší", case=False, na=False)
     added_mask = view["description"].str.contains("dodavat", case=False, na=False)
@@ -439,7 +469,14 @@ if bid_files:
         bids_dict[name] = wb
 
 # ------------- Tabs -------------
-tab_data, tab_compare, tab_overview, tab_dashboard, tab_qa = st.tabs(["📑 Mapování", "⚖️ Porovnání", "📊 Přehled", "📈 Dashboard", "🧪 QA kontroly"])
+tab_data, tab_compare, tab_summary, tab_overview, tab_dashboard, tab_qa = st.tabs([
+    "📑 Mapování",
+    "⚖️ Porovnání",
+    "📋 Celkový přehled",
+    "📊 Přehled",
+    "📈 Dashboard",
+    "🧪 QA kontroly",
+])
 
 with tab_data:
     mapping_ui("Master", master_wb)
@@ -465,9 +502,9 @@ with tab_compare:
                 sums_df.columns = ["Supplier total (col)", "Value"]
                 with st.container():
                     c1, c2 = st.columns([2, 3])
-                    with c1:
-                        st.markdown("**Součty za list (bez DPH):**")
-                        st.dataframe(sums_df)
+                with c1:
+                    st.markdown("**Součty za list (bez DPH):**")
+                    show_df(sums_df)
                     with c2:
                         # bar chart per sheet
                         try:
@@ -476,14 +513,17 @@ with tab_compare:
                             st.plotly_chart(fig, use_container_width=True)
                         except Exception:
                             pass
-            st.dataframe(df)
+            show_df(df)
 
-        # global summary table
+with tab_summary:
+    if not bids_dict:
+        st.info("Nahraj alespoň jednu nabídku dodavatele v levém panelu.")
+    else:
+        results = compare(master_wb, bids_dict, join_mode="auto")
         summary_df = summarize(results)
         if not summary_df.empty:
             st.markdown("### 📌 Souhrn po listech")
-            st.dataframe(summary_df)
-            # grand totals per supplier
+            show_df(summary_df)
             supplier_totals = {}
             for col in summary_df.columns:
                 if col.endswith(" total"):
@@ -496,7 +536,7 @@ with tab_compare:
             c1, c2 = st.columns([3, 2])
             with c1:
                 st.markdown("**Celkové součty (napříč listy):**")
-                st.dataframe(grand_df)
+                show_df(grand_df)
             with c2:
                 try:
                     fig = px.bar(grand_df, x="supplier", y="grand_total", title=f"Celkové součty ({currency} bez DPH)")
@@ -516,13 +556,13 @@ with tab_overview:
             st.subheader(f"Souhrnný list: {overview_sheet}")
             if not sections_df.empty:
                 st.markdown("### Celkové ceny oddílů")
-                st.dataframe(sections_df)
+                show_df(sections_df)
             if not indirect_df.empty:
                 st.markdown("### Vedlejší rozpočtové náklady")
-                st.dataframe(indirect_df)
+                show_df(indirect_df)
             if not added_df.empty:
                 st.markdown("### Náklady přidané dodavatelem")
-                st.dataframe(added_df)
+                show_df(added_df)
 
 with tab_dashboard:
     if not bids_dict:
@@ -534,6 +574,16 @@ with tab_dashboard:
         if sheet_choices:
             sel_sheet = st.selectbox("Vyber list pro detailní grafy", sheet_choices, index=0)
             df = results[sel_sheet]
+            total_cols = [c for c in df.columns if c.endswith(" total")]
+            if total_cols:
+                st.markdown("**Součet za list (včetně Master):**")
+                totals_chart_df = pd.DataFrame({"supplier": [c.replace(" total", "") for c in total_cols], "total": [df[c].sum() for c in total_cols]})
+                try:
+                    fig_tot = px.bar(totals_chart_df, x="supplier", y="total", title=f"Součet za list: {sel_sheet} ({currency} bez DPH)")
+                    st.plotly_chart(fig_tot, use_container_width=True)
+                except Exception:
+                    show_df(totals_chart_df)
+
             # Heatmap-like chart: Δ vs LOWEST per supplier
             delta_cols = [c for c in df.columns if c.endswith(" Δ vs LOWEST")]
             if delta_cols:
@@ -547,7 +597,7 @@ with tab_dashboard:
                     fig = px.bar(sum_deltas, title="Součet Δ vs. LOWEST (po dodavatelích)")
                     st.plotly_chart(fig, use_container_width=True)
                 except Exception:
-                    st.dataframe(sum_deltas.to_frame("sum_delta"))
+                    show_df(sum_deltas.to_frame("sum_delta"))
 
                 # Top položky podle rozdílu mezi nejlepší a vybraným dodavatelem
                 st.markdown("**Top 20 položek s nejvyšší odchylkou od nejnižší ceny (součet přes dodavatele):**")
@@ -556,7 +606,7 @@ with tab_dashboard:
                     fig2 = px.bar(item_deltas, title="Top 20 položek podle absolutní Δ")
                     st.plotly_chart(fig2, use_container_width=True)
                 except Exception:
-                    st.dataframe(item_deltas.to_frame("abs_sum_delta"))
+                    show_df(item_deltas.to_frame("abs_sum_delta"))
             else:
                 st.info("Pro zvolený list zatím nejsou k dispozici delty (nahraj nabídky a ověř mapování).")
 
@@ -572,13 +622,13 @@ with tab_qa:
                 c1, c2, c3 = st.columns(3)
                 with c1:
                     st.markdown("**Chybějící položky**")
-                    st.dataframe(d["missing"].head(50))
+                    show_df(d["missing"].head(50))
                 with c2:
                     st.markdown("**Nad rámec (navíc)**")
-                    st.dataframe(d["extras"].head(50))
+                    show_df(d["extras"].head(50))
                 with c3:
                     st.markdown("**Duplicitní položky**")
-                    st.dataframe(d["duplicates"].head(50))
+                    show_df(d["duplicates"].head(50))
 
 st.markdown("---")
 st.caption("© 2025 BoQ Bid Studio — MVP. Doporučení: používat jednotné Item ID pro precizní párování.")
