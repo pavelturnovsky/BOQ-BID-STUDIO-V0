@@ -542,6 +542,17 @@ if bid_files:
 compare_results: Dict[str, pd.DataFrame] = {}
 if bids_dict:
     compare_results = compare(master_wb, bids_dict, join_mode="auto")
+
+# Pre-compute overview results to avoid repeated work in tabs
+overview_results: Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame] = (
+    pd.DataFrame(),
+    pd.DataFrame(),
+    pd.DataFrame(),
+)
+if bids_overview_dict:
+    overview_results = overview_comparison(
+        master_overview_wb, bids_overview_dict, overview_sheet
+    )
 # ------------- Tabs -------------
 tab_data, tab_compare, tab_summary, tab_overview, tab_dashboard, tab_qa = st.tabs([
     "📑 Mapování",
@@ -631,9 +642,7 @@ with tab_overview:
     if not bids_overview_dict:
         st.info("Nahraj alespoň jednu nabídku dodavatele v levém panelu.")
     else:
-        sections_df, indirect_df, added_df = overview_comparison(
-            master_overview_wb, bids_overview_dict, overview_sheet
-        )
+        sections_df, indirect_df, added_df = overview_results
         if sections_df.empty and indirect_df.empty and added_df.empty:
             st.info(f"List '{overview_sheet}' neobsahuje data pro porovnání.")
         else:
