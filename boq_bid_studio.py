@@ -462,24 +462,44 @@ def qa_checks(master: WorkbookData, bids: Dict[str, WorkbookData]) -> Dict[str, 
 # ------------- Sidebar Inputs -------------
 
 st.sidebar.header("Vstupy")
-master_file = st.sidebar.file_uploader("Master BoQ (.xlsx/.xlsm)", type=["xlsx", "xlsm"], key="master")
-bid_files = st.sidebar.file_uploader("Nabídky dodavatelů (max 7)", type=["xlsx", "xlsm"], accept_multiple_files=True, key="bids")
-vat_rate = st.sidebar.number_input("DPH (%) — pouze pro zobrazení součtů", min_value=0.0, max_value=30.0, value=0.0, step=1.0)
+master_file = st.sidebar.file_uploader(
+    "Master BoQ (.xlsx/.xlsm)", type=["xlsx", "xlsm"], key="master"
+)
+bid_files = st.sidebar.file_uploader(
+    "Nabídky dodavatelů (max 7)",
+    type=["xlsx", "xlsm"],
+    accept_multiple_files=True,
+    key="bids",
+)
+vat_rate = st.sidebar.number_input(
+    "DPH (%) — pouze pro zobrazení součtů",
+    min_value=0.0,
+    max_value=30.0,
+    value=0.0,
+    step=1.0,
+)
 currency = st.sidebar.text_input("Měna (zobrazit)", value="CZK")
 
 if not master_file:
     st.info("➡️ Nahraj Master BoQ v levém panelu.")
     st.stop()
 
-codex/add-multiselect-and-selectbox-in-sidebar
 # Determine sheet names without loading all sheets
 master_xl = pd.ExcelFile(master_file)
 all_sheets = master_xl.sheet_names
 
 # User selections for comparison and overview
 compare_sheets = st.sidebar.multiselect("Listy pro porovnání", all_sheets, default=all_sheets)
-default_overview = "Přehled_dílčí kapitoly" if "Přehled_dílčí kapitoly" in all_sheets else (all_sheets[0] if all_sheets else "")
-overview_sheet = st.sidebar.selectbox("List pro přehled", all_sheets, index=all_sheets.index(default_overview) if default_overview in all_sheets else 0)
+default_overview = (
+    "Přehled_dílčí kapitoly"
+    if "Přehled_dílčí kapitoly" in all_sheets
+    else (all_sheets[0] if all_sheets else "")
+)
+overview_sheet = st.sidebar.selectbox(
+    "List pro přehled",
+    all_sheets,
+    index=all_sheets.index(default_overview) if default_overview in all_sheets else 0,
+)
 
 # Read master only for selected comparison sheets
 master_file.seek(0)
@@ -487,28 +507,14 @@ master_wb = read_workbook(master_file, limit_sheets=compare_sheets)
 
 # If overview sheet not among comparison sheets, load separately
 if overview_sheet in compare_sheets:
-    master_overview_wb = WorkbookData(name=master_wb.name, sheets={overview_sheet: master_wb.sheets[overview_sheet]})
+    master_overview_wb = WorkbookData(
+        name=master_wb.name, sheets={overview_sheet: master_wb.sheets[overview_sheet]}
+    )
 else:
     master_file.seek(0)
     master_overview_wb = read_workbook(master_file, limit_sheets=[overview_sheet])
 
 # Read bids for comparison sheets and overview sheet separately
-
-# Read master
-master_wb = read_workbook(master_file)
-
-# Confirm sheet selection (default all master sheets)
-all_sheets = list(master_wb.sheets.keys())
-selected_sheets = st.sidebar.multiselect("Které listy zahrnout", all_sheets, default=all_sheets)
-
-# Sheet used for overview comparison
-default_overview = "Přehled_dílčí kapitoly" if "Přehled_dílčí kapitoly" in all_sheets else (all_sheets[0] if all_sheets else "")
-overview_sheet = st.sidebar.selectbox(
-    "List pro sumarizační porovnání", all_sheets, index=all_sheets.index(default_overview) if default_overview in all_sheets else 0
-)
-
-# Read bids
-main
 bids_dict: Dict[str, WorkbookData] = {}
 bids_overview_dict: Dict[str, WorkbookData] = {}
 if bid_files:
@@ -517,41 +523,25 @@ if bid_files:
         bid_files = bid_files[:7]
     for i, f in enumerate(bid_files, start=1):
         name = getattr(f, "name", f"Bid{i}")
-codex/add-multiselect-and-selectbox-in-sidebar
         f.seek(0)
         wb_comp = read_workbook(f, limit_sheets=compare_sheets)
         apply_master_mapping(master_wb, wb_comp)
         bids_dict[name] = wb_comp
 
         if overview_sheet in compare_sheets:
-            wb_over = WorkbookData(name=wb_comp.name, sheets={overview_sheet: wb_comp.sheets.get(overview_sheet, {})})
+            wb_over = WorkbookData(
+                name=wb_comp.name, sheets={overview_sheet: wb_comp.sheets.get(overview_sheet, {})}
+            )
         else:
             f.seek(0)
             wb_over = read_workbook(f, limit_sheets=[overview_sheet])
             apply_master_mapping(master_overview_wb, wb_over)
         bids_overview_dict[name] = wb_over
 
-
 # Pre-compute comparison results for reuse in tabs
 compare_results: Dict[str, pd.DataFrame] = {}
-overview_results: Dict[str, pd.DataFrame] = {}
 if bids_dict:
     compare_results = compare(master_wb, bids_dict, join_mode="auto")
-if bids_overview_dict:
-    overview_results = compare(master_overview_wb, bids_overview_dict, join_mode="auto")
-    
-        wb = read_workbook(f)
-        apply_master_mapping(master_wb, wb)
-        bids_dict[name] = wb
-main
-
-# Filtered workbooks for comparisons
-comp_master = WorkbookData(master_wb.name, {s: master_wb.sheets[s] for s in selected_sheets})
-comp_bids = {
-    name: WorkbookData(wb.name, {s: wb.sheets.get(s, {}) for s in selected_sheets})
-    for name, wb in bids_dict.items()
-}
-
 # ------------- Tabs -------------
 tab_data, tab_compare, tab_summary, tab_overview, tab_dashboard, tab_qa = st.tabs([
     "📑 Mapování",
@@ -581,11 +571,8 @@ with tab_compare:
     if not bids_dict:
         st.info("Nahraj alespoň jednu nabídku dodavatele v levém panelu.")
     else:
- codex/add-multiselect-and-selectbox-in-sidebar
         results = compare_results
 
-        results = compare(comp_master, comp_bids, join_mode="auto")
- main
         # main per-sheet tables
         for sheet, df in results.items():
             st.subheader(f"List: {sheet}")
@@ -614,11 +601,8 @@ with tab_summary:
     if not bids_dict:
         st.info("Nahraj alespoň jednu nabídku dodavatele v levém panelu.")
     else:
- codex/add-multiselect-and-selectbox-in-sidebar
         results = compare_results
 
-        results = compare(comp_master, comp_bids, join_mode="auto")
- main
         summary_df = summarize(results)
         if not summary_df.empty:
             st.markdown("### 📌 Souhrn po listech")
@@ -647,12 +631,9 @@ with tab_overview:
     if not bids_overview_dict:
         st.info("Nahraj alespoň jednu nabídku dodavatele v levém panelu.")
     else:
- codex/add-multiselect-and-selectbox-in-sidebar
-        results = overview_results
-        sections_df, indirect_df, added_df = overview_comparison(results, overview_sheet)
-
-        sections_df, indirect_df, added_df = overview_comparison(master_wb, bids_dict, overview_sheet)
- main
+        sections_df, indirect_df, added_df = overview_comparison(
+            master_overview_wb, bids_overview_dict, overview_sheet
+        )
         if sections_df.empty and indirect_df.empty and added_df.empty:
             st.info(f"List '{overview_sheet}' neobsahuje data pro porovnání.")
         else:
@@ -671,11 +652,8 @@ with tab_dashboard:
     if not bids_dict:
         st.info("Nejdřív nahraj nabídky.")
     else:
- codex/add-multiselect-and-selectbox-in-sidebar
         results = compare_results
 
-        results = compare(comp_master, comp_bids, join_mode="auto")
- main
         # Choose a sheet for detailed variance chart
         sheet_choices = list(results.keys())
         if sheet_choices:
