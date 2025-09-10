@@ -107,8 +107,11 @@ def build_normalized_table(df: pd.DataFrame, mapping: Dict[str, int]) -> pd.Data
     # filter empty row heuristics
     mask = ((out["code"].astype(str).str.strip() != "") | (desc_str.str.strip() != "")) & (~summary_mask)
     out = out[mask].copy()
+    # drop rows where all numeric columns are NaN or zero (extra empty lines)
+    numeric_cols = out.select_dtypes(include=[np.number]).columns
+    out = out[~(out[numeric_cols].isna() | (out[numeric_cols] == 0)).all(axis=1)]
     # canonical key (will be overridden if user picks dedicated Item ID)
-    out["__key__"] = out["code"].astype(str).str.strip() + " | " + desc_str.str.strip()
+    out["__key__"] = (out["code"].astype(str).str.strip() + " | " + desc_str.str.strip()).str.strip(" |")
     return out
 
 
@@ -179,10 +182,11 @@ def apply_master_mapping(master: WorkbookData, target: WorkbookData) -> None:
         except Exception:
             continue
 
-def mapping_ui(section_title: str, wb: WorkbookData) -> None:
+def mapping_ui(section_title: str, wb: WorkbookData, minimal: bool = False, minimal_sheets: Optional[List[str]] = None) -> None:
     st.subheader(section_title)
     tabs = st.tabs(list(wb.sheets.keys()))
     for tab, (sheet, obj) in zip(tabs, wb.sheets.items()):
+        use_minimal = minimal or (minimal_sheets is not None and sheet in minimal_sheets)
         with tab:
             st.markdown(f"**List:** `{sheet}`")
             raw = obj.get("raw")
@@ -202,115 +206,143 @@ def mapping_ui(section_title: str, wb: WorkbookData) -> None:
             cols = list(range(len(header_names)))
             if not cols:
                 cols = [0]
+
             def pick_default(key):
-                # try to find a column by heuristics
                 hints = HEADER_HINTS.get(key, [])
                 for i, col in enumerate(header_names):
                     if any(p in col for p in hints):
                         return i
-                # fallback to existing mapping
                 return mapping.get(key, 0)
 
             def clamp(idx: int) -> int:
-                """Ensure index is within available column range."""
                 return max(0, min(idx, len(cols) - 1))
 
-            c1, c2, c3, c4, c5 = st.columns(5)
-            with c1:
-                code_idx = st.selectbox(
-                    "Sloupec: code",
-                    cols,
-                    format_func=lambda i: header_names[i] if i < len(header_names) else "",
-                    index=clamp(pick_default("code")),
-                    key=f"map_code_{section_title}_{sheet}",
-                )
-            with c2:
-                desc_idx = st.selectbox(
-                    "Sloupec: description",
-                    cols,
-                    format_func=lambda i: header_names[i] if i < len(header_names) else "",
-                    index=clamp(pick_default("description")),
-                    key=f"map_desc_{section_title}_{sheet}",
-                )
-            with c3:
-                unit_idx = st.selectbox(
-                    "Sloupec: unit",
-                    cols,
-                    format_func=lambda i: header_names[i] if i < len(header_names) else "",
-                    index=clamp(pick_default("unit")),
-                    key=f"map_unit_{section_title}_{sheet}",
-                )
-            with c4:
-                qty_idx = st.selectbox(
-                    "Sloupec: quantity",
-                    cols,
-                    format_func=lambda i: header_names[i] if i < len(header_names) else "",
-                    index=clamp(pick_default("quantity")),
-                    key=f"map_qty_{section_title}_{sheet}",
-                )
-            with c5:
-                up_idx = st.selectbox(
-                    "Sloupec: unit_price",
-                    cols,
-                    format_func=lambda i: header_names[i] if i < len(header_names) else "",
-                    index=clamp(pick_default("unit_price")),
-                    key=f"map_up_{section_title}_{sheet}",
-                )
-            c6, c7, c8, c9, c10 = st.columns(5)
-            with c6:
-                qty_sup_idx = st.selectbox(
-                    "Sloupec: quantity_supplier",
-                    cols,
-                    format_func=lambda i: header_names[i] if i < len(header_names) else "",
-                    index=clamp(pick_default("quantity_supplier")),
-                    key=f"map_qtysup_{section_title}_{sheet}",
-                )
-            with c7:
-                upm_idx = st.selectbox(
-                    "Sloupec: unit_price_material",
-                    cols,
-                    format_func=lambda i: header_names[i] if i < len(header_names) else "",
-                    index=clamp(pick_default("unit_price_material")),
-                    key=f"map_upm_{section_title}_{sheet}",
-                )
-            with c8:
-                upi_idx = st.selectbox(
-                    "Sloupec: unit_price_install",
-                    cols,
-                    format_func=lambda i: header_names[i] if i < len(header_names) else "",
-                    index=clamp(pick_default("unit_price_install")),
-                    key=f"map_upi_{section_title}_{sheet}",
-                )
-            with c9:
-                total_idx = st.selectbox(
-                    "Sloupec: total_price",
-                    cols,
-                    format_func=lambda i: header_names[i] if i < len(header_names) else "",
-                    index=clamp(pick_default("total_price")),
-                    key=f"map_total_{section_title}_{sheet}",
-                )
-            with c10:
-                section_idx = st.selectbox(
-                    "Sloupec: section_total",
-                    cols,
-                    format_func=lambda i: header_names[i] if i < len(header_names) else "",
-                    index=clamp(pick_default("section_total")),
-                    key=f"map_section_{section_title}_{sheet}",
-                )
+            if use_minimal:
+                c1, c2 = st.columns(2)
+                with c1:
+                    desc_idx = st.selectbox(
+                        "Sloupec: description",
+                        cols,
+                        format_func=lambda i: header_names[i] if i < len(header_names) else "",
+                        index=clamp(pick_default("description")),
+                        key=f"map_desc_{section_title}_{sheet}",
+                    )
+                with c2:
+                    total_idx = st.selectbox(
+                        "Sloupec: total_price",
+                        cols,
+                        format_func=lambda i: header_names[i] if i < len(header_names) else "",
+                        index=clamp(pick_default("total_price")),
+                        key=f"map_total_{section_title}_{sheet}",
+                    )
+                ui_mapping = {
+                    "code": -1,
+                    "description": desc_idx,
+                    "unit": -1,
+                    "quantity": -1,
+                    "unit_price": -1,
+                    "quantity_supplier": -1,
+                    "unit_price_material": -1,
+                    "unit_price_install": -1,
+                    "total_price": total_idx,
+                    "section_total": -1,
+                }
+            else:
+                c1, c2, c3, c4, c5 = st.columns(5)
+                with c1:
+                    code_idx = st.selectbox(
+                        "Sloupec: code",
+                        cols,
+                        format_func=lambda i: header_names[i] if i < len(header_names) else "",
+                        index=clamp(pick_default("code")),
+                        key=f"map_code_{section_title}_{sheet}",
+                    )
+                with c2:
+                    desc_idx = st.selectbox(
+                        "Sloupec: description",
+                        cols,
+                        format_func=lambda i: header_names[i] if i < len(header_names) else "",
+                        index=clamp(pick_default("description")),
+                        key=f"map_desc_{section_title}_{sheet}",
+                    )
+                with c3:
+                    unit_idx = st.selectbox(
+                        "Sloupec: unit",
+                        cols,
+                        format_func=lambda i: header_names[i] if i < len(header_names) else "",
+                        index=clamp(pick_default("unit")),
+                        key=f"map_unit_{section_title}_{sheet}",
+                    )
+                with c4:
+                    qty_idx = st.selectbox(
+                        "Sloupec: quantity",
+                        cols,
+                        format_func=lambda i: header_names[i] if i < len(header_names) else "",
+                        index=clamp(pick_default("quantity")),
+                        key=f"map_qty_{section_title}_{sheet}",
+                    )
+                with c5:
+                    up_idx = st.selectbox(
+                        "Sloupec: unit_price",
+                        cols,
+                        format_func=lambda i: header_names[i] if i < len(header_names) else "",
+                        index=clamp(pick_default("unit_price")),
+                        key=f"map_up_{section_title}_{sheet}",
+                    )
+                c6, c7, c8, c9, c10 = st.columns(5)
+                with c6:
+                    qty_sup_idx = st.selectbox(
+                        "Sloupec: quantity_supplier",
+                        cols,
+                        format_func=lambda i: header_names[i] if i < len(header_names) else "",
+                        index=clamp(pick_default("quantity_supplier")),
+                        key=f"map_qtysup_{section_title}_{sheet}",
+                    )
+                with c7:
+                    upm_idx = st.selectbox(
+                        "Sloupec: unit_price_material",
+                        cols,
+                        format_func=lambda i: header_names[i] if i < len(header_names) else "",
+                        index=clamp(pick_default("unit_price_material")),
+                        key=f"map_upm_{section_title}_{sheet}",
+                    )
+                with c8:
+                    upi_idx = st.selectbox(
+                        "Sloupec: unit_price_install",
+                        cols,
+                        format_func=lambda i: header_names[i] if i < len(header_names) else "",
+                        index=clamp(pick_default("unit_price_install")),
+                        key=f"map_upi_{section_title}_{sheet}",
+                    )
+                with c9:
+                    total_idx = st.selectbox(
+                        "Sloupec: total_price",
+                        cols,
+                        format_func=lambda i: header_names[i] if i < len(header_names) else "",
+                        index=clamp(pick_default("total_price")),
+                        key=f"map_total_{section_title}_{sheet}",
+                    )
+                with c10:
+                    section_idx = st.selectbox(
+                        "Sloupec: section_total",
+                        cols,
+                        format_func=lambda i: header_names[i] if i < len(header_names) else "",
+                        index=clamp(pick_default("section_total")),
+                        key=f"map_section_{section_title}_{sheet}",
+                    )
 
-            # Rebuild normalized table with UI mapping
-            ui_mapping = {
-                "code": code_idx,
-                "description": desc_idx,
-                "unit": unit_idx,
-                "quantity": qty_idx,
-                "unit_price": up_idx,
-                "quantity_supplier": qty_sup_idx,
-                "unit_price_material": upm_idx,
-                "unit_price_install": upi_idx,
-                "total_price": total_idx,
-                "section_total": section_idx,
-            }
+                ui_mapping = {
+                    "code": code_idx,
+                    "description": desc_idx,
+                    "unit": unit_idx,
+                    "quantity": qty_idx,
+                    "unit_price": up_idx,
+                    "quantity_supplier": qty_sup_idx,
+                    "unit_price_material": upm_idx,
+                    "unit_price_install": upi_idx,
+                    "total_price": total_idx,
+                    "section_total": section_idx,
+                }
             if isinstance(raw, pd.DataFrame):
                 body = raw.iloc[header_row+1:].reset_index(drop=True)
                 body.columns = [normalize_col(x) for x in raw.iloc[header_row].tolist()]
@@ -406,7 +438,11 @@ def overview_comparison(master: WorkbookData, bids: Dict[str, WorkbookData], she
     if mtab is None or mtab.empty:
         return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
 
-    df = mtab[["description", "total_price"]].rename(columns={"total_price": "Master total"}).copy()
+    df = (
+        mtab[["description", "total_price"]]
+        .groupby("description", as_index=False, dropna=False)["total_price"].sum()
+        .rename(columns={"total_price": "Master total"})
+    )
 
     for sup_name, wb in bids.items():
         tobj = wb.sheets.get(sheet_name, {})
@@ -418,13 +454,18 @@ def overview_comparison(master: WorkbookData, bids: Dict[str, WorkbookData], she
         if ttab is None or ttab.empty:
             df[f"{sup_name} total"] = np.nan
         else:
-            tdf = ttab[["description", "total_price"]].copy()
+            tdf = (
+                ttab[["description", "total_price"]]
+                .groupby("description", as_index=False, dropna=False)["total_price"].sum()
+            )
             df = df.merge(tdf, on="description", how="left")
             df.rename(columns={"total_price": f"{sup_name} total"}, inplace=True)
 
     total_cols = [c for c in df.columns if c.endswith(" total")]
     view = df[["description"] + total_cols].copy()
-    indirect_mask = view["description"].str.contains("vedlejší", case=False, na=False)
+    view["description"] = view["description"].fillna("").astype(str)
+    view = view[view["description"].str.strip() != ""]
+    indirect_mask = view["description"].str.contains("vedlejs", case=False, na=False)
     added_mask = view["description"].str.contains("dodavat", case=False, na=False)
     sections_df = view[~(indirect_mask | added_mask)]
     indirect_df = view[indirect_mask]
@@ -496,7 +537,7 @@ default_overview = (
     else (all_sheets[0] if all_sheets else "")
 )
 overview_sheet = st.sidebar.selectbox(
-    "List pro přehled",
+    "List pro rekapitulaci",
     all_sheets,
     index=all_sheets.index(default_overview) if default_overview in all_sheets else 0,
 )
@@ -539,28 +580,36 @@ if bid_files:
         bids_overview_dict[name] = wb_over
 
 # ------------- Tabs -------------
-tab_data, tab_compare, tab_summary, tab_overview, tab_dashboard, tab_qa = st.tabs([
+tab_data, tab_compare, tab_summary, tab_rekap, tab_dashboard, tab_qa = st.tabs([
     "📑 Mapování",
     "⚖️ Porovnání",
     "📋 Celkový přehled",
-    "📊 Přehled",
+    "📊 Rekapitulace",
     "📈 Dashboard",
     "🧪 QA kontroly",
 ])
 
 with tab_data:
-    mapping_ui("Master", master_wb)
+    mapping_ui(
+        "Master",
+        master_wb,
+        minimal_sheets=[overview_sheet] if overview_sheet in compare_sheets else None,
+    )
     if overview_sheet not in compare_sheets:
-        with st.expander("Mapování — Master přehled", expanded=False):
-            mapping_ui("Master overview", master_overview_wb)
+        with st.expander("Mapování — Master rekapitulace", expanded=False):
+            mapping_ui("Master rekapitulace", master_overview_wb, minimal=True)
     if bids_dict:
         for sup_name, wb in bids_dict.items():
             with st.expander(f"Mapování — {sup_name}", expanded=False):
-                mapping_ui(sup_name, wb)
+                mapping_ui(
+                    sup_name,
+                    wb,
+                    minimal_sheets=[overview_sheet] if overview_sheet in compare_sheets else None,
+                )
         if overview_sheet not in compare_sheets:
             for sup_name, wb in bids_overview_dict.items():
-                with st.expander(f"Mapování přehled — {sup_name}", expanded=False):
-                    mapping_ui(f"{sup_name} overview", wb)
+                with st.expander(f"Mapování rekapitulace — {sup_name}", expanded=False):
+                    mapping_ui(f"{sup_name} rekapitulace", wb, minimal=True)
     st.success("Mapování připraveno. Přepni na záložku **Porovnání**.")
 
 # Pre-compute comparison results for reuse in tabs (after mapping)
@@ -568,14 +617,14 @@ compare_results: Dict[str, pd.DataFrame] = {}
 if bids_dict:
     compare_results = compare(master_wb, bids_dict, join_mode="auto")
 
-# Pre-compute overview results to avoid repeated work in tabs (after mapping)
-overview_results: Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame] = (
+# Pre-compute rekapitulace results to avoid repeated work in tabs (after mapping)
+recap_results: Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame] = (
     pd.DataFrame(),
     pd.DataFrame(),
     pd.DataFrame(),
 )
 if bids_overview_dict:
-    overview_results = overview_comparison(
+    recap_results = overview_comparison(
         master_overview_wb, bids_overview_dict, overview_sheet
     )
 
@@ -639,11 +688,11 @@ with tab_summary:
                 except Exception:
                     pass
 
-with tab_overview:
+with tab_rekap:
     if not bids_overview_dict:
         st.info("Nahraj alespoň jednu nabídku dodavatele v levém panelu.")
     else:
-        sections_df, indirect_df, added_df = overview_results
+        sections_df, indirect_df, added_df = recap_results
         if sections_df.empty and indirect_df.empty and added_df.empty:
             st.info(f"List '{overview_sheet}' neobsahuje data pro porovnání.")
         else:
