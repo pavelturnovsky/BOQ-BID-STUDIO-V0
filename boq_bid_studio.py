@@ -10,8 +10,8 @@ import plotly.express as px
 import streamlit as st
 
 # ------------- App Config -------------
-st.set_page_config(page_title="BoQ Bid Studio V.03", layout="wide")
-st.title("🏗️ BoQ Bid Studio V.03")
+st.set_page_config(page_title="BoQ Bid Studio V.04", layout="wide")
+st.title("🏗️ BoQ Bid Studio V.04")
 st.caption("Jedna aplikace pro nahrání, mapování, porovnání nabídek a vizualizace — bez exportů do Excelu.")
 
 # ------------- Helpers -------------
@@ -538,21 +538,6 @@ if bid_files:
             apply_master_mapping(master_overview_wb, wb_over)
         bids_overview_dict[name] = wb_over
 
-# Pre-compute comparison results for reuse in tabs
-compare_results: Dict[str, pd.DataFrame] = {}
-if bids_dict:
-    compare_results = compare(master_wb, bids_dict, join_mode="auto")
-
-# Pre-compute overview results to avoid repeated work in tabs
-overview_results: Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame] = (
-    pd.DataFrame(),
-    pd.DataFrame(),
-    pd.DataFrame(),
-)
-if bids_overview_dict:
-    overview_results = overview_comparison(
-        master_overview_wb, bids_overview_dict, overview_sheet
-    )
 # ------------- Tabs -------------
 tab_data, tab_compare, tab_summary, tab_overview, tab_dashboard, tab_qa = st.tabs([
     "📑 Mapování",
@@ -577,6 +562,22 @@ with tab_data:
                 with st.expander(f"Mapování přehled — {sup_name}", expanded=False):
                     mapping_ui(f"{sup_name} overview", wb)
     st.success("Mapování připraveno. Přepni na záložku **Porovnání**.")
+
+# Pre-compute comparison results for reuse in tabs (after mapping)
+compare_results: Dict[str, pd.DataFrame] = {}
+if bids_dict:
+    compare_results = compare(master_wb, bids_dict, join_mode="auto")
+
+# Pre-compute overview results to avoid repeated work in tabs (after mapping)
+overview_results: Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame] = (
+    pd.DataFrame(),
+    pd.DataFrame(),
+    pd.DataFrame(),
+)
+if bids_overview_dict:
+    overview_results = overview_comparison(
+        master_overview_wb, bids_overview_dict, overview_sheet
+    )
 
 with tab_compare:
     if not bids_dict:
