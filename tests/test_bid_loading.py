@@ -16,6 +16,7 @@ module.build_normalized_table = module.build_normalized_table.__wrapped__
 read_workbook = module.read_workbook.__wrapped__
 apply_master_mapping = module.apply_master_mapping
 compare = module.compare
+validate_totals = module.validate_totals
 
 
 def make_workbook(df: pd.DataFrame) -> io.BytesIO:
@@ -63,3 +64,47 @@ def test_multiple_bid_loading() -> None:
     df = results["Sheet1"]
     assert not df.empty
     assert df.shape[0] == 1
+
+
+def test_coerce_numeric_european_formats() -> None:
+    s = pd.Series(["1 234,56", "1 234", "1234", "1.234,5", "-"])
+    res = module.coerce_numeric(s)
+    assert res.iloc[0] == 1234.56
+    assert res.iloc[1] == 1234
+    assert res.iloc[2] == 1234
+    assert res.iloc[3] == 1234.5
+    assert pd.isna(res.iloc[4])
+
+
+def test_total_diff_and_summary_detection() -> None:
+    df = pd.DataFrame(
+        {
+            "code": ["1", ""],
+            "description": ["práce", "součet"],
+            "unit": ["m", ""],
+            "quantity": ["2", ""],
+            "unit_price": ["5", ""],
+            "total_price": ["10", "10"],
+        }
+    )
+    mapping = {"code": 0, "description": 1, "unit": 2, "quantity": 3, "unit_price": 4, "total_price": 5}
+    out = module.build_normalized_table(df, mapping)
+    assert out.loc[0, "total_diff"] == 0
+    assert out.loc[1, "is_summary"]
+    assert validate_totals(out) == 0
+
+
+def test_validate_totals_detects_difference() -> None:
+    df = pd.DataFrame(
+        {
+            "code": ["1", ""],
+            "description": ["práce", "součet"],
+            "unit": ["m", ""],
+            "quantity": ["1", ""],
+            "unit_price": ["100", ""],
+            "total_price": ["100", "150"],
+        }
+    )
+    mapping = {"code": 0, "description": 1, "unit": 2, "quantity": 3, "unit_price": 4, "total_price": 5}
+    out = module.build_normalized_table(df, mapping)
+    assert validate_totals(out) == 50
