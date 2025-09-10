@@ -395,13 +395,33 @@ def summarize(results: Dict[str, pd.DataFrame]) -> pd.DataFrame:
     out = pd.DataFrame(rows)
     return out
 
-def overview_comparison(results: Dict[str, pd.DataFrame], sheet_name: str) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+def overview_comparison(master: WorkbookData, bids: Dict[str, WorkbookData], sheet_name: str) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """Return tables for section totals, indirect costs and supplier added costs."""
-    if sheet_name not in results:
+    mobj = master.sheets.get(sheet_name, {})
+    mtab = mobj.get("table", pd.DataFrame())
+    if (mtab is None or mtab.empty) and isinstance(mobj.get("raw"), pd.DataFrame):
+        mapping, hdr, body = try_autodetect_mapping(mobj["raw"])
+        if mapping:
+            mtab = build_normalized_table(body, mapping)
+    if mtab is None or mtab.empty:
         return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
-    df = results[sheet_name].copy()
-    if "total_price" in df.columns:
-        df.rename(columns={"total_price": "Master total"}, inplace=True)
+
+    df = mtab[["description", "total_price"]].rename(columns={"total_price": "Master total"}).copy()
+
+    for sup_name, wb in bids.items():
+        tobj = wb.sheets.get(sheet_name, {})
+        ttab = tobj.get("table", pd.DataFrame())
+        if (ttab is None or ttab.empty) and isinstance(tobj.get("raw"), pd.DataFrame):
+            mapping, hdr, body = try_autodetect_mapping(tobj["raw"])
+            if mapping:
+                ttab = build_normalized_table(body, mapping)
+        if ttab is None or ttab.empty:
+            df[f"{sup_name} total"] = np.nan
+        else:
+            tdf = ttab[["description", "total_price"]].copy()
+            df = df.merge(tdf, on="description", how="left")
+            df.rename(columns={"total_price": f"{sup_name} total"}, inplace=True)
+
     total_cols = [c for c in df.columns if c.endswith(" total")]
     view = df[["description"] + total_cols].copy()
     indirect_mask = view["description"].str.contains("vedlejší", case=False, na=False)
@@ -459,11 +479,10 @@ all_sheets = list(master_wb.sheets.keys())
 selected_sheets = st.sidebar.multiselect("Které listy zahrnout", all_sheets, default=all_sheets)
 
 # Sheet used for overview comparison
-default_overview = "Přehled_dílčí kapitoly" if "Přehled_dílčí kapitoly" in selected_sheets else (selected_sheets[0] if selected_sheets else "")
-overview_sheet = st.sidebar.selectbox("List pro sumarizační porovnání", selected_sheets, index=selected_sheets.index(default_overview) if default_overview in selected_sheets else 0)
-
-# Filter master to selected sheets
-master_wb.sheets = {s: master_wb.sheets[s] for s in selected_sheets}
+default_overview = "Přehled_dílčí kapitoly" if "Přehled_dílčí kapitoly" in all_sheets else (all_sheets[0] if all_sheets else "")
+overview_sheet = st.sidebar.selectbox(
+    "List pro sumarizační porovnání", all_sheets, index=all_sheets.index(default_overview) if default_overview in all_sheets else 0
+)
 
 # Read bids
 bids_dict: Dict[str, WorkbookData] = {}
@@ -473,9 +492,16 @@ if bid_files:
         bid_files = bid_files[:7]
     for i, f in enumerate(bid_files, start=1):
         name = getattr(f, "name", f"Bid{i}")
-        wb = read_workbook(f, limit_sheets=selected_sheets)
+        wb = read_workbook(f)
         apply_master_mapping(master_wb, wb)
         bids_dict[name] = wb
+
+# Filtered workbooks for comparisons
+comp_master = WorkbookData(master_wb.name, {s: master_wb.sheets[s] for s in selected_sheets})
+comp_bids = {
+    name: WorkbookData(wb.name, {s: wb.sheets.get(s, {}) for s in selected_sheets})
+    for name, wb in bids_dict.items()
+}
 
 # ------------- Tabs -------------
 tab_data, tab_compare, tab_summary, tab_overview, tab_dashboard, tab_qa = st.tabs([
@@ -499,7 +525,7 @@ with tab_compare:
     if not bids_dict:
         st.info("Nahraj alespoň jednu nabídku dodavatele v levém panelu.")
     else:
-        results = compare(master_wb, bids_dict, join_mode="auto")
+        results = compare(comp_master, comp_bids, join_mode="auto")
         # main per-sheet tables
         for sheet, df in results.items():
             st.subheader(f"List: {sheet}")
@@ -528,7 +554,7 @@ with tab_summary:
     if not bids_dict:
         st.info("Nahraj alespoň jednu nabídku dodavatele v levém panelu.")
     else:
-        results = compare(master_wb, bids_dict, join_mode="auto")
+        results = compare(comp_master, comp_bids, join_mode="auto")
         summary_df = summarize(results)
         if not summary_df.empty:
             st.markdown("### 📌 Souhrn po listech")
@@ -557,8 +583,7 @@ with tab_overview:
     if not bids_dict:
         st.info("Nahraj alespoň jednu nabídku dodavatele v levém panelu.")
     else:
-        results = compare(master_wb, bids_dict, join_mode="auto")
-        sections_df, indirect_df, added_df = overview_comparison(results, overview_sheet)
+        sections_df, indirect_df, added_df = overview_comparison(master_wb, bids_dict, overview_sheet)
         if sections_df.empty and indirect_df.empty and added_df.empty:
             st.info(f"List '{overview_sheet}' neobsahuje data pro porovnání.")
         else:
@@ -577,7 +602,7 @@ with tab_dashboard:
     if not bids_dict:
         st.info("Nejdřív nahraj nabídky.")
     else:
-        results = compare(master_wb, bids_dict, join_mode="auto")
+        results = compare(comp_master, comp_bids, join_mode="auto")
         # Choose a sheet for detailed variance chart
         sheet_choices = list(results.keys())
         if sheet_choices:
