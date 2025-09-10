@@ -40,23 +40,27 @@ def normalize_col(c):
         c = str(c)
     return re.sub(r"\s+", " ", c.strip().lower())
 
+@st.cache_data
 def try_autodetect_mapping(df: pd.DataFrame) -> Tuple[Dict[str, int], int, pd.DataFrame]:
-    """
-    Probe first 10 rows for a header line that includes required keys.
-    Returns (mapping, header_row_index, body_df_with_named_columns) or ({}, -1, df) if not found.
-    """
-    nprobe = min(10, len(df))
-    for header_row in range(nprobe):
-        header = df.iloc[header_row].astype(str).apply(normalize_col).tolist()
-        mapping = {}
-        for k, patterns in HEADER_HINTS.items():
-            for i, col in enumerate(header):
-                if any(p in col for p in patterns):
-                    mapping[k] = i
-                    break
+    """Autodetect header mapping using a sampled, vectorized search."""
+    # probe size grows with the dataframe but is capped to keep things fast
+    nprobe = min(len(df), max(10, min(50, len(df) // 100)))
+    sample = df.head(nprobe).astype(str).applymap(normalize_col)
+
+    regex_map = {k: "|".join(map(re.escape, v)) for k, v in HEADER_HINTS.items()}
+
+    def detect_row(row: pd.Series) -> Dict[str, int]:
+        mapping: Dict[str, int] = {}
+        for key, regex in regex_map.items():
+            matches = row.str.contains(regex, regex=True, na=False)
+            if matches.any():
+                mapping[key] = matches.idxmax()
+        return mapping
+
+    mappings = sample.apply(detect_row, axis=1)
+    for header_row, mapping in mappings.items():
         if set(REQUIRED_KEYS).issubset(mapping.keys()):
             body = df.iloc[header_row + 1:].reset_index(drop=True)
-            # assign the original header normalized as column names
             body.columns = [normalize_col(x) for x in df.iloc[header_row].tolist()]
             return mapping, header_row, body
     return {}, -1, df
@@ -64,6 +68,7 @@ def try_autodetect_mapping(df: pd.DataFrame) -> Tuple[Dict[str, int], int, pd.Da
 def coerce_numeric(s: pd.Series) -> pd.Series:
     return pd.to_numeric(s, errors="coerce")
 
+@st.cache_data
 def build_normalized_table(df: pd.DataFrame, mapping: Dict[str, int]) -> pd.DataFrame:
     cols = df.columns.tolist()
     def pick(mapped_key, default=None):
@@ -128,6 +133,7 @@ class WorkbookData:
     name: str
     sheets: Dict[str, Dict] = field(default_factory=dict)  # sheet -> {"raw": df_raw, "mapping": dict, "header_row": int, "table": df_norm}
 
+@st.cache_data
 def read_workbook(upload, limit_sheets: Optional[List[str]] = None) -> WorkbookData:
     xl = pd.ExcelFile(upload)
     sheet_names = xl.sheet_names if limit_sheets is None else [s for s in xl.sheet_names if s in limit_sheets]
