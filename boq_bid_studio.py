@@ -66,6 +66,19 @@ def try_autodetect_mapping(df: pd.DataFrame) -> Tuple[Dict[str, int], int, pd.Da
     return {}, -1, df
 
 def coerce_numeric(s: pd.Series) -> pd.Series:
+    """Coerce various textual numeric formats into floats.
+
+    Handles European formats like "1 234,56" by removing thousand
+    separators (spaces/non‑breaking spaces) and converting decimal comma to
+    a dot before calling ``pd.to_numeric``.
+    """
+    if not isinstance(s, pd.Series):
+        s = pd.Series(s)
+    s = s.astype(str).str.replace(r"\s+", "", regex=True)
+    # If both comma and dot present, assume dot is thousands separator
+    mask = s.str.contains(",") & s.str.contains(".")
+    s = s.where(~mask, s.str.replace(".", "", regex=False))
+    s = s.str.replace(",", ".", regex=False)
     return pd.to_numeric(s, errors="coerce")
 
 @st.cache_data
@@ -95,23 +108,40 @@ def build_normalized_table(df: pd.DataFrame, mapping: Dict[str, int]) -> pd.Data
     if "section_total" in out.columns:
         out.drop(columns=["section_total"], inplace=True)
 
-    # filter out summary rows to avoid double counting
-    summary_patterns = r"(celkem za odd[ií]l|sou[cč]et za odd[ií]l|celkov[aá] cena za list|sou[cč]et za list)"
-    # ensure non-string descriptions do not break .str operations
+    # Ensure non-string descriptions do not break .str operations
     desc_str = out["description"].fillna("").astype(str)
     out["description"] = desc_str
-    summary_mask = desc_str.str.contains(summary_patterns, case=False) & (
-        out["code"].astype(str).str.strip() == ""
-    )
 
-    # filter empty row heuristics
-    mask = ((out["code"].astype(str).str.strip() != "") | (desc_str.str.strip() != "")) & (~summary_mask)
+    # Heuristics for detecting summary rows
+    summary_patterns = (
+        r"(celkem za odd[ií]l|sou[cč]et za odd[ií]l|celkov[aá] cena za list|sou[cč]et za list|"
+        r"sou[cč]et|souhrn|subtotal|total|celkem)"
+    )
+    code_blank = out["code"].astype(str).str.strip() == ""
+    qty_zero = out["quantity"].fillna(0) == 0
+    up_zero = out["unit_price"].fillna(0) == 0
+    pattern_mask = desc_str.str.contains(summary_patterns, case=False, na=False)
+    structural_mask = code_blank & qty_zero & up_zero & (desc_str.str.strip() != "")
+    summary_mask = pattern_mask | structural_mask
+    out["is_summary"] = summary_mask
+
+    # Compute total prices and cross-check
+    out["calc_total"] = out["quantity"].fillna(0) * out["unit_price"].fillna(0)
+    mask_total_na = out["total_price"].isna()
+    out.loc[mask_total_na, "total_price"] = out.loc[mask_total_na, "calc_total"]
+    out["total_diff"] = out["total_price"] - out["calc_total"]
+    out.loc[summary_mask, "calc_total"] = np.nan
+    out.loc[summary_mask, "total_diff"] = np.nan
+
+    # Filter out completely empty rows (keep summaries for later validation)
+    mask = (~code_blank) | (desc_str.str.strip() != "")
     out = out[mask].copy()
-    # drop rows where all numeric columns are NaN or zero (extra empty lines)
     numeric_cols = out.select_dtypes(include=[np.number]).columns
-    out = out[~(out[numeric_cols].isna() | (out[numeric_cols] == 0)).all(axis=1)]
-    # canonical key (will be overridden if user picks dedicated Item ID)
-    out["__key__"] = (out["code"].astype(str).str.strip() + " | " + desc_str.str.strip()).str.strip(" |")
+    out = out[~((out[numeric_cols].isna() | (out[numeric_cols] == 0)).all(axis=1) & ~out["is_summary"])]
+    # Canonical key (will be overridden if user picks dedicated Item ID)
+    out["__key__"] = (
+        out["code"].astype(str).str.strip() + " | " + desc_str.str.strip()
+    ).str.strip(" |")
     return out
 
 
@@ -177,9 +207,11 @@ def apply_master_mapping(master: WorkbookData, target: WorkbookData) -> None:
         except Exception:
             continue
 
-def mapping_ui(section_title: str, wb: WorkbookData, minimal: bool = False, minimal_sheets: Optional[List[str]] = None) -> None:
+def mapping_ui(section_title: str, wb: WorkbookData, minimal: bool = False, minimal_sheets: Optional[List[str]] = None) -> bool:
+    """Render mapping UI and return True if any mapping changed."""
     st.subheader(section_title)
     tabs = st.tabs(list(wb.sheets.keys()))
+    changed_any = False
     for tab, (sheet, obj) in zip(tabs, wb.sheets.items()):
         use_minimal = minimal or (minimal_sheets is not None and sheet in minimal_sheets)
         with tab:
@@ -187,6 +219,8 @@ def mapping_ui(section_title: str, wb: WorkbookData, minimal: bool = False, mini
             raw = obj.get("raw")
             header_row = obj.get("header_row", -1)
             mapping = obj.get("mapping", {}).copy()
+            prev_mapping = mapping.copy()
+            prev_header = header_row
             hdr_preview = raw.head(10) if isinstance(raw, pd.DataFrame) else None
             if hdr_preview is not None:
                 show_df(hdr_preview)
@@ -348,10 +382,13 @@ def mapping_ui(section_title: str, wb: WorkbookData, minimal: bool = False, mini
             wb.sheets[sheet]["mapping"] = ui_mapping
             wb.sheets[sheet]["header_row"] = header_row
             wb.sheets[sheet]["table"] = table
+            mapping_changed = (ui_mapping != prev_mapping) or (header_row != prev_header)
+            wb.sheets[sheet]["_changed"] = mapping_changed
+            changed_any = changed_any or mapping_changed
 
             st.markdown("**Normalizovaná tabulka (náhled):**")
             show_df(table.head(50))
-
+    return changed_any
 def compare(master: WorkbookData, bids: Dict[str, WorkbookData], join_mode: str = "auto") -> Dict[str, pd.DataFrame]:
     """
     join_mode: "auto" (Item ID if detekováno, jinak code+description), nebo "code+description".
@@ -363,6 +400,8 @@ def compare(master: WorkbookData, bids: Dict[str, WorkbookData], join_mode: str 
         mtab = mobj.get("table", pd.DataFrame())
         if mtab is None or mtab.empty:
             continue
+        if "is_summary" in mtab.columns:
+            mtab = mtab[~mtab["is_summary"]]
         base = mtab[["__key__", "code", "description", "unit", "quantity", "total_price"]].copy()
         base = base.drop_duplicates("__key__")
         base.rename(columns={"total_price": "Master total"}, inplace=True)
@@ -376,6 +415,8 @@ def compare(master: WorkbookData, bids: Dict[str, WorkbookData], join_mode: str 
                 comp[f"{sup_name} unit_price"] = np.nan
                 comp[f"{sup_name} total"] = np.nan
                 continue
+            if "is_summary" in ttab.columns:
+                ttab = ttab[~ttab["is_summary"]]
             # join by __key__ (manual mapping already built in normalized table)
             sup_qty_col = "quantity_supplier" if "quantity_supplier" in ttab.columns else "quantity"
             tt = ttab[["__key__", sup_qty_col, "unit_price_material", "unit_price_install", "unit_price", "total_price"]].copy()
@@ -432,6 +473,8 @@ def overview_comparison(master: WorkbookData, bids: Dict[str, WorkbookData], she
             mtab = build_normalized_table(body, mapping)
     if mtab is None or mtab.empty:
         return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+    if "is_summary" in mtab.columns:
+        mtab = mtab[~mtab["is_summary"]]
 
     df = (
         mtab[["description", "total_price"]]
@@ -449,6 +492,8 @@ def overview_comparison(master: WorkbookData, bids: Dict[str, WorkbookData], she
         if ttab is None or ttab.empty:
             df[f"{sup_name} total"] = np.nan
         else:
+            if "is_summary" in ttab.columns:
+                ttab = ttab[~ttab["is_summary"]]
             tdf = (
                 ttab[["description", "total_price"]]
                 .groupby("description", as_index=False, dropna=False)["total_price"].sum()
@@ -467,15 +512,42 @@ def overview_comparison(master: WorkbookData, bids: Dict[str, WorkbookData], she
     added_df = view[added_mask]
     return sections_df, indirect_df, added_df
 
+
+def validate_totals(df: pd.DataFrame) -> float:
+    """Return difference between summary total and sum of line items.
+
+    Positive result means the summary total is greater than the sum of
+    individual items. If no summary rows exist, returns 0."""
+    if df is None or df.empty:
+        return np.nan
+    if "is_summary" in df.columns:
+        summary_total = df.loc[df["is_summary"], "total_price"].sum(skipna=True)
+        line_total = df.loc[~df["is_summary"], "total_price"].sum(skipna=True)
+    else:
+        summary_total = 0.0
+        line_total = df["total_price"].sum(skipna=True)
+    if summary_total == 0:
+        return 0.0
+    return float(summary_total - line_total)
+
 def qa_checks(master: WorkbookData, bids: Dict[str, WorkbookData]) -> Dict[str, Dict[str, pd.DataFrame]]:
-    """ Return {sheet: {"missing": df, "extras": df, "duplicates": df}} """
-    out = {}
+    """Return {sheet: {supplier: {"missing": df, "extras": df, "duplicates": df, "total_diff": float}}}"""
+    out: Dict[str, Dict[str, Dict[str, pd.DataFrame]]] = {}
     for sheet, mobj in master.sheets.items():
         mtab = mobj.get("table", pd.DataFrame())
         if mtab is None or mtab.empty:
             continue
-        mkeys = set(mtab["__key__"].dropna().astype(str))
-        per_sheet = {}
+        mtotal_diff = validate_totals(mtab)
+        mtab_clean = mtab[~mtab.get("is_summary", False)] if "is_summary" in mtab.columns else mtab
+        mkeys = set(mtab_clean["__key__"].dropna().astype(str))
+        per_sheet: Dict[str, Dict[str, pd.DataFrame]] = {}
+        # Include master total diff for reference
+        per_sheet["Master"] = {
+            "missing": pd.DataFrame(columns=["__key__"]),
+            "extras": pd.DataFrame(columns=["__key__"]),
+            "duplicates": pd.DataFrame(columns=["__key__", "cnt"]),
+            "total_diff": mtotal_diff,
+        }
         for sup, wb in bids.items():
             tobj = wb.sheets.get(sheet, {})
             ttab = tobj.get("table", pd.DataFrame())
@@ -483,15 +555,23 @@ def qa_checks(master: WorkbookData, bids: Dict[str, WorkbookData]) -> Dict[str, 
                 miss = pd.DataFrame({"__key__": sorted(mkeys)})
                 ext = pd.DataFrame(columns=["__key__"])
                 dupl = pd.DataFrame(columns=["__key__", "cnt"])
+                total_diff = np.nan
             else:
-                tkeys_series = ttab["__key__"].dropna().astype(str)
+                total_diff = validate_totals(ttab)
+                ttab_clean = ttab[~ttab.get("is_summary", False)] if "is_summary" in ttab.columns else ttab
+                tkeys_series = ttab_clean["__key__"].dropna().astype(str)
                 tkeys = set(tkeys_series)
                 miss = pd.DataFrame({"__key__": sorted(mkeys - tkeys)})
                 ext = pd.DataFrame({"__key__": sorted(tkeys - mkeys)})
                 # duplicates within supplier bid (same key appearing more than once)
                 dupl_counts = tkeys_series.value_counts()
                 dupl = dupl_counts[dupl_counts > 1].rename_axis("__key__").reset_index(name="cnt")
-            per_sheet[sup] = {"missing": miss, "extras": ext, "duplicates": dupl}
+            per_sheet[sup] = {
+                "missing": miss,
+                "extras": ext,
+                "duplicates": dupl,
+                "total_diff": total_diff,
+            }
         out[sheet] = per_sheet
     return out
 
@@ -585,14 +665,23 @@ tab_data, tab_compare, tab_summary, tab_rekap, tab_dashboard, tab_qa = st.tabs([
 ])
 
 with tab_data:
-    mapping_ui(
+    master_changed = mapping_ui(
         "Master",
         master_wb,
         minimal_sheets=[overview_sheet] if overview_sheet in compare_sheets else None,
     )
+    if master_changed:
+        for wb in bids_dict.values():
+            apply_master_mapping(master_wb, wb)
+        if overview_sheet in compare_sheets:
+            for wb in bids_overview_dict.values():
+                apply_master_mapping(master_wb, wb)
     if overview_sheet not in compare_sheets:
         with st.expander("Mapování — Master rekapitulace", expanded=False):
-            mapping_ui("Master rekapitulace", master_overview_wb, minimal=True)
+            master_over_changed = mapping_ui("Master rekapitulace", master_overview_wb, minimal=True)
+        if master_over_changed:
+            for wb in bids_overview_dict.values():
+                apply_master_mapping(master_overview_wb, wb)
     if bids_dict:
         for sup_name, wb in bids_dict.items():
             with st.expander(f"Mapování — {sup_name}", expanded=False):
@@ -758,7 +847,7 @@ with tab_qa:
             st.subheader(f"List: {sheet}")
             for sup, d in per_sup.items():
                 st.markdown(f"**Dodavatel:** {sup}")
-                c1, c2, c3 = st.columns(3)
+                c1, c2, c3, c4 = st.columns(4)
                 with c1:
                     st.markdown("**Chybějící položky**")
                     show_df(d["missing"].head(50))
@@ -768,6 +857,13 @@ with tab_qa:
                 with c3:
                     st.markdown("**Duplicitní položky**")
                     show_df(d["duplicates"].head(50))
+                with c4:
+                    st.markdown("**Δ součtu vs. souhrn**")
+                    diff = d.get("total_diff")
+                    if diff is None or pd.isna(diff):
+                        st.write("n/a")
+                    else:
+                        st.write(format_number(diff))
 
 st.markdown("---")
 st.caption("© 2025 BoQ Bid Studio — MVP. Doporučení: používat jednotné Item ID pro precizní párování.")
