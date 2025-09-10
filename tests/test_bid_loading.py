@@ -1,13 +1,14 @@
 import io
 import os
+import sys
 import types
 from pathlib import Path
 import pandas as pd
 
 # Load only helper functions from boq_bid_studio without running Streamlit app
-module_code = (
-    Path(__file__).resolve().parent.parent / "boq_bid_studio.py"
-).read_text().split("# ------------- Sidebar Inputs -------------")[0]
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.append(str(ROOT))
+module_code = (ROOT / "boq_bid_studio.py").read_text().split("# ------------- Sidebar Inputs -------------")[0]
 module = types.ModuleType("boq_bid_helpers")
 exec(module_code, module.__dict__)
 module.try_autodetect_mapping = module.try_autodetect_mapping.__wrapped__

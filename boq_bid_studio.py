@@ -1,13 +1,13 @@
 
 import re
 import json
-from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 import plotly.express as px
 import streamlit as st
+from workbook import WorkbookData
 
 # ------------- App Config -------------
 st.set_page_config(page_title="BoQ Bid Studio V.04", layout="wide")
@@ -130,11 +130,6 @@ def show_df(df: pd.DataFrame) -> None:
         st.dataframe(df)
     else:
         st.dataframe(df.style.format({col: format_number for col in numeric_cols}))
-
-@dataclass
-class WorkbookData:
-    name: str
-    sheets: Dict[str, Dict] = field(default_factory=dict)  # sheet -> {"raw": df_raw, "mapping": dict, "header_row": int, "table": df_norm}
 
 @st.cache_data
 def read_workbook(upload, limit_sheets: Optional[List[str]] = None) -> WorkbookData:
