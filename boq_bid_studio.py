@@ -40,23 +40,27 @@ def normalize_col(c):
         c = str(c)
     return re.sub(r"\s+", " ", c.strip().lower())
 
+@st.cache_data
 def try_autodetect_mapping(df: pd.DataFrame) -> Tuple[Dict[str, int], int, pd.DataFrame]:
-    """
-    Probe first 10 rows for a header line that includes required keys.
-    Returns (mapping, header_row_index, body_df_with_named_columns) or ({}, -1, df) if not found.
-    """
-    nprobe = min(10, len(df))
-    for header_row in range(nprobe):
-        header = df.iloc[header_row].astype(str).apply(normalize_col).tolist()
-        mapping = {}
-        for k, patterns in HEADER_HINTS.items():
-            for i, col in enumerate(header):
-                if any(p in col for p in patterns):
-                    mapping[k] = i
-                    break
+    """Autodetect header mapping using a sampled, vectorized search."""
+    # probe size grows with the dataframe but is capped to keep things fast
+    nprobe = min(len(df), max(10, min(50, len(df) // 100)))
+    sample = df.head(nprobe).astype(str).applymap(normalize_col)
+
+    regex_map = {k: "|".join(map(re.escape, v)) for k, v in HEADER_HINTS.items()}
+
+    def detect_row(row: pd.Series) -> Dict[str, int]:
+        mapping: Dict[str, int] = {}
+        for key, regex in regex_map.items():
+            matches = row.str.contains(regex, regex=True, na=False)
+            if matches.any():
+                mapping[key] = matches.idxmax()
+        return mapping
+
+    mappings = sample.apply(detect_row, axis=1)
+    for header_row, mapping in mappings.items():
         if set(REQUIRED_KEYS).issubset(mapping.keys()):
             body = df.iloc[header_row + 1:].reset_index(drop=True)
-            # assign the original header normalized as column names
             body.columns = [normalize_col(x) for x in df.iloc[header_row].tolist()]
             return mapping, header_row, body
     return {}, -1, df
@@ -64,6 +68,7 @@ def try_autodetect_mapping(df: pd.DataFrame) -> Tuple[Dict[str, int], int, pd.Da
 def coerce_numeric(s: pd.Series) -> pd.Series:
     return pd.to_numeric(s, errors="coerce")
 
+@st.cache_data
 def build_normalized_table(df: pd.DataFrame, mapping: Dict[str, int]) -> pd.DataFrame:
     cols = df.columns.tolist()
     def pick(mapped_key, default=None):
@@ -128,6 +133,7 @@ class WorkbookData:
     name: str
     sheets: Dict[str, Dict] = field(default_factory=dict)  # sheet -> {"raw": df_raw, "mapping": dict, "header_row": int, "table": df_norm}
 
+@st.cache_data
 def read_workbook(upload, limit_sheets: Optional[List[str]] = None) -> WorkbookData:
     xl = pd.ExcelFile(upload)
     sheet_names = xl.sheet_names if limit_sheets is None else [s for s in xl.sheet_names if s in limit_sheets]
@@ -389,13 +395,33 @@ def summarize(results: Dict[str, pd.DataFrame]) -> pd.DataFrame:
     out = pd.DataFrame(rows)
     return out
 
-def overview_comparison(results: Dict[str, pd.DataFrame], sheet_name: str) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+def overview_comparison(master: WorkbookData, bids: Dict[str, WorkbookData], sheet_name: str) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """Return tables for section totals, indirect costs and supplier added costs."""
-    if sheet_name not in results:
+    mobj = master.sheets.get(sheet_name, {})
+    mtab = mobj.get("table", pd.DataFrame())
+    if (mtab is None or mtab.empty) and isinstance(mobj.get("raw"), pd.DataFrame):
+        mapping, hdr, body = try_autodetect_mapping(mobj["raw"])
+        if mapping:
+            mtab = build_normalized_table(body, mapping)
+    if mtab is None or mtab.empty:
         return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
-    df = results[sheet_name].copy()
-    if "total_price" in df.columns:
-        df.rename(columns={"total_price": "Master total"}, inplace=True)
+
+    df = mtab[["description", "total_price"]].rename(columns={"total_price": "Master total"}).copy()
+
+    for sup_name, wb in bids.items():
+        tobj = wb.sheets.get(sheet_name, {})
+        ttab = tobj.get("table", pd.DataFrame())
+        if (ttab is None or ttab.empty) and isinstance(tobj.get("raw"), pd.DataFrame):
+            mapping, hdr, body = try_autodetect_mapping(tobj["raw"])
+            if mapping:
+                ttab = build_normalized_table(body, mapping)
+        if ttab is None or ttab.empty:
+            df[f"{sup_name} total"] = np.nan
+        else:
+            tdf = ttab[["description", "total_price"]].copy()
+            df = df.merge(tdf, on="description", how="left")
+            df.rename(columns={"total_price": f"{sup_name} total"}, inplace=True)
+
     total_cols = [c for c in df.columns if c.endswith(" total")]
     view = df[["description"] + total_cols].copy()
     indirect_mask = view["description"].str.contains("vedlejší", case=False, na=False)
@@ -445,6 +471,7 @@ if not master_file:
     st.info("➡️ Nahraj Master BoQ v levém panelu.")
     st.stop()
 
+codex/add-multiselect-and-selectbox-in-sidebar
 # Determine sheet names without loading all sheets
 master_xl = pd.ExcelFile(master_file)
 all_sheets = master_xl.sheet_names
@@ -466,6 +493,22 @@ else:
     master_overview_wb = read_workbook(master_file, limit_sheets=[overview_sheet])
 
 # Read bids for comparison sheets and overview sheet separately
+
+# Read master
+master_wb = read_workbook(master_file)
+
+# Confirm sheet selection (default all master sheets)
+all_sheets = list(master_wb.sheets.keys())
+selected_sheets = st.sidebar.multiselect("Které listy zahrnout", all_sheets, default=all_sheets)
+
+# Sheet used for overview comparison
+default_overview = "Přehled_dílčí kapitoly" if "Přehled_dílčí kapitoly" in all_sheets else (all_sheets[0] if all_sheets else "")
+overview_sheet = st.sidebar.selectbox(
+    "List pro sumarizační porovnání", all_sheets, index=all_sheets.index(default_overview) if default_overview in all_sheets else 0
+)
+
+# Read bids
+main
 bids_dict: Dict[str, WorkbookData] = {}
 bids_overview_dict: Dict[str, WorkbookData] = {}
 if bid_files:
@@ -474,6 +517,7 @@ if bid_files:
         bid_files = bid_files[:7]
     for i, f in enumerate(bid_files, start=1):
         name = getattr(f, "name", f"Bid{i}")
+codex/add-multiselect-and-selectbox-in-sidebar
         f.seek(0)
         wb_comp = read_workbook(f, limit_sheets=compare_sheets)
         apply_master_mapping(master_wb, wb_comp)
@@ -495,6 +539,18 @@ if bids_dict:
     compare_results = compare(master_wb, bids_dict, join_mode="auto")
 if bids_overview_dict:
     overview_results = compare(master_overview_wb, bids_overview_dict, join_mode="auto")
+    
+        wb = read_workbook(f)
+        apply_master_mapping(master_wb, wb)
+        bids_dict[name] = wb
+main
+
+# Filtered workbooks for comparisons
+comp_master = WorkbookData(master_wb.name, {s: master_wb.sheets[s] for s in selected_sheets})
+comp_bids = {
+    name: WorkbookData(wb.name, {s: wb.sheets.get(s, {}) for s in selected_sheets})
+    for name, wb in bids_dict.items()
+}
 
 # ------------- Tabs -------------
 tab_data, tab_compare, tab_summary, tab_overview, tab_dashboard, tab_qa = st.tabs([
@@ -525,7 +581,11 @@ with tab_compare:
     if not bids_dict:
         st.info("Nahraj alespoň jednu nabídku dodavatele v levém panelu.")
     else:
+ codex/add-multiselect-and-selectbox-in-sidebar
         results = compare_results
+
+        results = compare(comp_master, comp_bids, join_mode="auto")
+ main
         # main per-sheet tables
         for sheet, df in results.items():
             st.subheader(f"List: {sheet}")
@@ -554,7 +614,11 @@ with tab_summary:
     if not bids_dict:
         st.info("Nahraj alespoň jednu nabídku dodavatele v levém panelu.")
     else:
+ codex/add-multiselect-and-selectbox-in-sidebar
         results = compare_results
+
+        results = compare(comp_master, comp_bids, join_mode="auto")
+ main
         summary_df = summarize(results)
         if not summary_df.empty:
             st.markdown("### 📌 Souhrn po listech")
@@ -583,8 +647,12 @@ with tab_overview:
     if not bids_overview_dict:
         st.info("Nahraj alespoň jednu nabídku dodavatele v levém panelu.")
     else:
+ codex/add-multiselect-and-selectbox-in-sidebar
         results = overview_results
         sections_df, indirect_df, added_df = overview_comparison(results, overview_sheet)
+
+        sections_df, indirect_df, added_df = overview_comparison(master_wb, bids_dict, overview_sheet)
+ main
         if sections_df.empty and indirect_df.empty and added_df.empty:
             st.info(f"List '{overview_sheet}' neobsahuje data pro porovnání.")
         else:
@@ -603,7 +671,11 @@ with tab_dashboard:
     if not bids_dict:
         st.info("Nejdřív nahraj nabídky.")
     else:
+ codex/add-multiselect-and-selectbox-in-sidebar
         results = compare_results
+
+        results = compare(comp_master, comp_bids, join_mode="auto")
+ main
         # Choose a sheet for detailed variance chart
         sheet_choices = list(results.keys())
         if sheet_choices:
