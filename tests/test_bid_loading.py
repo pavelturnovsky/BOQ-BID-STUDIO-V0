@@ -4,6 +4,7 @@ import sys
 import types
 from pathlib import Path
 import pandas as pd
+import numpy as np
 
 # Load only helper functions from boq_bid_studio without running Streamlit app
 ROOT = Path(__file__).resolve().parent.parent
@@ -34,7 +35,6 @@ def test_multiple_bid_loading() -> None:
         "description": ["Item"],
         "unit": ["m"],
         "quantity": [1],
-        "unit_price": [10],
         "total_price": [10],
     })
     bid_df = pd.DataFrame({
@@ -42,7 +42,6 @@ def test_multiple_bid_loading() -> None:
         "description": ["Item"],
         "unit": ["m"],
         "quantity": [1],
-        "unit_price": [12],
         "total_price": [12],
     })
 
@@ -83,11 +82,11 @@ def test_total_diff_and_summary_detection() -> None:
             "description": ["práce", "součet"],
             "unit": ["m", ""],
             "quantity": ["2", ""],
-            "unit_price": ["5", ""],
+            "unit_price_material": ["5", ""],
             "total_price": ["10", "10"],
         }
     )
-    mapping = {"code": 0, "description": 1, "unit": 2, "quantity": 3, "unit_price": 4, "total_price": 5}
+    mapping = {"code": 0, "description": 1, "unit": 2, "quantity": 3, "unit_price_material": 4, "total_price": 5}
     out = module.build_normalized_table(df, mapping)
     assert out.loc[0, "total_diff"] == 0
     assert out.loc[1, "is_summary"]
@@ -101,11 +100,10 @@ def test_detect_summary_rows_alternating() -> None:
             "description": ["item1", "součet", "item2", "Sub section", "Total"],
             "unit": ["m", "", "m", "", ""],
             "quantity": ["1", "", "2", "", ""],
-            "unit_price": ["10", "", "20", "", ""],
             "total_price": ["10", "10", "40", "50", "50"],
         }
     )
-    mapping = {"code": 0, "description": 1, "unit": 2, "quantity": 3, "unit_price": 4, "total_price": 5}
+    mapping = {"code": 0, "description": 1, "unit": 2, "quantity": 3, "total_price": 4}
     out = module.build_normalized_table(df, mapping)
     assert out["is_summary"].tolist() == [False, True, False, True, True]
 
@@ -117,11 +115,10 @@ def test_validate_totals_detects_difference() -> None:
             "description": ["práce", "součet"],
             "unit": ["m", ""],
             "quantity": ["1", ""],
-            "unit_price": ["100", ""],
             "total_price": ["100", "150"],
         }
     )
-    mapping = {"code": 0, "description": 1, "unit": 2, "quantity": 3, "unit_price": 4, "total_price": 5}
+    mapping = {"code": 0, "description": 1, "unit": 2, "quantity": 3, "total_price": 4}
     out = module.build_normalized_table(df, mapping)
     assert validate_totals(out) == 50
 
@@ -141,13 +138,16 @@ def test_validate_totals_handles_multiple_summaries() -> None:
             ],
             "unit": ["m", "m", "", "m", "m", "", ""],
             "quantity": ["1", "2", "", "3", "4", "", ""],
-            "unit_price": ["10", "20", "", "30", "40", "", ""],
             "total_price": ["10", "40", "50", "90", "160", "250", "300"],
         }
     )
-    mapping = {"code": 0, "description": 1, "unit": 2, "quantity": 3, "unit_price": 4, "total_price": 5}
+    mapping = {"code": 0, "description": 1, "unit": 2, "quantity": 3, "total_price": 4}
     out = module.build_normalized_table(df, mapping)
     assert validate_totals(out) == 0
+    vals = out["section_total"].tolist()
+    assert vals[:3] == [50, 50, 50]
+    assert vals[3:6] == [250, 250, 250]
+    assert pd.isna(vals[6])
 
 
 def test_validate_totals_flags_subtotal_mismatch() -> None:
@@ -165,11 +165,10 @@ def test_validate_totals_flags_subtotal_mismatch() -> None:
             ],
             "unit": ["m", "m", "", "m", "m", "", ""],
             "quantity": ["1", "2", "", "3", "4", "", ""],
-            "unit_price": ["10", "20", "", "30", "40", "", ""],
             "total_price": ["10", "40", "60", "90", "160", "250", "300"],
         }
     )
-    mapping = {"code": 0, "description": 1, "unit": 2, "quantity": 3, "unit_price": 4, "total_price": 5}
+    mapping = {"code": 0, "description": 1, "unit": 2, "quantity": 3, "total_price": 4}
     out = module.build_normalized_table(df, mapping)
     assert validate_totals(out) == 10
 
@@ -187,11 +186,10 @@ def test_summary_type_and_dedup() -> None:
             ],
             "unit": ["m", "m", "", "", ""],
             "quantity": ["1", "2", "", "", ""],
-            "unit_price": ["10", "20", "", "", ""],
             "total_price": ["10", "40", "50", "50", "100"],
         }
     )
-    mapping = {"code": 0, "description": 1, "unit": 2, "quantity": 3, "unit_price": 4, "total_price": 5}
+    mapping = {"code": 0, "description": 1, "unit": 2, "quantity": 3, "total_price": 4}
     out = module.build_normalized_table(df, mapping)
     # duplicate summary row should be removed
     assert out.shape[0] == 4
