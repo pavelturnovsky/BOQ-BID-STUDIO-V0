@@ -24,7 +24,14 @@ HEADER_HINTS = {
     # optional extras commonly seen
     "item_id": ["item id", "itemid", "id položky", "id polozky", "kod", "kód", "číslo položky", "cislo polozky"],
     # extended optional columns for richer comparisons
-    "quantity_supplier": ["množství dodavatel", "mnozstvi dodavatel", "qty supplier", "quantity supplier"],
+    "quantity_supplier": [
+        "množství dodavatel",
+        "mnozstvi dodavatel",
+        "množství dle dodavatele",
+        "mnozstvi dle dodavatele",
+        "qty supplier",
+        "quantity supplier",
+    ],
     "unit_price_material": ["cena materiál", "cena material", "unit price material", "materiál", "material"],
     "unit_price_install": ["cena montáž", "cena montaz", "unit price install", "montáž", "montaz"],
     "total_price": ["cena celkem", "celková cena", "total price", "celkem"],
@@ -152,6 +159,9 @@ def build_normalized_table(df: pd.DataFrame, mapping: Dict[str, int]) -> pd.Data
         subset=["summary_type", "description", "total_price"], keep="first"
     )
     out = out[~dup_mask].copy()
+
+    # Preserve summary totals separately for later use
+    out["summary_price"] = out["total_price"].where(out["is_summary"], np.nan)
 
     # Compute section totals (propagate section summary values upwards)
     section_vals = out["total_price"].where(out["summary_type"] == "section")
@@ -496,8 +506,8 @@ def overview_comparison(master: WorkbookData, bids: Dict[str, WorkbookData], she
         mtab = mtab[~mtab["is_summary"].fillna(False).astype(bool)]
 
     df = (
-        mtab[["description", "total_price"]]
-        .groupby("description", as_index=False, dropna=False)["total_price"].sum()
+        mtab[["code", "description", "total_price"]]
+        .groupby(["code", "description"], as_index=False, dropna=False)["total_price"].sum()
         .rename(columns={"total_price": "Master total"})
     )
 
@@ -514,16 +524,25 @@ def overview_comparison(master: WorkbookData, bids: Dict[str, WorkbookData], she
             if "is_summary" in ttab.columns:
                 ttab = ttab[~ttab["is_summary"].fillna(False).astype(bool)]
             tdf = (
-                ttab[["description", "total_price"]]
-                .groupby("description", as_index=False, dropna=False)["total_price"].sum()
+                ttab[["code", "description", "total_price"]]
+                .groupby(["code", "description"], as_index=False, dropna=False)["total_price"].sum()
             )
-            df = df.merge(tdf, on="description", how="left")
+            df = df.merge(tdf, on=["code", "description"], how="left")
             df.rename(columns={"total_price": f"{sup_name} total"}, inplace=True)
 
     total_cols = [c for c in df.columns if c.endswith(" total")]
-    view = df[["description"] + total_cols].copy()
+    view = df[["code", "description"] + total_cols].copy()
+    view["code"] = view["code"].fillna("").astype(str)
     view["description"] = view["description"].fillna("").astype(str)
     view = view[view["description"].str.strip() != ""]
+
+    # Natural sort by code to handle values like 0, 0.1, 0.2
+    def _code_sort_key(s: pd.Series) -> pd.Series:
+        return s.str.split(".").apply(
+            lambda parts: tuple(int(p) if p.isdigit() else p for p in parts if p != "")
+        )
+
+    view = view.sort_values(by="code", key=_code_sort_key)
     indirect_mask = view["description"].str.contains("vedlejs", case=False, na=False)
     added_mask = view["description"].str.contains("dodavat", case=False, na=False)
     sections_df = view[~(indirect_mask | added_mask)]

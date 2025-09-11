@@ -194,3 +194,18 @@ def test_summary_type_and_dedup() -> None:
     # duplicate summary row should be removed
     assert out.shape[0] == 4
     assert out["summary_type"].tolist() == ["", "", "section", "grand"]
+
+
+def test_summary_price_column() -> None:
+    df = pd.DataFrame(
+        {
+            "code": ["1", ""],
+            "description": ["item", "součet"],
+            "quantity": ["1", ""],
+            "total_price": ["10", "10"],
+        }
+    )
+    mapping = {"code": 0, "description": 1, "quantity": 2, "total_price": 3}
+    out = module.build_normalized_table(df, mapping)
+    assert pd.isna(out.loc[0, "summary_price"])
+    assert out.loc[1, "summary_price"] == 10
