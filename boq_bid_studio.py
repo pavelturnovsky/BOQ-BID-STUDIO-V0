@@ -525,22 +525,43 @@ def overview_comparison(master: WorkbookData, bids: Dict[str, WorkbookData], she
 
 
 def validate_totals(df: pd.DataFrame) -> float:
-    """Return difference between summary total and sum of line items.
+    """Return cumulative absolute difference between summaries and items.
 
-    Positive result means the summary total is greater than the sum of
-    individual items. If no summary rows exist, returns 0."""
+    The check walks the table in order and compares each summary row with the
+    sum of preceding item rows until the previous summary. If the last summary
+    appears to be the grand total (i.e. it's the largest summary), it is also
+    compared against the overall sum of all items. The absolute differences are
+    accumulated and returned. If no summary rows exist, returns ``0``."""
     if df is None or df.empty:
         return np.nan
-    if "is_summary" in df.columns:
-        summary_mask = df["is_summary"].fillna(False).astype(bool)
-        summary_total = df.loc[summary_mask, "total_price"].sum(skipna=True)
-        line_total = df.loc[~summary_mask, "total_price"].sum(skipna=True)
-    else:
-        summary_total = 0.0
-        line_total = df["total_price"].sum(skipna=True)
-    if summary_total == 0:
+    if "is_summary" not in df.columns:
         return 0.0
-    return float(summary_total - line_total)
+
+    tp = coerce_numeric(df.get("total_price", 0)).fillna(0.0)
+    summaries = df["is_summary"].fillna(False).astype(bool).tolist()
+
+    diffs: List[float] = []
+    running = 0.0
+    total_items = 0.0
+    summary_vals: List[float] = []
+
+    for price, is_sum in zip(tp, summaries):
+        if not is_sum:
+            running += float(price)
+            total_items += float(price)
+        else:
+            diffs.append(float(price) - running)
+            running = 0.0
+            summary_vals.append(float(price))
+
+    # If the last summary is the largest, treat it as grand total and compare
+    # against all items instead of the running section sum.
+    if summary_vals:
+        last_val = summary_vals[-1]
+        if last_val == max(summary_vals):
+            diffs[-1] = last_val - total_items
+
+    return float(sum(abs(d) for d in diffs))
 
 def qa_checks(master: WorkbookData, bids: Dict[str, WorkbookData]) -> Dict[str, Dict[str, pd.DataFrame]]:
     """Return {sheet: {supplier: {"missing": df, "extras": df, "duplicates": df, "total_diff": float}}}"""

@@ -124,3 +124,51 @@ def test_validate_totals_detects_difference() -> None:
     mapping = {"code": 0, "description": 1, "unit": 2, "quantity": 3, "unit_price": 4, "total_price": 5}
     out = module.build_normalized_table(df, mapping)
     assert validate_totals(out) == 50
+
+
+def test_validate_totals_handles_multiple_summaries() -> None:
+    df = pd.DataFrame(
+        {
+            "code": ["1", "2", "", "3", "4", "", ""],
+            "description": [
+                "item1",
+                "item2",
+                "součet oddíl A",
+                "item3",
+                "item4",
+                "součet oddíl B",
+                "celkem",
+            ],
+            "unit": ["m", "m", "", "m", "m", "", ""],
+            "quantity": ["1", "2", "", "3", "4", "", ""],
+            "unit_price": ["10", "20", "", "30", "40", "", ""],
+            "total_price": ["10", "40", "50", "90", "160", "250", "300"],
+        }
+    )
+    mapping = {"code": 0, "description": 1, "unit": 2, "quantity": 3, "unit_price": 4, "total_price": 5}
+    out = module.build_normalized_table(df, mapping)
+    assert validate_totals(out) == 0
+
+
+def test_validate_totals_flags_subtotal_mismatch() -> None:
+    df = pd.DataFrame(
+        {
+            "code": ["1", "2", "", "3", "4", "", ""],
+            "description": [
+                "item1",
+                "item2",
+                "součet oddíl A",
+                "item3",
+                "item4",
+                "součet oddíl B",
+                "celkem",
+            ],
+            "unit": ["m", "m", "", "m", "m", "", ""],
+            "quantity": ["1", "2", "", "3", "4", "", ""],
+            "unit_price": ["10", "20", "", "30", "40", "", ""],
+            "total_price": ["10", "40", "60", "90", "160", "250", "300"],
+        }
+    )
+    mapping = {"code": 0, "description": 1, "unit": 2, "quantity": 3, "unit_price": 4, "total_price": 5}
+    out = module.build_normalized_table(df, mapping)
+    assert validate_totals(out) == 10
