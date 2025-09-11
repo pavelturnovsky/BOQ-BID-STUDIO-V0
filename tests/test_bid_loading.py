@@ -5,6 +5,7 @@ import types
 from pathlib import Path
 import pandas as pd
 import numpy as np
+from workbook import WorkbookData
 
 # Load only helper functions from boq_bid_studio without running Streamlit app
 ROOT = Path(__file__).resolve().parent.parent
@@ -18,6 +19,7 @@ read_workbook = module.read_workbook.__wrapped__
 apply_master_mapping = module.apply_master_mapping
 compare = module.compare
 validate_totals = module.validate_totals
+overview_comparison = module.overview_comparison
 
 
 def make_workbook(df: pd.DataFrame) -> io.BytesIO:
@@ -196,7 +198,7 @@ def test_summary_type_and_dedup() -> None:
     assert out["summary_type"].tolist() == ["", "", "section", "grand"]
 
 
-def test_summary_price_column() -> None:
+def test_summary_total_column() -> None:
     df = pd.DataFrame(
         {
             "code": ["1", ""],
@@ -207,5 +209,18 @@ def test_summary_price_column() -> None:
     )
     mapping = {"code": 0, "description": 1, "quantity": 2, "total_price": 3}
     out = module.build_normalized_table(df, mapping)
-    assert pd.isna(out.loc[0, "summary_price"])
-    assert out.loc[1, "summary_price"] == 10
+    assert pd.isna(out.loc[0, "summary_total"])
+    assert out.loc[1, "summary_total"] == 10
+    assert pd.isna(out.loc[1, "total_price"])
+
+
+def test_overview_comparison_mixed_codes() -> None:
+    master = WorkbookData(name="m", sheets={
+        "s": {
+            "table": pd.DataFrame(
+                {"code": ["1", "A"], "description": ["one", "A"], "total_price": [1, 2]}
+            )
+        }
+    })
+    sections, _, _ = overview_comparison(master, {}, "s")
+    assert sections["code"].tolist() == ["1", "A"]
