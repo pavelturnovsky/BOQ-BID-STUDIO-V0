@@ -17,7 +17,7 @@ st.caption("Jedna aplikace pro nahrání, mapování, porovnání nabídek a viz
 # ------------- Helpers -------------
 
 HEADER_HINTS = {
-    "code": ["code", "item", "číslo položky", "cislo polozky", "položka", "polozka", "id", "kód", "kod"],
+    "code": ["code", "item", "č.", "č", "číslo položky", "cislo polozky", "položka", "polozka", "id", "kód", "kod"],
     "description": ["description", "popis", "název", "nazev", "specifikace"],
     "unit": ["unit", "jm", "mj", "jednotka", "uom", "měrná jednotka", "merna jednotka"],
     "quantity": ["quantity", "qty", "množství", "mnozstvi", "q"],
@@ -29,7 +29,6 @@ HEADER_HINTS = {
     "unit_price_material": ["cena materiál", "cena material", "unit price material", "materiál", "material"],
     "unit_price_install": ["cena montáž", "cena montaz", "unit price install", "montáž", "montaz"],
     "total_price": ["cena celkem", "celková cena", "total price", "celkem"],
-    "section_total": ["celkem za oddíl", "section total", "součet za oddíl", "souhrn oddíl"]
 }
 
 # For některé souhrnné listy nemusí být množství dostupné
@@ -100,6 +99,17 @@ def detect_summary_rows(df: pd.DataFrame) -> pd.Series:
     structural_mask = code_blank & qty_zero & up_zero & (desc_str.str.strip() != "")
     return pattern_mask | structural_mask
 
+def classify_summary_type(df: pd.DataFrame, summary_mask: pd.Series) -> pd.Series:
+    """Categorize summary rows into section, grand, or other totals."""
+    desc = df.get("description", "").fillna("").astype(str).str.lower()
+    summary_type = pd.Series("", index=df.index, dtype="object")
+    section = desc.str.contains(r"(celkem\s*(za)?\s*odd[ií]l|sou[cč]et\s*(za)?\s*odd[ií]l)", na=False)
+    grand = desc.str.contains(r"(celkov[aá] cena|sou[cč]et za list|celkem)", na=False) & ~section
+    summary_type.loc[summary_mask & section] = "section"
+    summary_type.loc[summary_mask & grand] = "grand"
+    summary_type.loc[summary_mask & (summary_type == "")] = "other"
+    return summary_type
+
 @st.cache_data
 def build_normalized_table(df: pd.DataFrame, mapping: Dict[str, int]) -> pd.DataFrame:
     cols = df.columns.tolist()
@@ -120,21 +130,12 @@ def build_normalized_table(df: pd.DataFrame, mapping: Dict[str, int]) -> pd.Data
         "unit_price_install": coerce_numeric(pick("unit_price_install", np.nan)),
         "unit_price": coerce_numeric(pick("unit_price", np.nan)),
         "total_price": coerce_numeric(pick("total_price", np.nan)),
-        "section_total": coerce_numeric(pick("section_total", np.nan)),
     })
-    # use section totals as fallback for total_price
-    out["total_price"] = out["total_price"].fillna(out["section_total"])
-    if "section_total" in out.columns:
-        out.drop(columns=["section_total"], inplace=True)
-
-    # Ensure non-string descriptions do not break .str operations
-    desc_str = out["description"].fillna("").astype(str)
-    out["description"] = desc_str
-    code_blank = out["code"].astype(str).str.strip() == ""
 
     # Detect summary rows using centralized helper
     summary_mask = detect_summary_rows(out)
     out["is_summary"] = summary_mask
+    out["summary_type"] = classify_summary_type(out, summary_mask)
 
     # Compute total prices and cross-check
     out["calc_total"] = out["quantity"].fillna(0) * out["unit_price"].fillna(0)
@@ -142,6 +143,17 @@ def build_normalized_table(df: pd.DataFrame, mapping: Dict[str, int]) -> pd.Data
     out.loc[mask_total_na, "total_price"] = out.loc[mask_total_na, "calc_total"]
     out["total_diff"] = out["total_price"] - out["calc_total"]
     out.loc[summary_mask, ["calc_total", "total_diff"]] = np.nan
+
+    # Remove duplicate summary rows to avoid double counting
+    dup_mask = out["is_summary"] & out.duplicated(
+        subset=["summary_type", "description", "total_price"], keep="first"
+    )
+    out = out[~dup_mask].copy()
+
+    # Recompute helpers after potential row drops
+    desc_str = out["description"].fillna("").astype(str)
+    out["description"] = desc_str
+    code_blank = out["code"].astype(str).str.strip() == ""
 
     # Filter out completely empty rows (keep summaries for later validation)
     mask = (~code_blank) | (desc_str.str.strip() != "")
@@ -258,8 +270,16 @@ def mapping_ui(section_title: str, wb: WorkbookData, minimal: bool = False, mini
                 return max(0, min(idx, len(cols) - 1))
 
             if use_minimal:
-                c1, c2 = st.columns(2)
+                c1, c2, c3 = st.columns(3)
                 with c1:
+                    code_idx = st.selectbox(
+                        "Sloupec: code",
+                        cols,
+                        format_func=lambda i: header_names[i] if i < len(header_names) else "",
+                        index=clamp(pick_default("code")),
+                        key=f"map_code_{section_title}_{sheet}",
+                    )
+                with c2:
                     desc_idx = st.selectbox(
                         "Sloupec: description",
                         cols,
@@ -267,7 +287,7 @@ def mapping_ui(section_title: str, wb: WorkbookData, minimal: bool = False, mini
                         index=clamp(pick_default("description")),
                         key=f"map_desc_{section_title}_{sheet}",
                     )
-                with c2:
+                with c3:
                     total_idx = st.selectbox(
                         "Sloupec: total_price",
                         cols,
@@ -276,7 +296,7 @@ def mapping_ui(section_title: str, wb: WorkbookData, minimal: bool = False, mini
                         key=f"map_total_{section_title}_{sheet}",
                     )
                 ui_mapping = {
-                    "code": -1,
+                    "code": code_idx,
                     "description": desc_idx,
                     "unit": -1,
                     "quantity": -1,
@@ -285,7 +305,6 @@ def mapping_ui(section_title: str, wb: WorkbookData, minimal: bool = False, mini
                     "unit_price_material": -1,
                     "unit_price_install": -1,
                     "total_price": total_idx,
-                    "section_total": -1,
                 }
             else:
                 c1, c2, c3, c4, c5 = st.columns(5)
@@ -329,7 +348,7 @@ def mapping_ui(section_title: str, wb: WorkbookData, minimal: bool = False, mini
                         index=clamp(pick_default("unit_price")),
                         key=f"map_up_{section_title}_{sheet}",
                     )
-                c6, c7, c8, c9, c10 = st.columns(5)
+                c6, c7, c8, c9 = st.columns(4)
                 with c6:
                     qty_sup_idx = st.selectbox(
                         "Sloupec: quantity_supplier",
@@ -362,14 +381,6 @@ def mapping_ui(section_title: str, wb: WorkbookData, minimal: bool = False, mini
                         index=clamp(pick_default("total_price")),
                         key=f"map_total_{section_title}_{sheet}",
                     )
-                with c10:
-                    section_idx = st.selectbox(
-                        "Sloupec: section_total",
-                        cols,
-                        format_func=lambda i: header_names[i] if i < len(header_names) else "",
-                        index=clamp(pick_default("section_total")),
-                        key=f"map_section_{section_title}_{sheet}",
-                    )
 
                 ui_mapping = {
                     "code": code_idx,
@@ -381,7 +392,6 @@ def mapping_ui(section_title: str, wb: WorkbookData, minimal: bool = False, mini
                     "unit_price_material": upm_idx,
                     "unit_price_install": upi_idx,
                     "total_price": total_idx,
-                    "section_total": section_idx,
                 }
             if isinstance(raw, pd.DataFrame):
                 body = raw.iloc[header_row+1:].reset_index(drop=True)
