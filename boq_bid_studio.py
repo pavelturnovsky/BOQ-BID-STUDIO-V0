@@ -160,11 +160,12 @@ def build_normalized_table(df: pd.DataFrame, mapping: Dict[str, int]) -> pd.Data
     )
     out = out[~dup_mask].copy()
 
-    # Preserve summary totals separately for later use
-    out["summary_price"] = out["total_price"].where(out["is_summary"], np.nan)
+    # Preserve summary totals separately and exclude them from item totals
+    out["summary_total"] = out["total_price"].where(out["is_summary"], np.nan)
+    out.loc[out["is_summary"].fillna(False), "total_price"] = np.nan
 
     # Compute section totals (propagate section summary values upwards)
-    section_vals = out["total_price"].where(out["summary_type"] == "section")
+    section_vals = out["summary_total"].where(out["summary_type"] == "section")
     out["section_total"] = section_vals[::-1].ffill()[::-1]
     out.drop(columns=["unit_price_combined"], inplace=True)
 
@@ -485,7 +486,8 @@ def summarize(results: Dict[str, pd.DataFrame]) -> pd.DataFrame:
         if df is None or df.empty:
             continue
         total_cols = [c for c in df.columns if c.endswith(" total")]
-        sums = {c: df[c].sum(skipna=True) for c in total_cols}
+        valid = df["description"].astype(str).str.strip() != ""
+        sums = {c: df.loc[valid & df[c].notna(), c].sum() for c in total_cols}
         row = {"sheet": sheet}
         row.update(sums)
         rows.append(row)
@@ -538,9 +540,18 @@ def overview_comparison(master: WorkbookData, bids: Dict[str, WorkbookData], she
 
     # Natural sort by code to handle values like 0, 0.1, 0.2
     def _code_sort_key(s: pd.Series) -> pd.Series:
-        return s.str.split(".").apply(
-            lambda parts: tuple(int(p) if p.isdigit() else p for p in parts if p != "")
-        )
+        def convert(parts):
+            key = []
+            for p in parts:
+                if p == "":
+                    continue
+                if p.isdigit():
+                    key.append((0, int(p)))
+                else:
+                    key.append((1, p))
+            return tuple(key)
+
+        return s.str.split(".").apply(convert)
 
     view = view.sort_values(by="code", key=_code_sort_key)
     indirect_mask = view["description"].str.contains("vedlejs", case=False, na=False)
@@ -564,7 +575,8 @@ def validate_totals(df: pd.DataFrame) -> float:
     if "is_summary" not in df.columns:
         return 0.0
 
-    tp = coerce_numeric(df.get("total_price", 0)).fillna(0.0)
+    line_tp = coerce_numeric(df.get("total_price", 0)).fillna(0.0)
+    sum_tp = coerce_numeric(df.get("summary_total", 0)).fillna(0.0)
     summaries = df["is_summary"].fillna(False).astype(bool).tolist()
 
     diffs: List[float] = []
@@ -572,14 +584,14 @@ def validate_totals(df: pd.DataFrame) -> float:
     total_items = 0.0
     summary_vals: List[float] = []
 
-    for price, is_sum in zip(tp, summaries):
+    for line_val, sum_val, is_sum in zip(line_tp, sum_tp, summaries):
         if not is_sum:
-            running += float(price)
-            total_items += float(price)
+            running += float(line_val)
+            total_items += float(line_val)
         else:
-            diffs.append(float(price) - running)
+            diffs.append(float(sum_val) - running)
             running = 0.0
-            summary_vals.append(float(price))
+            summary_vals.append(float(sum_val))
 
     # If the last summary is the largest, treat it as grand total and compare
     # against all items instead of the running section sum.
