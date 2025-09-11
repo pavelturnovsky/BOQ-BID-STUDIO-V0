@@ -81,6 +81,25 @@ def coerce_numeric(s: pd.Series) -> pd.Series:
     s = s.str.replace(",", ".", regex=False)
     return pd.to_numeric(s, errors="coerce")
 
+
+def detect_summary_rows(df: pd.DataFrame) -> pd.Series:
+    """Return boolean Series marking summary/subtotal rows.
+
+    Detection combines textual patterns (e.g. "součet", "total") and
+    structural hints such as empty code with zero quantity and unit price.
+    """
+    desc_str = df.get("description", "").fillna("").astype(str)
+    summary_patterns = (
+        r"(celkem za odd[ií]l|sou[cč]et za odd[ií]l|celkov[aá] cena za list|sou[cč]et za list|"
+        r"sou[cč]et|souhrn|subtotal|total|celkem)"
+    )
+    code_blank = df.get("code", "").astype(str).str.strip() == ""
+    qty_zero = coerce_numeric(df.get("quantity", 0)).fillna(0) == 0
+    up_zero = coerce_numeric(df.get("unit_price", 0)).fillna(0) == 0
+    pattern_mask = desc_str.str.contains(summary_patterns, case=False, na=False)
+    structural_mask = code_blank & qty_zero & up_zero & (desc_str.str.strip() != "")
+    return pattern_mask | structural_mask
+
 @st.cache_data
 def build_normalized_table(df: pd.DataFrame, mapping: Dict[str, int]) -> pd.DataFrame:
     cols = df.columns.tolist()
@@ -111,18 +130,10 @@ def build_normalized_table(df: pd.DataFrame, mapping: Dict[str, int]) -> pd.Data
     # Ensure non-string descriptions do not break .str operations
     desc_str = out["description"].fillna("").astype(str)
     out["description"] = desc_str
-
-    # Heuristics for detecting summary rows
-    summary_patterns = (
-        r"(celkem za odd[ií]l|sou[cč]et za odd[ií]l|celkov[aá] cena za list|sou[cč]et za list|"
-        r"sou[cč]et|souhrn|subtotal|total|celkem)"
-    )
     code_blank = out["code"].astype(str).str.strip() == ""
-    qty_zero = out["quantity"].fillna(0) == 0
-    up_zero = out["unit_price"].fillna(0) == 0
-    pattern_mask = desc_str.str.contains(summary_patterns, case=False, na=False)
-    structural_mask = code_blank & qty_zero & up_zero & (desc_str.str.strip() != "")
-    summary_mask = pattern_mask | structural_mask
+
+    # Detect summary rows using centralized helper
+    summary_mask = detect_summary_rows(out)
     out["is_summary"] = summary_mask
 
     # Compute total prices and cross-check
@@ -130,14 +141,14 @@ def build_normalized_table(df: pd.DataFrame, mapping: Dict[str, int]) -> pd.Data
     mask_total_na = out["total_price"].isna()
     out.loc[mask_total_na, "total_price"] = out.loc[mask_total_na, "calc_total"]
     out["total_diff"] = out["total_price"] - out["calc_total"]
-    out.loc[summary_mask, "calc_total"] = np.nan
-    out.loc[summary_mask, "total_diff"] = np.nan
+    out.loc[summary_mask, ["calc_total", "total_diff"]] = np.nan
 
     # Filter out completely empty rows (keep summaries for later validation)
     mask = (~code_blank) | (desc_str.str.strip() != "")
     out = out[mask].copy()
     numeric_cols = out.select_dtypes(include=[np.number]).columns
-    out = out[~((out[numeric_cols].isna() | (out[numeric_cols] == 0)).all(axis=1) & ~out["is_summary"])]
+    summary_col = out["is_summary"].fillna(False).astype(bool)
+    out = out[~((out[numeric_cols].isna() | (out[numeric_cols] == 0)).all(axis=1) & ~summary_col)]
     # Canonical key (will be overridden if user picks dedicated Item ID)
     out["__key__"] = (
         out["code"].astype(str).str.strip() + " | " + desc_str.str.strip()
@@ -401,7 +412,7 @@ def compare(master: WorkbookData, bids: Dict[str, WorkbookData], join_mode: str 
         if mtab is None or mtab.empty:
             continue
         if "is_summary" in mtab.columns:
-            mtab = mtab[~mtab["is_summary"]]
+            mtab = mtab[~mtab["is_summary"].fillna(False).astype(bool)]
         base = mtab[["__key__", "code", "description", "unit", "quantity", "total_price"]].copy()
         base = base.drop_duplicates("__key__")
         base.rename(columns={"total_price": "Master total"}, inplace=True)
@@ -416,7 +427,7 @@ def compare(master: WorkbookData, bids: Dict[str, WorkbookData], join_mode: str 
                 comp[f"{sup_name} total"] = np.nan
                 continue
             if "is_summary" in ttab.columns:
-                ttab = ttab[~ttab["is_summary"]]
+                ttab = ttab[~ttab["is_summary"].fillna(False).astype(bool)]
             # join by __key__ (manual mapping already built in normalized table)
             sup_qty_col = "quantity_supplier" if "quantity_supplier" in ttab.columns else "quantity"
             tt = ttab[["__key__", sup_qty_col, "unit_price_material", "unit_price_install", "unit_price", "total_price"]].copy()
@@ -474,7 +485,7 @@ def overview_comparison(master: WorkbookData, bids: Dict[str, WorkbookData], she
     if mtab is None or mtab.empty:
         return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
     if "is_summary" in mtab.columns:
-        mtab = mtab[~mtab["is_summary"]]
+        mtab = mtab[~mtab["is_summary"].fillna(False).astype(bool)]
 
     df = (
         mtab[["description", "total_price"]]
@@ -493,7 +504,7 @@ def overview_comparison(master: WorkbookData, bids: Dict[str, WorkbookData], she
             df[f"{sup_name} total"] = np.nan
         else:
             if "is_summary" in ttab.columns:
-                ttab = ttab[~ttab["is_summary"]]
+                ttab = ttab[~ttab["is_summary"].fillna(False).astype(bool)]
             tdf = (
                 ttab[["description", "total_price"]]
                 .groupby("description", as_index=False, dropna=False)["total_price"].sum()
@@ -521,8 +532,9 @@ def validate_totals(df: pd.DataFrame) -> float:
     if df is None or df.empty:
         return np.nan
     if "is_summary" in df.columns:
-        summary_total = df.loc[df["is_summary"], "total_price"].sum(skipna=True)
-        line_total = df.loc[~df["is_summary"], "total_price"].sum(skipna=True)
+        summary_mask = df["is_summary"].fillna(False).astype(bool)
+        summary_total = df.loc[summary_mask, "total_price"].sum(skipna=True)
+        line_total = df.loc[~summary_mask, "total_price"].sum(skipna=True)
     else:
         summary_total = 0.0
         line_total = df["total_price"].sum(skipna=True)
@@ -538,7 +550,10 @@ def qa_checks(master: WorkbookData, bids: Dict[str, WorkbookData]) -> Dict[str, 
         if mtab is None or mtab.empty:
             continue
         mtotal_diff = validate_totals(mtab)
-        mtab_clean = mtab[~mtab.get("is_summary", False)] if "is_summary" in mtab.columns else mtab
+        if "is_summary" in mtab.columns:
+            mtab_clean = mtab[~mtab["is_summary"].fillna(False).astype(bool)]
+        else:
+            mtab_clean = mtab
         mkeys = set(mtab_clean["__key__"].dropna().astype(str))
         per_sheet: Dict[str, Dict[str, pd.DataFrame]] = {}
         # Include master total diff for reference
@@ -558,7 +573,10 @@ def qa_checks(master: WorkbookData, bids: Dict[str, WorkbookData]) -> Dict[str, 
                 total_diff = np.nan
             else:
                 total_diff = validate_totals(ttab)
-                ttab_clean = ttab[~ttab.get("is_summary", False)] if "is_summary" in ttab.columns else ttab
+                if "is_summary" in ttab.columns:
+                    ttab_clean = ttab[~ttab["is_summary"].fillna(False).astype(bool)]
+                else:
+                    ttab_clean = ttab
                 tkeys_series = ttab_clean["__key__"].dropna().astype(str)
                 tkeys = set(tkeys_series)
                 miss = pd.DataFrame({"__key__": sorted(mkeys - tkeys)})

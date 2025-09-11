@@ -94,6 +94,22 @@ def test_total_diff_and_summary_detection() -> None:
     assert validate_totals(out) == 0
 
 
+def test_detect_summary_rows_alternating() -> None:
+    df = pd.DataFrame(
+        {
+            "code": ["1", "", "2", "", ""],
+            "description": ["item1", "součet", "item2", "Sub section", "Total"],
+            "unit": ["m", "", "m", "", ""],
+            "quantity": ["1", "", "2", "", ""],
+            "unit_price": ["10", "", "20", "", ""],
+            "total_price": ["10", "10", "40", "50", "50"],
+        }
+    )
+    mapping = {"code": 0, "description": 1, "unit": 2, "quantity": 3, "unit_price": 4, "total_price": 5}
+    out = module.build_normalized_table(df, mapping)
+    assert out["is_summary"].tolist() == [False, True, False, True, True]
+
+
 def test_validate_totals_detects_difference() -> None:
     df = pd.DataFrame(
         {
