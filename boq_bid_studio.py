@@ -21,7 +21,6 @@ HEADER_HINTS = {
     "description": ["description", "popis", "název", "nazev", "specifikace"],
     "unit": ["unit", "jm", "mj", "jednotka", "uom", "měrná jednotka", "merna jednotka"],
     "quantity": ["quantity", "qty", "množství", "mnozstvi", "q"],
-    "unit_price": ["unit price", "u.p.", "cena/jedn", "cena za jednotku", "jedn. cena", "unitprice", "rate", "sazba", "jednotková cena", "jednotkova cena"],
     # optional extras commonly seen
     "item_id": ["item id", "itemid", "id položky", "id polozky", "kod", "kód", "číslo položky", "cislo polozky"],
     # extended optional columns for richer comparisons
@@ -32,7 +31,7 @@ HEADER_HINTS = {
 }
 
 # For některé souhrnné listy nemusí být množství dostupné
-REQUIRED_KEYS = ["code", "description"]  # unit & quantity & unit_price can be optional at parse time
+REQUIRED_KEYS = ["code", "description"]  # unit & quantity can be optional at parse time
 
 def normalize_col(c):
     if not isinstance(c, str):
@@ -94,7 +93,11 @@ def detect_summary_rows(df: pd.DataFrame) -> pd.Series:
     )
     code_blank = df.get("code", "").astype(str).str.strip() == ""
     qty_zero = coerce_numeric(df.get("quantity", 0)).fillna(0) == 0
-    up_zero = coerce_numeric(df.get("unit_price", 0)).fillna(0) == 0
+    unit_price_combined = (
+        coerce_numeric(df.get("unit_price_material", 0)).fillna(0)
+        + coerce_numeric(df.get("unit_price_install", 0)).fillna(0)
+    )
+    up_zero = unit_price_combined == 0
     pattern_mask = desc_str.str.contains(summary_patterns, case=False, na=False)
     structural_mask = code_blank & qty_zero & up_zero & (desc_str.str.strip() != "")
     return pattern_mask | structural_mask
@@ -128,7 +131,6 @@ def build_normalized_table(df: pd.DataFrame, mapping: Dict[str, int]) -> pd.Data
         "quantity_supplier": coerce_numeric(pick("quantity_supplier", np.nan)),
         "unit_price_material": coerce_numeric(pick("unit_price_material", np.nan)),
         "unit_price_install": coerce_numeric(pick("unit_price_install", np.nan)),
-        "unit_price": coerce_numeric(pick("unit_price", np.nan)),
         "total_price": coerce_numeric(pick("total_price", np.nan)),
     })
 
@@ -138,17 +140,23 @@ def build_normalized_table(df: pd.DataFrame, mapping: Dict[str, int]) -> pd.Data
     out["summary_type"] = classify_summary_type(out, summary_mask)
 
     # Compute total prices and cross-check
-    out["calc_total"] = out["quantity"].fillna(0) * out["unit_price"].fillna(0)
+    out["unit_price_combined"] = out[["unit_price_material", "unit_price_install"]].sum(axis=1, min_count=1)
+    out["calc_total"] = out["quantity"].fillna(0) * out["unit_price_combined"].fillna(0)
     mask_total_na = out["total_price"].isna()
     out.loc[mask_total_na, "total_price"] = out.loc[mask_total_na, "calc_total"]
     out["total_diff"] = out["total_price"] - out["calc_total"]
-    out.loc[summary_mask, ["calc_total", "total_diff"]] = np.nan
+    out.loc[summary_mask, ["unit_price_combined", "calc_total", "total_diff"]] = np.nan
 
     # Remove duplicate summary rows to avoid double counting
     dup_mask = out["is_summary"] & out.duplicated(
         subset=["summary_type", "description", "total_price"], keep="first"
     )
     out = out[~dup_mask].copy()
+
+    # Compute section totals (propagate section summary values upwards)
+    section_vals = out["total_price"].where(out["summary_type"] == "section")
+    out["section_total"] = section_vals[::-1].ffill()[::-1]
+    out.drop(columns=["unit_price_combined"], inplace=True)
 
     # Recompute helpers after potential row drops
     desc_str = out["description"].fillna("").astype(str)
@@ -300,14 +308,13 @@ def mapping_ui(section_title: str, wb: WorkbookData, minimal: bool = False, mini
                     "description": desc_idx,
                     "unit": -1,
                     "quantity": -1,
-                    "unit_price": -1,
                     "quantity_supplier": -1,
                     "unit_price_material": -1,
                     "unit_price_install": -1,
                     "total_price": total_idx,
                 }
             else:
-                c1, c2, c3, c4, c5 = st.columns(5)
+                c1, c2, c3, c4 = st.columns(4)
                 with c1:
                     code_idx = st.selectbox(
                         "Sloupec: code",
@@ -340,16 +347,8 @@ def mapping_ui(section_title: str, wb: WorkbookData, minimal: bool = False, mini
                         index=clamp(pick_default("quantity")),
                         key=f"map_qty_{section_title}_{sheet}",
                     )
+                c5, c6, c7, c8 = st.columns(4)
                 with c5:
-                    up_idx = st.selectbox(
-                        "Sloupec: unit_price",
-                        cols,
-                        format_func=lambda i: header_names[i] if i < len(header_names) else "",
-                        index=clamp(pick_default("unit_price")),
-                        key=f"map_up_{section_title}_{sheet}",
-                    )
-                c6, c7, c8, c9 = st.columns(4)
-                with c6:
                     qty_sup_idx = st.selectbox(
                         "Sloupec: quantity_supplier",
                         cols,
@@ -357,7 +356,7 @@ def mapping_ui(section_title: str, wb: WorkbookData, minimal: bool = False, mini
                         index=clamp(pick_default("quantity_supplier")),
                         key=f"map_qtysup_{section_title}_{sheet}",
                     )
-                with c7:
+                with c6:
                     upm_idx = st.selectbox(
                         "Sloupec: unit_price_material",
                         cols,
@@ -365,7 +364,7 @@ def mapping_ui(section_title: str, wb: WorkbookData, minimal: bool = False, mini
                         index=clamp(pick_default("unit_price_material")),
                         key=f"map_upm_{section_title}_{sheet}",
                     )
-                with c8:
+                with c7:
                     upi_idx = st.selectbox(
                         "Sloupec: unit_price_install",
                         cols,
@@ -373,7 +372,7 @@ def mapping_ui(section_title: str, wb: WorkbookData, minimal: bool = False, mini
                         index=clamp(pick_default("unit_price_install")),
                         key=f"map_upi_{section_title}_{sheet}",
                     )
-                with c9:
+                with c8:
                     total_idx = st.selectbox(
                         "Sloupec: total_price",
                         cols,
@@ -387,7 +386,6 @@ def mapping_ui(section_title: str, wb: WorkbookData, minimal: bool = False, mini
                     "description": desc_idx,
                     "unit": unit_idx,
                     "quantity": qty_idx,
-                    "unit_price": up_idx,
                     "quantity_supplier": qty_sup_idx,
                     "unit_price_material": upm_idx,
                     "unit_price_install": upi_idx,
@@ -440,8 +438,8 @@ def compare(master: WorkbookData, bids: Dict[str, WorkbookData], join_mode: str 
                 ttab = ttab[~ttab["is_summary"].fillna(False).astype(bool)]
             # join by __key__ (manual mapping already built in normalized table)
             sup_qty_col = "quantity_supplier" if "quantity_supplier" in ttab.columns else "quantity"
-            tt = ttab[["__key__", sup_qty_col, "unit_price_material", "unit_price_install", "unit_price", "total_price"]].copy()
-            tt["unit_price_combined"] = tt[["unit_price_material", "unit_price_install", "unit_price"]].sum(axis=1, min_count=1)
+            tt = ttab[["__key__", sup_qty_col, "unit_price_material", "unit_price_install", "total_price"]].copy()
+            tt["unit_price_combined"] = tt[["unit_price_material", "unit_price_install"]].sum(axis=1, min_count=1)
             tt["calc_total"] = tt["total_price"]
             mask = tt["calc_total"].isna()
             tt.loc[mask, "calc_total"] = tt.loc[mask, sup_qty_col] * tt.loc[mask, "unit_price_combined"]
