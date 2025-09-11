@@ -172,3 +172,27 @@ def test_validate_totals_flags_subtotal_mismatch() -> None:
     mapping = {"code": 0, "description": 1, "unit": 2, "quantity": 3, "unit_price": 4, "total_price": 5}
     out = module.build_normalized_table(df, mapping)
     assert validate_totals(out) == 10
+
+
+def test_summary_type_and_dedup() -> None:
+    df = pd.DataFrame(
+        {
+            "code": ["1", "2", "", "", ""],
+            "description": [
+                "item1",
+                "item2",
+                "součet oddíl A",
+                "součet oddíl A",
+                "celkem",
+            ],
+            "unit": ["m", "m", "", "", ""],
+            "quantity": ["1", "2", "", "", ""],
+            "unit_price": ["10", "20", "", "", ""],
+            "total_price": ["10", "40", "50", "50", "100"],
+        }
+    )
+    mapping = {"code": 0, "description": 1, "unit": 2, "quantity": 3, "unit_price": 4, "total_price": 5}
+    out = module.build_normalized_table(df, mapping)
+    # duplicate summary row should be removed
+    assert out.shape[0] == 4
+    assert out["summary_type"].tolist() == ["", "", "section", "grand"]
