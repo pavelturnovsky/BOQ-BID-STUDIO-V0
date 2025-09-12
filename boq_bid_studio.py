@@ -17,8 +17,8 @@ st.caption("Jedna aplikace pro nahrání, mapování, porovnání nabídek a viz
 # ------------- Helpers -------------
 
 HEADER_HINTS = {
-    "code": ["code", "item", "č.", "č", "číslo položky", "cislo polozky", "položka", "polozka", "id", "kód", "kod"],
-    "description": ["description", "popis", "název", "nazev", "specifikace"],
+    "code": ["code", "item", "č.", "č", "číslo položky", "cislo polozky", "id", "kód", "kod"],
+    "description": ["description", "popis", "položka", "polozka", "název", "nazev", "specifikace"],
     "unit": ["unit", "jm", "mj", "jednotka", "uom", "měrná jednotka", "merna jednotka"],
     "quantity": ["quantity", "qty", "množství", "mnozstvi", "q"],
     # optional extras commonly seen
@@ -35,6 +35,7 @@ HEADER_HINTS = {
     "unit_price_material": ["cena materiál", "cena material", "unit price material", "materiál", "material"],
     "unit_price_install": ["cena montáž", "cena montaz", "unit price install", "montáž", "montaz"],
     "total_price": ["cena celkem", "celková cena", "total price", "celkem"],
+    "summary_total": ["celkem za oddíl", "součet oddíl", "součet za oddíl"],
 }
 
 # For některé souhrnné listy nemusí být množství dostupné
@@ -139,6 +140,7 @@ def build_normalized_table(df: pd.DataFrame, mapping: Dict[str, int]) -> pd.Data
         "unit_price_material": coerce_numeric(pick("unit_price_material", np.nan)),
         "unit_price_install": coerce_numeric(pick("unit_price_install", np.nan)),
         "total_price": coerce_numeric(pick("total_price", np.nan)),
+        "summary_total": coerce_numeric(pick("summary_total", np.nan)),
     })
 
     # Detect summary rows using centralized helper
@@ -161,8 +163,10 @@ def build_normalized_table(df: pd.DataFrame, mapping: Dict[str, int]) -> pd.Data
     out = out[~dup_mask].copy()
 
     # Preserve summary totals separately and exclude them from item totals
-    out["summary_total"] = out["total_price"].where(out["is_summary"], np.nan)
-    out.loc[out["is_summary"].fillna(False), "total_price"] = np.nan
+    out.loc[summary_mask & out["summary_total"].isna(), "summary_total"] = out.loc[
+        summary_mask & out["summary_total"].isna(), "total_price"
+    ]
+    out.loc[summary_mask, "total_price"] = np.nan
 
     # Compute section totals (propagate section summary values upwards)
     section_vals = out["summary_total"].where(out["summary_type"] == "section")
@@ -172,11 +176,10 @@ def build_normalized_table(df: pd.DataFrame, mapping: Dict[str, int]) -> pd.Data
     # Recompute helpers after potential row drops
     desc_str = out["description"].fillna("").astype(str)
     out["description"] = desc_str
-    code_blank = out["code"].astype(str).str.strip() == ""
 
-    # Filter out completely empty rows (keep summaries for later validation)
-    mask = (~code_blank) | (desc_str.str.strip() != "")
-    out = out[mask].copy()
+    # Filter out rows without description entirely
+    out = out[desc_str.str.strip() != ""].copy()
+    desc_str = out["description"].fillna("").astype(str)
     numeric_cols = out.select_dtypes(include=[np.number]).columns
     summary_col = out["is_summary"].fillna(False).astype(bool)
     out = out[~((out[numeric_cols].isna() | (out[numeric_cols] == 0)).all(axis=1) & ~summary_col)]
@@ -184,6 +187,26 @@ def build_normalized_table(df: pd.DataFrame, mapping: Dict[str, int]) -> pd.Data
     out["__key__"] = (
         out["code"].astype(str).str.strip() + " | " + desc_str.str.strip()
     ).str.strip(" |")
+
+    # Reorder columns for clarity
+    col_order = [
+        "code",
+        "description",
+        "unit",
+        "quantity",
+        "quantity_supplier",
+        "unit_price_material",
+        "unit_price_install",
+        "total_price",
+        "summary_total",
+        "section_total",
+        "calc_total",
+        "total_diff",
+        "is_summary",
+        "summary_type",
+        "__key__",
+    ]
+    out = out[[c for c in col_order if c in out.columns]]
     return out
 
 
@@ -289,7 +312,7 @@ def mapping_ui(section_title: str, wb: WorkbookData, minimal: bool = False, mini
                 return max(0, min(idx, len(cols) - 1))
 
             if use_minimal:
-                c1, c2, c3 = st.columns(3)
+                c1, c2, c3, c4 = st.columns(4)
                 with c1:
                     code_idx = st.selectbox(
                         "Sloupec: code",
@@ -314,6 +337,14 @@ def mapping_ui(section_title: str, wb: WorkbookData, minimal: bool = False, mini
                         index=clamp(pick_default("total_price")),
                         key=f"map_total_{section_title}_{sheet}",
                     )
+                with c4:
+                    summ_idx = st.selectbox(
+                        "Sloupec: summary_total",
+                        cols,
+                        format_func=lambda i: header_names[i] if i < len(header_names) else "",
+                        index=clamp(pick_default("summary_total")),
+                        key=f"map_sum_{section_title}_{sheet}",
+                    )
                 ui_mapping = {
                     "code": code_idx,
                     "description": desc_idx,
@@ -323,6 +354,7 @@ def mapping_ui(section_title: str, wb: WorkbookData, minimal: bool = False, mini
                     "unit_price_material": -1,
                     "unit_price_install": -1,
                     "total_price": total_idx,
+                    "summary_total": summ_idx,
                 }
             else:
                 c1, c2, c3, c4 = st.columns(4)
@@ -358,7 +390,7 @@ def mapping_ui(section_title: str, wb: WorkbookData, minimal: bool = False, mini
                         index=clamp(pick_default("quantity")),
                         key=f"map_qty_{section_title}_{sheet}",
                     )
-                c5, c6, c7, c8 = st.columns(4)
+                c5, c6, c7, c8, c9 = st.columns(5)
                 with c5:
                     qty_sup_idx = st.selectbox(
                         "Sloupec: quantity_supplier",
@@ -391,6 +423,14 @@ def mapping_ui(section_title: str, wb: WorkbookData, minimal: bool = False, mini
                         index=clamp(pick_default("total_price")),
                         key=f"map_total_{section_title}_{sheet}",
                     )
+                with c9:
+                    summ_idx = st.selectbox(
+                        "Sloupec: summary_total",
+                        cols,
+                        format_func=lambda i: header_names[i] if i < len(header_names) else "",
+                        index=clamp(pick_default("summary_total")),
+                        key=f"map_sum_{section_title}_{sheet}",
+                    )
 
                 ui_mapping = {
                     "code": code_idx,
@@ -401,6 +441,7 @@ def mapping_ui(section_title: str, wb: WorkbookData, minimal: bool = False, mini
                     "unit_price_material": upm_idx,
                     "unit_price_install": upi_idx,
                     "total_price": total_idx,
+                    "summary_total": summ_idx,
                 }
             if isinstance(raw, pd.DataFrame):
                 body = raw.iloc[header_row+1:].reset_index(drop=True)
@@ -432,6 +473,7 @@ def compare(master: WorkbookData, bids: Dict[str, WorkbookData], join_mode: str 
             continue
         if "is_summary" in mtab.columns:
             mtab = mtab[~mtab["is_summary"].fillna(False).astype(bool)]
+        mtab = mtab[mtab["description"].astype(str).str.strip() != ""]
         base = mtab[["__key__", "code", "description", "unit", "quantity", "total_price"]].copy()
         base = base.drop_duplicates("__key__")
         base.rename(columns={"total_price": "Master total"}, inplace=True)
@@ -447,6 +489,7 @@ def compare(master: WorkbookData, bids: Dict[str, WorkbookData], join_mode: str 
                 continue
             if "is_summary" in ttab.columns:
                 ttab = ttab[~ttab["is_summary"].fillna(False).astype(bool)]
+            ttab = ttab[ttab["description"].astype(str).str.strip() != ""]
             # join by __key__ (manual mapping already built in normalized table)
             sup_qty_col = "quantity_supplier" if "quantity_supplier" in ttab.columns else "quantity"
             tt = ttab[["__key__", sup_qty_col, "unit_price_material", "unit_price_install", "total_price"]].copy()
@@ -486,16 +529,19 @@ def summarize(results: Dict[str, pd.DataFrame]) -> pd.DataFrame:
         if df is None or df.empty:
             continue
         total_cols = [c for c in df.columns if c.endswith(" total")]
-        valid = df["description"].astype(str).str.strip() != ""
-        sums = {c: df.loc[valid & df[c].notna(), c].sum() for c in total_cols}
+        df = df[df["description"].astype(str).str.strip() != ""]
+        sums = {c: df[c].dropna().sum() for c in total_cols}
         row = {"sheet": sheet}
         row.update(sums)
         rows.append(row)
     out = pd.DataFrame(rows)
     return out
 
-def overview_comparison(master: WorkbookData, bids: Dict[str, WorkbookData], sheet_name: str) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """Return tables for section totals, indirect costs and supplier added costs."""
+def overview_comparison(
+    master: WorkbookData, bids: Dict[str, WorkbookData], sheet_name: str
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Return tables for section totals, indirect costs, added costs,
+    missing items and aggregated indirect totals."""
     mobj = master.sheets.get(sheet_name, {})
     mtab = mobj.get("table", pd.DataFrame())
     if (mtab is None or mtab.empty) and isinstance(mobj.get("raw"), pd.DataFrame):
@@ -503,7 +549,7 @@ def overview_comparison(master: WorkbookData, bids: Dict[str, WorkbookData], she
         if mapping:
             mtab = build_normalized_table(body, mapping)
     if mtab is None or mtab.empty:
-        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
     if "is_summary" in mtab.columns:
         mtab = mtab[~mtab["is_summary"].fillna(False).astype(bool)]
 
@@ -554,12 +600,38 @@ def overview_comparison(master: WorkbookData, bids: Dict[str, WorkbookData], she
         return s.str.split(".").apply(convert)
 
     view = view.sort_values(by="code", key=_code_sort_key)
-    indirect_mask = view["description"].str.contains("vedlejs", case=False, na=False)
+    indirect_mask = view["description"].str.contains("vedlej", case=False, na=False)
     added_mask = view["description"].str.contains("dodavat", case=False, na=False)
     sections_df = view[~(indirect_mask | added_mask)]
     indirect_df = view[indirect_mask]
     added_df = view[added_mask]
-    return sections_df, indirect_df, added_df
+
+    # Missing items per supplier
+    missing_rows: List[pd.DataFrame] = []
+    for col in total_cols:
+        if col == "Master total":
+            continue
+        missing_mask = sections_df[col].isna() & sections_df["Master total"].notna()
+        if missing_mask.any():
+            tmp = sections_df.loc[missing_mask, ["code", "description", "Master total"]].copy()
+            tmp["missing_in"] = col.replace(" total", "")
+            missing_rows.append(tmp)
+    missing_df = (
+        pd.concat(missing_rows, ignore_index=True)
+        if missing_rows
+        else pd.DataFrame(columns=["code", "description", "Master total", "missing_in"])
+    )
+
+    # Aggregate indirect costs per supplier
+    if indirect_df.empty:
+        indirect_total = pd.DataFrame()
+    else:
+        sums = indirect_df[[c for c in indirect_df.columns if c.endswith(" total")]].sum()
+        indirect_total = sums.rename("total").to_frame().reset_index()
+        indirect_total.rename(columns={"index": "supplier"}, inplace=True)
+        indirect_total["supplier"] = indirect_total["supplier"].str.replace(" total", "", regex=False)
+
+    return sections_df, indirect_df, added_df, missing_df, indirect_total
 
 
 def validate_totals(df: pd.DataFrame) -> float:
@@ -780,7 +852,9 @@ if bids_dict:
     compare_results = compare(master_wb, bids_dict, join_mode="auto")
 
 # Pre-compute rekapitulace results to avoid repeated work in tabs (after mapping)
-recap_results: Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame] = (
+recap_results: Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame] = (
+    pd.DataFrame(),
+    pd.DataFrame(),
     pd.DataFrame(),
     pd.DataFrame(),
     pd.DataFrame(),
@@ -854,17 +928,28 @@ with tab_rekap:
     if not bids_overview_dict:
         st.info("Nahraj alespoň jednu nabídku dodavatele v levém panelu.")
     else:
-        sections_df, indirect_df, added_df = recap_results
-        if sections_df.empty and indirect_df.empty and added_df.empty:
+        sections_df, indirect_df, added_df, missing_df, indirect_total = recap_results
+        if (
+            sections_df.empty
+            and indirect_df.empty
+            and added_df.empty
+            and missing_df.empty
+        ):
             st.info(f"List '{overview_sheet}' neobsahuje data pro porovnání.")
         else:
             st.subheader(f"Souhrnný list: {overview_sheet}")
             if not sections_df.empty:
                 st.markdown("### Celkové ceny oddílů")
                 show_df(sections_df)
+            if not missing_df.empty:
+                st.markdown("### Chybějící položky dle dodavatele")
+                show_df(missing_df)
             if not indirect_df.empty:
                 st.markdown("### Vedlejší rozpočtové náklady")
                 show_df(indirect_df)
+                if not indirect_total.empty:
+                    st.markdown("**Součet vedlejších nákladů:**")
+                    show_df(indirect_total)
             if not added_df.empty:
                 st.markdown("### Náklady přidané dodavatelem")
                 show_df(added_df)
