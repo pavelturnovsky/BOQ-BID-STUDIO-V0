@@ -474,9 +474,31 @@ def compare(master: WorkbookData, bids: Dict[str, WorkbookData], join_mode: str 
         if "is_summary" in mtab.columns:
             mtab = mtab[~mtab["is_summary"].fillna(False).astype(bool)]
         mtab = mtab[mtab["description"].astype(str).str.strip() != ""]
-        base = mtab[["__key__", "code", "description", "unit", "quantity", "total_price"]].copy()
-        base = base.drop_duplicates("__key__")
-        base.rename(columns={"total_price": "Master total"}, inplace=True)
+        mtab["unit_price_combined"] = mtab[[
+            "unit_price_material",
+            "unit_price_install",
+        ]].sum(axis=1, min_count=1)
+        mtab["calc_total"] = (
+            mtab["quantity"].fillna(0) * mtab["unit_price_combined"].fillna(0)
+        )
+        mask = mtab["total_price"].isna()
+        mtab.loc[mask, "total_price"] = mtab.loc[mask, "calc_total"]
+        mtab["calc_total"] = mtab["calc_total"].round(2)
+        base = (
+            mtab.groupby("__key__", as_index=False)
+            .agg(
+                {
+                    "code": "first",
+                    "description": "first",
+                    "unit": "first",
+                    "quantity": "sum",
+                    "calc_total": "sum",
+                }
+            )
+        )
+        base["quantity"] = base["quantity"].round(2)
+        base["Master total"] = base["calc_total"].round(2)
+        base.drop(columns=["calc_total"], inplace=True)
         comp = base.copy()
 
         for sup_name, wb in bids.items():
@@ -491,18 +513,48 @@ def compare(master: WorkbookData, bids: Dict[str, WorkbookData], join_mode: str 
                 ttab = ttab[~ttab["is_summary"].fillna(False).astype(bool)]
             ttab = ttab[ttab["description"].astype(str).str.strip() != ""]
             # join by __key__ (manual mapping already built in normalized table)
-            sup_qty_col = "quantity_supplier" if "quantity_supplier" in ttab.columns else "quantity"
-            tt = ttab[["__key__", sup_qty_col, "unit_price_material", "unit_price_install", "total_price"]].copy()
-            tt["unit_price_combined"] = tt[["unit_price_material", "unit_price_install"]].sum(axis=1, min_count=1)
+            sup_qty_col = (
+                "quantity_supplier" if "quantity_supplier" in ttab.columns else "quantity"
+            )
+            tt = ttab[
+                ["__key__", sup_qty_col, "unit_price_material", "unit_price_install", "total_price"]
+            ].copy()
+            tt = (
+                tt.groupby("__key__", as_index=False)
+                .agg(
+                    {
+                        sup_qty_col: "sum",
+                        "unit_price_material": "first",
+                        "unit_price_install": "first",
+                        "total_price": "sum",
+                    }
+                )
+            )
+            tt["unit_price_combined"] = tt[[
+                "unit_price_material",
+                "unit_price_install",
+            ]].sum(axis=1, min_count=1)
             tt["calc_total"] = tt["total_price"]
             mask = tt["calc_total"].isna()
-            tt.loc[mask, "calc_total"] = tt.loc[mask, sup_qty_col] * tt.loc[mask, "unit_price_combined"]
-            comp = comp.merge(tt[["__key__", sup_qty_col, "unit_price_combined", "calc_total"]], on="__key__", how="left")
-            comp.rename(columns={
-                sup_qty_col: f"{sup_name} quantity",
-                "unit_price_combined": f"{sup_name} unit_price",
-                "calc_total": f"{sup_name} total",
-            }, inplace=True)
+            tt.loc[mask, "calc_total"] = (
+                tt.loc[mask, sup_qty_col] * tt.loc[mask, "unit_price_combined"]
+            )
+            tt[sup_qty_col] = tt[sup_qty_col].round(2)
+            tt["unit_price_combined"] = tt["unit_price_combined"].round(2)
+            tt["calc_total"] = tt["calc_total"].round(2)
+            comp = comp.merge(
+                tt[["__key__", sup_qty_col, "unit_price_combined", "calc_total"]],
+                on="__key__",
+                how="left",
+            )
+            comp.rename(
+                columns={
+                    sup_qty_col: f"{sup_name} quantity",
+                    "unit_price_combined": f"{sup_name} unit_price",
+                    "calc_total": f"{sup_name} total",
+                },
+                inplace=True,
+            )
             comp[f"{sup_name} Δ qty"] = comp[f"{sup_name} quantity"] - comp["quantity"]
 
         total_cols = [c for c in comp.columns if c.endswith(" total") and c != "Master total"]
@@ -530,7 +582,7 @@ def summarize(results: Dict[str, pd.DataFrame]) -> pd.DataFrame:
             continue
         total_cols = [c for c in df.columns if c.endswith(" total")]
         df = df[df["description"].astype(str).str.strip() != ""]
-        sums = {c: df[c].dropna().sum() for c in total_cols}
+        sums = {c: round(df[c].dropna().sum(), 2) for c in total_cols}
         row = {"sheet": sheet}
         row.update(sums)
         rows.append(row)
@@ -556,6 +608,7 @@ def overview_comparison(
     df = (
         mtab[["code", "description", "total_price"]]
         .groupby(["code", "description"], as_index=False, dropna=False)["total_price"].sum()
+        .round(2)
         .rename(columns={"total_price": "Master total"})
     )
 
@@ -574,6 +627,7 @@ def overview_comparison(
             tdf = (
                 ttab[["code", "description", "total_price"]]
                 .groupby(["code", "description"], as_index=False, dropna=False)["total_price"].sum()
+                .round(2)
             )
             df = df.merge(tdf, on=["code", "description"], how="left")
             df.rename(columns={"total_price": f"{sup_name} total"}, inplace=True)
@@ -626,7 +680,11 @@ def overview_comparison(
     if indirect_df.empty:
         indirect_total = pd.DataFrame()
     else:
-        sums = indirect_df[[c for c in indirect_df.columns if c.endswith(" total")]].sum()
+        sums = (
+            indirect_df[[c for c in indirect_df.columns if c.endswith(" total")]]
+            .sum()
+            .round(2)
+        )
         indirect_total = sums.rename("total").to_frame().reset_index()
         indirect_total.rename(columns={"index": "supplier"}, inplace=True)
         indirect_total["supplier"] = indirect_total["supplier"].str.replace(" total", "", regex=False)

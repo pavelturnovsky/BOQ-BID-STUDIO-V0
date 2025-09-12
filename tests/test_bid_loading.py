@@ -297,3 +297,47 @@ def test_overview_comparison_missing_and_indirect_total() -> None:
     mtot = indirect_total.set_index("supplier").loc["Master", "total"]
     btot = indirect_total.set_index("supplier").loc["B", "total"]
     assert mtot == 5 and btot == 7
+
+
+def test_compare_aggregates_duplicate_master() -> None:
+    master_df = pd.DataFrame(
+        {
+            "code": ["A", "A"],
+            "description": ["Item", "Item"],
+            "unit": ["m", "m"],
+            "quantity": [1, 2],
+            "unit_price_material": [5, 5],
+            "total_price": [np.nan, np.nan],
+        }
+    )
+    master_file = make_workbook(master_df)
+    master_wb = read_workbook(master_file, limit_sheets=["Sheet1"])
+    results = compare(master_wb, {})
+    df = results["Sheet1"]
+    assert df.shape[0] == 1
+    assert df.loc[0, "quantity"] == 3
+    assert df.loc[0, "Master total"] == 15
+
+
+def test_compare_aggregates_supplier_duplicates() -> None:
+    master_df = pd.DataFrame(
+        {
+            "code": ["A", "A"],
+            "description": ["Item", "Item"],
+            "unit": ["m", "m"],
+            "quantity": [1, 1],
+            "unit_price_material": [5, 5],
+            "total_price": [np.nan, np.nan],
+        }
+    )
+    bid_df = master_df.copy()
+    master_file = make_workbook(master_df)
+    bid_file = make_workbook(bid_df)
+    master_wb = read_workbook(master_file, limit_sheets=["Sheet1"])
+    bid_wb = read_workbook(bid_file, limit_sheets=["Sheet1"])
+    apply_master_mapping(master_wb, bid_wb)
+    results = compare(master_wb, {"Bid": bid_wb})
+    df = results["Sheet1"]
+    assert df.shape[0] == 1
+    assert df.loc[0, "Master total"] == 10
+    assert df.loc[0, "Bid total"] == 10
