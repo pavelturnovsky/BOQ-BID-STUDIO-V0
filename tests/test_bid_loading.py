@@ -5,11 +5,13 @@ import types
 from pathlib import Path
 import pandas as pd
 import numpy as np
+
+# Ensure project root on path for imports
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.append(str(ROOT))
 from workbook import WorkbookData
 
 # Load only helper functions from boq_bid_studio without running Streamlit app
-ROOT = Path(__file__).resolve().parent.parent
-sys.path.append(str(ROOT))
 module_code = (ROOT / "boq_bid_studio.py").read_text().split("# ------------- Sidebar Inputs -------------")[0]
 module = types.ModuleType("boq_bid_helpers")
 exec(module_code, module.__dict__)
@@ -30,6 +32,24 @@ def make_workbook(df: pd.DataFrame) -> io.BytesIO:
     buffer.name = "test.xlsx"
     return buffer
 
+
+def test_autodetect_polozka_description() -> None:
+    df = pd.DataFrame([
+        ["kód", "položka", "cena celkem"],
+        ["1", "des", "10"],
+    ])
+    mapping, hdr, body = module.try_autodetect_mapping(df)
+    assert mapping["code"] == 0
+    assert mapping["description"] == 1
+
+
+def test_autodetect_summary_total() -> None:
+    df = pd.DataFrame([
+        ["kód", "popis", "celkem za oddíl"],
+        ["1", "a", "10"],
+    ])
+    mapping, hdr, body = module.try_autodetect_mapping(df)
+    assert mapping["summary_total"] == 2
 
 def test_multiple_bid_loading() -> None:
     master_df = pd.DataFrame({
@@ -93,6 +113,19 @@ def test_total_diff_and_summary_detection() -> None:
     assert out.loc[0, "total_diff"] == 0
     assert out.loc[1, "is_summary"]
     assert validate_totals(out) == 0
+
+
+def test_ignore_rows_without_description() -> None:
+    df = pd.DataFrame(
+        {
+            "code": ["1", ""],
+            "description": ["item", ""],
+            "total_price": ["10", "5"],
+        }
+    )
+    mapping = {"code": 0, "description": 1, "total_price": 2}
+    out = module.build_normalized_table(df, mapping)
+    assert out.shape[0] == 1
 
 
 def test_detect_summary_rows_alternating() -> None:
@@ -204,11 +237,14 @@ def test_summary_total_column() -> None:
             "code": ["1", ""],
             "description": ["item", "součet"],
             "quantity": ["1", ""],
-            "total_price": ["10", "10"],
+            "total_price": ["10", ""],
+            "summary_total": ["", "10"],
         }
     )
-    mapping = {"code": 0, "description": 1, "quantity": 2, "total_price": 3}
+    mapping = {"code": 0, "description": 1, "quantity": 2, "total_price": 3, "summary_total": 4}
     out = module.build_normalized_table(df, mapping)
+    idx = list(out.columns).index("total_price")
+    assert out.columns[idx + 1] == "summary_total"
     assert pd.isna(out.loc[0, "summary_total"])
     assert out.loc[1, "summary_total"] == 10
     assert pd.isna(out.loc[1, "total_price"])
@@ -222,5 +258,42 @@ def test_overview_comparison_mixed_codes() -> None:
             )
         }
     })
-    sections, _, _ = overview_comparison(master, {}, "s")
+    sections, _, _, _, _ = overview_comparison(master, {}, "s")
     assert sections["code"].tolist() == ["1", "A"]
+
+
+def test_overview_comparison_missing_and_indirect_total() -> None:
+    master = WorkbookData(
+        name="m",
+        sheets={
+            "s": {
+                "table": pd.DataFrame(
+                    {
+                        "code": ["1", "2", ""],
+                        "description": ["a", "b", "vedlejší rozpočtové náklady"],
+                        "total_price": [1, 2, 5],
+                    }
+                )
+            }
+        },
+    )
+    bid = WorkbookData(
+        name="b",
+        sheets={
+            "s": {
+                "table": pd.DataFrame(
+                    {
+                        "code": ["1", ""],
+                        "description": ["a", "vedlejší rozpočtové náklady"],
+                        "total_price": [1.5, 7],
+                    }
+                )
+            }
+        },
+    )
+    sections, indirect, added, missing, indirect_total = overview_comparison(master, {"B": bid}, "s")
+    assert missing["code"].tolist() == ["2"]
+    assert set(indirect_total["supplier"]) == {"Master", "B"}
+    mtot = indirect_total.set_index("supplier").loc["Master", "total"]
+    btot = indirect_total.set_index("supplier").loc["B", "total"]
+    assert mtot == 5 and btot == 7
