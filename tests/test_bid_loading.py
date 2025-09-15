@@ -43,6 +43,15 @@ def test_autodetect_polozka_description() -> None:
     assert mapping["description"] == 1
 
 
+def test_autodetect_pol_abbreviation() -> None:
+    df = pd.DataFrame([
+        ["pol.", "popis", "cena"],
+        ["1", "a", "10"],
+    ])
+    mapping, _, _ = module.try_autodetect_mapping(df)
+    assert mapping["code"] == 0
+
+
 def test_autodetect_summary_total() -> None:
     df = pd.DataFrame([
         ["kód", "popis", "celkem za oddíl"],
@@ -164,7 +173,7 @@ def test_detect_summary_rows_alternating() -> None:
     )
     mapping = {"code": 0, "description": 1, "unit": 2, "quantity": 3, "total_price": 4}
     out = module.build_normalized_table(df, mapping)
-    assert out["is_summary"].tolist() == [False, True, False, True, True]
+    assert out["is_summary"].tolist() == [False, True, False, False, True]
 
 
 def test_validate_totals_detects_difference() -> None:
@@ -272,6 +281,38 @@ def test_summary_total_column() -> None:
     assert pd.isna(out.loc[0, "summary_total"])
     assert out.loc[1, "summary_total"] == 10
     assert pd.isna(out.loc[1, "total_price"])
+
+
+def test_continuation_and_indirect_rows() -> None:
+    df = pd.DataFrame(
+        {
+            "code": ["1", "", "", ""],
+            "description": [
+                "item",
+                "continued text",
+                "vedlejší rozpočtové náklady",
+                "součet",
+            ],
+            "unit": ["m", "", "", ""],
+            "quantity": ["1", "", "", ""],
+            "unit_price_material": ["5", "", "", ""],
+            "total_price": ["5", "", "5", "10"],
+        }
+    )
+    mapping = {
+        "code": 0,
+        "description": 1,
+        "unit": 2,
+        "quantity": 3,
+        "unit_price_material": 4,
+        "total_price": 5,
+    }
+    out = module.build_normalized_table(df, mapping)
+    # continuation row should be dropped, indirect cost kept as regular item
+    assert out["description"].tolist() == ["item", "vedlejší rozpočtové náklady", "součet"]
+    assert out["is_summary"].tolist() == [False, False, True]
+    # summary row should balance totals
+    assert module.validate_totals(out) == 0
 
 
 def test_overview_comparison_mixed_codes() -> None:

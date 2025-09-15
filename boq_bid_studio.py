@@ -17,7 +17,18 @@ st.caption("Jedna aplikace pro nahrání, mapování, porovnání nabídek a viz
 # ------------- Helpers -------------
 
 HEADER_HINTS = {
-    "code": ["code", "item", "č.", "č", "číslo položky", "cislo polozky", "id", "kód", "kod"],
+    "code": [
+        "code",
+        "item",
+        "č.",
+        "č",
+        "číslo položky",
+        "cislo polozky",
+        "id",
+        "kód",
+        "kod",
+        "regex:^pol\\.?$",
+    ],
     "description": ["description", "popis", "položka", "polozka", "název", "nazev", "specifikace"],
     "unit": ["unit", "jm", "mj", "jednotka", "uom", "měrná jednotka", "merna jednotka"],
     "quantity": ["quantity", "qty", "množství", "mnozstvi", "q"],
@@ -53,7 +64,15 @@ def try_autodetect_mapping(df: pd.DataFrame) -> Tuple[Dict[str, int], int, pd.Da
     nprobe = min(len(df), max(10, min(50, len(df) // 100)))
     sample = df.head(nprobe).astype(str).applymap(normalize_col)
 
-    regex_map = {k: "|".join(map(re.escape, v)) for k, v in HEADER_HINTS.items()}
+    regex_map = {}
+    for key, hints in HEADER_HINTS.items():
+        patterns: List[str] = []
+        for h in hints:
+            if h.startswith("regex:"):
+                patterns.append(h[len("regex:"):])
+            else:
+                patterns.append(re.escape(h))
+        regex_map[key] = "|".join(patterns)
 
     def detect_row(row: pd.Series) -> Dict[str, int]:
         mapping: Dict[str, int] = {}
@@ -107,7 +126,12 @@ def detect_summary_rows(df: pd.DataFrame) -> pd.Series:
     )
     up_zero = unit_price_combined == 0
     pattern_mask = desc_str.str.contains(summary_patterns, case=False, na=False)
-    structural_mask = code_blank & qty_zero & up_zero & (desc_str.str.strip() != "")
+    totals = coerce_numeric(df.get("summary_total", 0)).fillna(0) + coerce_numeric(
+        df.get("total_price", 0)
+    ).fillna(0)
+    structural_mask = (
+        code_blank & qty_zero & up_zero & (totals != 0) & pattern_mask
+    )
     return pattern_mask | structural_mask
 
 def classify_summary_type(df: pd.DataFrame, summary_mask: pd.Series) -> pd.Series:
@@ -563,11 +587,14 @@ def overview_comparison(
         return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
     if "is_summary" in mtab.columns:
         mtab = mtab[~mtab["is_summary"].fillna(False).astype(bool)]
+    mtab = mtab.copy()
+    calc = mtab["calc_total"] if "calc_total" in mtab.columns else 0
+    mtab["total_for_sum"] = mtab["total_price"].fillna(calc).fillna(0)
 
     df = (
-        mtab[["code", "description", "total_price"]]
-        .groupby(["code", "description"], as_index=False, dropna=False)["total_price"].sum()
-        .rename(columns={"total_price": "Master total"})
+        mtab[["code", "description", "total_for_sum"]]
+        .groupby(["code", "description"], as_index=False, dropna=False)["total_for_sum"].sum()
+        .rename(columns={"total_for_sum": "Master total"})
     )
 
     for sup_name, wb in bids.items():
@@ -582,12 +609,15 @@ def overview_comparison(
         else:
             if "is_summary" in ttab.columns:
                 ttab = ttab[~ttab["is_summary"].fillna(False).astype(bool)]
+            ttab = ttab.copy()
+            calc = ttab["calc_total"] if "calc_total" in ttab.columns else 0
+            ttab["total_for_sum"] = ttab["total_price"].fillna(calc).fillna(0)
             tdf = (
-                ttab[["code", "description", "total_price"]]
-                .groupby(["code", "description"], as_index=False, dropna=False)["total_price"].sum()
+                ttab[["code", "description", "total_for_sum"]]
+                .groupby(["code", "description"], as_index=False, dropna=False)["total_for_sum"].sum()
             )
             df = df.merge(tdf, on=["code", "description"], how="left")
-            df.rename(columns={"total_price": f"{sup_name} total"}, inplace=True)
+            df.rename(columns={"total_for_sum": f"{sup_name} total"}, inplace=True)
 
     total_cols = [c for c in df.columns if c.endswith(" total")]
     view = df[["code", "description"] + total_cols].copy()
