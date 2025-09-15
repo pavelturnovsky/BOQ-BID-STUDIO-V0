@@ -142,7 +142,7 @@ def test_total_diff_and_summary_detection() -> None:
     assert validate_totals(out) == 0
 
 
-def test_calc_total_falls_back_to_total_price_when_unit_missing() -> None:
+def test_calc_total_no_fallback_to_total_price() -> None:
     df = pd.DataFrame(
         {
             "code": ["1"],
@@ -160,10 +160,33 @@ def test_calc_total_falls_back_to_total_price_when_unit_missing() -> None:
         "total_price": 4,
     }
     out = module.build_normalized_table(df, mapping)
-    assert out.loc[0, "calc_total"] == 50
-    assert out.loc[0, "total_diff"] == 0
-    # calc_total should contribute to overall sums
-    assert out["calc_total"].sum() == 50
+    assert out.loc[0, "calc_total"] == 0
+    assert out.loc[0, "total_price"] == 50
+    assert out.loc[0, "total_diff"] == 50
+    # totals should rely solely on provided total_price
+    assert out["total_price"].sum() == 50
+
+
+def test_summary_keyword_requires_structural_hint() -> None:
+    df = pd.DataFrame(
+        {
+            "code": ["1"],
+            "description": ["součet položek"],
+            "unit": ["m"],
+            "quantity": ["2"],
+            "total_price": ["10"],
+        }
+    )
+    mapping = {
+        "code": 0,
+        "description": 1,
+        "unit": 2,
+        "quantity": 3,
+        "total_price": 4,
+    }
+    out = module.build_normalized_table(df, mapping)
+    assert not out.loc[0, "is_summary"]
+    assert out.loc[0, "summary_type"] == ""
 
 
 def test_ignore_rows_without_description() -> None:

@@ -138,10 +138,8 @@ def detect_summary_rows(df: pd.DataFrame) -> pd.Series:
     totals = coerce_numeric(df.get("summary_total", 0)).fillna(0) + coerce_numeric(
         df.get("total_price", 0)
     ).fillna(0)
-    structural_mask = (
-        code_blank & qty_zero & up_zero & (totals != 0) & pattern_mask
-    )
-    return pattern_mask | structural_mask
+    structural_mask = code_blank & qty_zero & up_zero
+    return pattern_mask & structural_mask & (totals != 0)
 
 def classify_summary_type(df: pd.DataFrame, summary_mask: pd.Series) -> pd.Series:
     """Categorize summary rows into section, grand, or other totals."""
@@ -185,18 +183,9 @@ def build_normalized_table(df: pd.DataFrame, mapping: Dict[str, int]) -> pd.Data
     out["unit_price_combined"] = out[["unit_price_material", "unit_price_install"]].sum(
         axis=1, min_count=1
     )
-    # Compute per-item total, but fall back to provided total_price when unit
-    # prices are missing so that such rows still contribute to aggregated sums
-    out["calc_total"] = out["quantity"].fillna(0) * out["unit_price_combined"]
-    mask_missing_units = (
-        out["unit_price_material"].isna() & out["unit_price_install"].isna()
-    )
-    out.loc[mask_missing_units & out["total_price"].notna(), "calc_total"] = out.loc[
-        mask_missing_units & out["total_price"].notna(), "total_price"
-    ]
+    out["calc_total"] = out["quantity"].fillna(0) * out["unit_price_combined"].fillna(0)
     out["calc_total"] = out["calc_total"].fillna(0)
-    mask_total_na = out["total_price"].isna()
-    out.loc[mask_total_na, "total_price"] = out.loc[mask_total_na, "calc_total"]
+    out["total_price"] = out["total_price"].fillna(0)
     out["total_diff"] = out["total_price"] - out["calc_total"]
     out.loc[summary_mask, ["unit_price_combined", "calc_total", "total_diff"]] = np.nan
 
@@ -519,6 +508,7 @@ def compare(master: WorkbookData, bids: Dict[str, WorkbookData], join_mode: str 
             mtab = mtab[~mtab["is_summary"].fillna(False).astype(bool)]
         mtab = mtab[mtab["description"].astype(str).str.strip() != ""]
         base = mtab[["__key__", "code", "description", "unit", "quantity", "total_price"]].copy()
+        base["total_price"] = base["total_price"].fillna(0)
         base = base.drop_duplicates("__key__")
         base.rename(columns={"total_price": "Master total"}, inplace=True)
         comp = base.copy()
@@ -538,14 +528,12 @@ def compare(master: WorkbookData, bids: Dict[str, WorkbookData], join_mode: str 
             sup_qty_col = "quantity_supplier" if "quantity_supplier" in ttab.columns else "quantity"
             tt = ttab[["__key__", sup_qty_col, "unit_price_material", "unit_price_install", "total_price"]].copy()
             tt["unit_price_combined"] = tt[["unit_price_material", "unit_price_install"]].sum(axis=1, min_count=1)
-            tt["calc_total"] = tt["total_price"]
-            mask = tt["calc_total"].isna()
-            tt.loc[mask, "calc_total"] = tt.loc[mask, sup_qty_col] * tt.loc[mask, "unit_price_combined"]
-            comp = comp.merge(tt[["__key__", sup_qty_col, "unit_price_combined", "calc_total"]], on="__key__", how="left")
+            tt["total_price"] = tt["total_price"].fillna(0)
+            comp = comp.merge(tt[["__key__", sup_qty_col, "unit_price_combined", "total_price"]], on="__key__", how="left")
             comp.rename(columns={
                 sup_qty_col: f"{sup_name} quantity",
                 "unit_price_combined": f"{sup_name} unit_price",
-                "calc_total": f"{sup_name} total",
+                "total_price": f"{sup_name} total",
             }, inplace=True)
             comp[f"{sup_name} Δ qty"] = comp[f"{sup_name} quantity"] - comp["quantity"]
 
@@ -597,8 +585,7 @@ def overview_comparison(
     if "is_summary" in mtab.columns:
         mtab = mtab[~mtab["is_summary"].fillna(False).astype(bool)]
     mtab = mtab.copy()
-    calc = mtab["calc_total"] if "calc_total" in mtab.columns else 0
-    mtab["total_for_sum"] = mtab["total_price"].fillna(calc).fillna(0)
+    mtab["total_for_sum"] = mtab["total_price"].fillna(0)
 
     df = (
         mtab[["code", "description", "total_for_sum"]]
@@ -619,8 +606,7 @@ def overview_comparison(
             if "is_summary" in ttab.columns:
                 ttab = ttab[~ttab["is_summary"].fillna(False).astype(bool)]
             ttab = ttab.copy()
-            calc = ttab["calc_total"] if "calc_total" in ttab.columns else 0
-            ttab["total_for_sum"] = ttab["total_price"].fillna(calc).fillna(0)
+            ttab["total_for_sum"] = ttab["total_price"].fillna(0)
             tdf = (
                 ttab[["code", "description", "total_for_sum"]]
                 .groupby(["code", "description"], as_index=False, dropna=False)["total_for_sum"].sum()
