@@ -149,8 +149,19 @@ def build_normalized_table(df: pd.DataFrame, mapping: Dict[str, int]) -> pd.Data
     out["summary_type"] = classify_summary_type(out, summary_mask)
 
     # Compute total prices and cross-check
-    out["unit_price_combined"] = out[["unit_price_material", "unit_price_install"]].sum(axis=1, min_count=1)
-    out["calc_total"] = out["quantity"].fillna(0) * out["unit_price_combined"].fillna(0)
+    out["unit_price_combined"] = out[["unit_price_material", "unit_price_install"]].sum(
+        axis=1, min_count=1
+    )
+    # Compute per-item total, but fall back to provided total_price when unit
+    # prices are missing so that such rows still contribute to aggregated sums
+    out["calc_total"] = out["quantity"].fillna(0) * out["unit_price_combined"]
+    mask_missing_units = (
+        out["unit_price_material"].isna() & out["unit_price_install"].isna()
+    )
+    out.loc[mask_missing_units & out["total_price"].notna(), "calc_total"] = out.loc[
+        mask_missing_units & out["total_price"].notna(), "total_price"
+    ]
+    out["calc_total"] = out["calc_total"].fillna(0)
     mask_total_na = out["total_price"].isna()
     out.loc[mask_total_na, "total_price"] = out.loc[mask_total_na, "calc_total"]
     out["total_diff"] = out["total_price"] - out["calc_total"]
