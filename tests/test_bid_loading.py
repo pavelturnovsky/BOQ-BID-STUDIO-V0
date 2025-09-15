@@ -115,6 +115,30 @@ def test_total_diff_and_summary_detection() -> None:
     assert validate_totals(out) == 0
 
 
+def test_calc_total_falls_back_to_total_price_when_unit_missing() -> None:
+    df = pd.DataFrame(
+        {
+            "code": ["1"],
+            "description": ["item"],
+            "unit": ["m"],
+            "quantity": ["2"],
+            "total_price": ["50"],
+        }
+    )
+    mapping = {
+        "code": 0,
+        "description": 1,
+        "unit": 2,
+        "quantity": 3,
+        "total_price": 4,
+    }
+    out = module.build_normalized_table(df, mapping)
+    assert out.loc[0, "calc_total"] == 50
+    assert out.loc[0, "total_diff"] == 0
+    # calc_total should contribute to overall sums
+    assert out["calc_total"].sum() == 50
+
+
 def test_ignore_rows_without_description() -> None:
     df = pd.DataFrame(
         {
