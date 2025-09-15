@@ -52,6 +52,24 @@ def test_autodetect_pol_abbreviation() -> None:
     assert mapping["code"] == 0
 
 
+def test_autodetect_pol_without_dot() -> None:
+    df = pd.DataFrame([
+        ["pol", "popis", "cena"],
+        ["1", "a", "10"],
+    ])
+    mapping, _, _ = module.try_autodetect_mapping(df)
+    assert mapping["code"] == 0
+
+
+def test_autodetect_ignores_bidder_comment_for_code() -> None:
+    df = pd.DataFrame([
+        ["komentář uchazeče", "kód", "popis"],
+        ["poznámka", "1", "a"],
+    ])
+    mapping, _, _ = module.try_autodetect_mapping(df)
+    assert mapping["code"] == 1
+
+
 def test_autodetect_summary_total() -> None:
     df = pd.DataFrame([
         ["kód", "popis", "celkem za oddíl"],
