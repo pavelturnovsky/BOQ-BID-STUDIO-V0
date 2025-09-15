@@ -24,7 +24,6 @@ HEADER_HINTS = {
         "č",
         "číslo položky",
         "cislo polozky",
-        "id",
         "kód",
         "kod",
         "regex:^pol\\.?$",
@@ -33,7 +32,17 @@ HEADER_HINTS = {
     "unit": ["unit", "jm", "mj", "jednotka", "uom", "měrná jednotka", "merna jednotka"],
     "quantity": ["quantity", "qty", "množství", "mnozstvi", "q"],
     # optional extras commonly seen
-    "item_id": ["item id", "itemid", "id položky", "id polozky", "kod", "kód", "číslo položky", "cislo polozky"],
+    "item_id": [
+        "item id",
+        "itemid",
+        "id položky",
+        "id polozky",
+        "kod",
+        "kód",
+        "číslo položky",
+        "cislo polozky",
+        "regex:^id$",
+    ],
     # extended optional columns for richer comparisons
     "quantity_supplier": [
         "množství dodavatel",
