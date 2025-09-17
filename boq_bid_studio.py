@@ -1,6 +1,7 @@
 
 import re
 import json
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -65,6 +66,19 @@ def normalize_col(c):
     if not isinstance(c, str):
         c = str(c)
     return re.sub(r"\s+", " ", c.strip().lower())
+
+
+def supplier_default_alias(name: str, max_length: int = 30) -> str:
+    base = Path(name).stem if name else "Dodavatel"
+    base = base.strip() or "Dodavatel"
+    if len(base) <= max_length:
+        return base
+    return base[: max_length - 1] + "…"
+
+
+def sanitize_key(prefix: str, name: str) -> str:
+    safe = re.sub(r"[^0-9a-zA-Z_]+", "_", name)
+    return f"{prefix}_{safe}" if safe else f"{prefix}_anon"
 
 @st.cache_data
 def try_autodetect_mapping(df: pd.DataFrame) -> Tuple[Dict[str, int], int, pd.DataFrame]:
@@ -221,6 +235,9 @@ def build_normalized_table(df: pd.DataFrame, mapping: Dict[str, int]) -> pd.Data
         out["code"].astype(str).str.strip() + " | " + desc_str.str.strip()
     ).str.strip(" |")
 
+    # Preserve explicit ordering from mapping for later aggregations
+    out["__row_order__"] = np.arange(len(out))
+
     # Reorder columns for clarity
     col_order = [
         "code",
@@ -238,6 +255,7 @@ def build_normalized_table(df: pd.DataFrame, mapping: Dict[str, int]) -> pd.Data
         "is_summary",
         "summary_type",
         "__key__",
+        "__row_order__",
     ]
     out = out[[c for c in col_order if c in out.columns]]
     return out
@@ -619,6 +637,31 @@ def summarize(results: Dict[str, pd.DataFrame]) -> pd.DataFrame:
     out = pd.DataFrame(rows)
     return out
 
+
+def rename_comparison_columns(df: pd.DataFrame, mapping: Dict[str, str]) -> pd.DataFrame:
+    if df is None or df.empty or not mapping:
+        return df
+    rename_map: Dict[str, str] = {}
+    for raw, alias in mapping.items():
+        rename_map[f"{raw} quantity"] = f"{alias} quantity"
+        rename_map[f"{raw} unit_price"] = f"{alias} unit_price"
+        rename_map[f"{raw} total"] = f"{alias} total"
+        rename_map[f"{raw} Δ qty"] = f"{alias} Δ qty"
+        rename_map[f"{raw} Δ vs LOWEST"] = f"{alias} Δ vs LOWEST"
+    renamed = df.rename(columns=rename_map).copy()
+    if "LOWEST supplier" in renamed.columns:
+        renamed["LOWEST supplier"] = renamed["LOWEST supplier"].map(mapping).fillna(
+            renamed["LOWEST supplier"]
+        )
+    return renamed
+
+
+def rename_total_columns(df: pd.DataFrame, mapping: Dict[str, str]) -> pd.DataFrame:
+    if df is None or df.empty or not mapping:
+        return df
+    rename_map = {f"{raw} total": f"{alias} total" for raw, alias in mapping.items()}
+    return df.rename(columns=rename_map)
+
 def overview_comparison(
     master: WorkbookData, bids: Dict[str, WorkbookData], sheet_name: str
 ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
@@ -635,11 +678,14 @@ def overview_comparison(
     if "is_summary" in mtab.columns:
         mtab = mtab[~mtab["is_summary"].fillna(False).astype(bool)]
     mtab = mtab.copy()
+    if "__row_order__" not in mtab.columns:
+        mtab["__row_order__"] = np.arange(len(mtab))
     mtab["total_for_sum"] = mtab["total_price"].fillna(0)
 
     df = (
-        mtab[["code", "description", "total_for_sum"]]
-        .groupby(["code", "description"], as_index=False, dropna=False)["total_for_sum"].sum()
+        mtab[["code", "description", "__row_order__", "total_for_sum"]]
+        .groupby(["code", "description"], as_index=False, dropna=False)
+        .agg({"total_for_sum": "sum", "__row_order__": "min"})
         .rename(columns={"total_for_sum": "Master total"})
     )
 
@@ -665,32 +711,17 @@ def overview_comparison(
             df.rename(columns={"total_for_sum": f"{sup_name} total"}, inplace=True)
 
     total_cols = [c for c in df.columns if c.endswith(" total")]
-    view = df[["code", "description"] + total_cols].copy()
+    view_cols = ["code", "description", "__row_order__"] + total_cols
+    view = df[view_cols].copy()
     view["code"] = view["code"].fillna("").astype(str)
     view["description"] = view["description"].fillna("").astype(str)
     view = view[view["description"].str.strip() != ""]
-
-    # Natural sort by code to handle values like 0, 0.1, 0.2
-    def _code_sort_key(s: pd.Series) -> pd.Series:
-        def convert(parts):
-            key = []
-            for p in parts:
-                if p == "":
-                    continue
-                if p.isdigit():
-                    key.append((0, int(p)))
-                else:
-                    key.append((1, p))
-            return tuple(key)
-
-        return s.str.split(".").apply(convert)
-
-    view = view.sort_values(by="code", key=_code_sort_key)
+    view = view.sort_values(by="__row_order__").reset_index(drop=True)
     indirect_mask = view["description"].str.contains("vedlej", case=False, na=False)
     added_mask = view["description"].str.contains("dodavat", case=False, na=False)
-    sections_df = view[~(indirect_mask | added_mask)]
-    indirect_df = view[indirect_mask]
-    added_df = view[added_mask]
+    sections_df = view[~(indirect_mask | added_mask)].copy()
+    indirect_df = view[indirect_mask].copy()
+    added_df = view[added_mask].copy()
 
     # Missing items per supplier
     missing_rows: List[pd.DataFrame] = []
@@ -699,7 +730,10 @@ def overview_comparison(
             continue
         missing_mask = sections_df[col].isna() & sections_df["Master total"].notna()
         if missing_mask.any():
-            tmp = sections_df.loc[missing_mask, ["code", "description", "Master total"]].copy()
+            tmp = sections_df.loc[
+                missing_mask,
+                ["code", "description", "Master total", "__row_order__"],
+            ].copy()
             tmp["missing_in"] = col.replace(" total", "")
             missing_rows.append(tmp)
     missing_df = (
@@ -707,6 +741,8 @@ def overview_comparison(
         if missing_rows
         else pd.DataFrame(columns=["code", "description", "Master total", "missing_in"])
     )
+    if not missing_df.empty and "__row_order__" in missing_df.columns:
+        missing_df = missing_df.sort_values("__row_order__").reset_index(drop=True)
 
     # Aggregate indirect costs per supplier
     if indirect_df.empty:
@@ -716,6 +752,14 @@ def overview_comparison(
         indirect_total = sums.rename("total").to_frame().reset_index()
         indirect_total.rename(columns={"index": "supplier"}, inplace=True)
         indirect_total["supplier"] = indirect_total["supplier"].str.replace(" total", "", regex=False)
+
+    for df_part in (sections_df, indirect_df, added_df):
+        if "__row_order__" in df_part.columns:
+            df_part.drop(columns="__row_order__", inplace=True)
+    if "__row_order__" in view.columns:
+        view.drop(columns="__row_order__", inplace=True)
+    if not missing_df.empty and "__row_order__" in missing_df.columns:
+        missing_df.drop(columns="__row_order__", inplace=True)
 
     return sections_df, indirect_df, added_df, missing_df, indirect_total
 
@@ -823,14 +867,7 @@ bid_files = st.sidebar.file_uploader(
     accept_multiple_files=True,
     key="bids",
 )
-vat_rate = st.sidebar.number_input(
-    "DPH (%) — pouze pro zobrazení součtů",
-    min_value=0.0,
-    max_value=30.0,
-    value=0.0,
-    step=1.0,
-)
-currency = st.sidebar.text_input("Měna (zobrazit)", value="CZK")
+currency = st.sidebar.text_input("Popisek měny", value="CZK")
 
 if not master_file:
     st.info("➡️ Nahraj Master BoQ v levém panelu.")
@@ -890,6 +927,58 @@ if bid_files:
             apply_master_mapping(master_overview_wb, wb_over)
         bids_overview_dict[name] = wb_over
 
+# Manage supplier aliases and colors
+display_names: Dict[str, str] = {}
+color_map: Dict[str, str] = {}
+if "supplier_metadata" not in st.session_state:
+    st.session_state["supplier_metadata"] = {}
+metadata: Dict[str, Dict[str, str]] = st.session_state["supplier_metadata"]
+current_suppliers = list(bids_dict.keys())
+for obsolete in list(metadata.keys()):
+    if obsolete not in current_suppliers:
+        metadata.pop(obsolete, None)
+
+palette = (
+    px.colors.qualitative.Plotly
+    + px.colors.qualitative.Safe
+    + px.colors.qualitative.Pastel
+)
+
+if current_suppliers:
+    for idx, raw_name in enumerate(current_suppliers):
+        entry = metadata.get(raw_name, {})
+        if not entry.get("alias"):
+            entry["alias"] = supplier_default_alias(raw_name)
+        if not entry.get("color"):
+            entry["color"] = palette[idx % len(palette)]
+        metadata[raw_name] = entry
+
+    with st.sidebar.expander("Alias a barvy dodavatelů", expanded=True):
+        st.caption("Zkrácený název a barva se promítnou do tabulek a grafů.")
+        for raw_name in current_suppliers:
+            entry = metadata.get(raw_name, {})
+            alias_value = st.text_input(
+                f"Alias pro {raw_name}",
+                value=entry.get("alias", supplier_default_alias(raw_name)),
+                key=sanitize_key("alias", raw_name),
+            )
+            alias_clean = alias_value.strip() or supplier_default_alias(raw_name)
+            color_default = entry.get("color", "#1f77b4")
+            color_value = st.color_picker(
+                f"Barva — {alias_clean}",
+                value=color_default,
+                key=sanitize_key("color", raw_name),
+            )
+            metadata[raw_name]["alias"] = alias_clean
+            metadata[raw_name]["color"] = color_value or color_default
+
+    st.session_state["supplier_metadata"] = metadata
+    display_names = {raw: metadata[raw]["alias"] for raw in current_suppliers}
+    color_map = {display_names[raw]: metadata[raw]["color"] for raw in current_suppliers}
+
+chart_color_map = color_map.copy()
+chart_color_map.setdefault("Master", "#636EFA")
+
 # ------------- Tabs -------------
 tab_data, tab_compare, tab_summary, tab_rekap, tab_dashboard, tab_qa = st.tabs([
     "📑 Mapování",
@@ -920,22 +1009,27 @@ with tab_data:
                 apply_master_mapping(master_overview_wb, wb)
     if bids_dict:
         for sup_name, wb in bids_dict.items():
-            with st.expander(f"Mapování — {sup_name}", expanded=False):
+            alias = display_names.get(sup_name, sup_name)
+            with st.expander(f"Mapování — {alias}", expanded=False):
                 mapping_ui(
-                    sup_name,
+                    alias,
                     wb,
                     minimal_sheets=[overview_sheet] if overview_sheet in compare_sheets else None,
                 )
         if overview_sheet not in compare_sheets:
             for sup_name, wb in bids_overview_dict.items():
-                with st.expander(f"Mapování rekapitulace — {sup_name}", expanded=False):
-                    mapping_ui(f"{sup_name} rekapitulace", wb, minimal=True)
+                alias = display_names.get(sup_name, sup_name)
+                with st.expander(f"Mapování rekapitulace — {alias}", expanded=False):
+                    mapping_ui(f"{alias} rekapitulace", wb, minimal=True)
     st.success("Mapování připraveno. Přepni na záložku **Porovnání**.")
 
 # Pre-compute comparison results for reuse in tabs (after mapping)
 compare_results: Dict[str, pd.DataFrame] = {}
 if bids_dict:
-    compare_results = compare(master_wb, bids_dict, join_mode="auto")
+    raw_compare_results = compare(master_wb, bids_dict, join_mode="auto")
+    compare_results = {
+        sheet: rename_comparison_columns(df, display_names) for sheet, df in raw_compare_results.items()
+    }
 
 # Pre-compute rekapitulace results to avoid repeated work in tabs (after mapping)
 recap_results: Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame] = (
@@ -949,6 +1043,21 @@ if bids_overview_dict:
     recap_results = overview_comparison(
         master_overview_wb, bids_overview_dict, overview_sheet
     )
+    if display_names:
+        recap_results = tuple(
+            rename_total_columns(df, display_names) if i < 3 else df
+            for i, df in enumerate(recap_results)
+        )
+        sections_df, indirect_df, added_df, missing_df, indirect_total = recap_results
+        if not missing_df.empty and "missing_in" in missing_df.columns:
+            missing_df["missing_in"] = missing_df["missing_in"].map(display_names).fillna(
+                missing_df["missing_in"]
+            )
+        if not indirect_total.empty and "supplier" in indirect_total.columns:
+            indirect_total["supplier"] = indirect_total["supplier"].map(display_names).fillna(
+                indirect_total["supplier"]
+            )
+        recap_results = (sections_df, indirect_df, added_df, missing_df, indirect_total)
 
 with tab_compare:
     if not bids_dict:
@@ -968,25 +1077,32 @@ with tab_compare:
                     return df[col].sum()
 
                 totals = [(col, total_for_column(col)) for col in total_cols]
-                sums_df = pd.DataFrame(totals, columns=["Supplier total (col)", "Value"])
+                sums_df = pd.DataFrame(totals, columns=["Součet (sloupec)", "Hodnota"])
                 with st.container():
                     c1, c2 = st.columns([2, 3])
-                with c1:
-                    st.markdown("**Součty za list (bez DPH):**")
-                    show_df(sums_df)
+                    with c1:
+                        st.markdown("**Součty za list:**")
+                        show_df(sums_df)
                     with c2:
-                        # bar chart per sheet
+                        chart_df = pd.DataFrame(
+                            {
+                                "supplier": [c.replace(" total", "") for c in total_cols],
+                                "total": [total_for_column(c) for c in total_cols],
+                            }
+                        )
                         try:
-                            chart_df = pd.DataFrame(
-                                {
-                                    "supplier": [c.replace(" total", "") for c in total_cols],
-                                    "total": [total_for_column(c) for c in total_cols],
-                                }
+                            fig = px.bar(
+                                chart_df,
+                                x="supplier",
+                                y="total",
+                                color="supplier",
+                                color_discrete_map=chart_color_map,
+                                title=f"Součet za list: {sheet} ({currency})",
                             )
-                            fig = px.bar(chart_df, x="supplier", y="total", title=f"Součet za list: {sheet} ({currency} bez DPH)")
+                            fig.update_layout(showlegend=False)
                             st.plotly_chart(fig, use_container_width=True)
                         except Exception:
-                            pass
+                            show_df(chart_df)
             show_df(df)
 
 with tab_summary:
@@ -998,26 +1114,83 @@ with tab_summary:
         summary_df = summarize(results)
         if not summary_df.empty:
             st.markdown("### 📌 Souhrn po listech")
+            ctrl_dir, ctrl_rate = st.columns([2, 1])
+            with ctrl_dir:
+                conversion_direction = st.radio(
+                    "Směr konverze",
+                    ["CZK → EUR", "EUR → CZK"],
+                    index=0,
+                    horizontal=True,
+                )
+            with ctrl_rate:
+                rate_label = (
+                    "Kurz (CZK za 1 EUR)"
+                    if conversion_direction == "CZK → EUR"
+                    else "Kurz (CZK za 1 EUR)"
+                )
+                exchange_rate = st.number_input(
+                    rate_label,
+                    min_value=0.0001,
+                    value=24.0,
+                    step=0.1,
+                    format="%.4f",
+                )
+
+            st.caption(
+                "Tabulka zobrazuje původní hodnoty v CZK. Přepočet níže pracuje pouze se souhrnnými hodnotami pro rychlost."
+            )
             show_df(summary_df)
+
+            target_currency = "EUR" if conversion_direction == "CZK → EUR" else "CZK"
+            conversion_factor = (1.0 / exchange_rate) if conversion_direction == "CZK → EUR" else exchange_rate
+            value_cols = [c for c in summary_df.columns if c != "sheet"]
+            summary_converted_df = summary_df.copy()
+            for col in value_cols:
+                summary_converted_df[col] = (
+                    pd.to_numeric(summary_converted_df[col], errors="coerce") * conversion_factor
+                )
+
+            st.markdown(f"**Souhrn v {target_currency}:**")
+            show_df(summary_converted_df)
+
             supplier_totals = {}
             for col in summary_df.columns:
                 if col.endswith(" total"):
                     supplier = col.replace(" total", "")
-                    supplier_totals[supplier] = summary_df[col].sum()
-            grand_df = pd.DataFrame({"supplier": list(supplier_totals.keys()), "grand_total": list(supplier_totals.values())})
-            if vat_rate and vat_rate > 0:
-                grand_df["grand_total_s_DPH"] = grand_df["grand_total"] * (1 + vat_rate/100.0)
+                    supplier_totals[supplier] = pd.to_numeric(
+                        summary_df[col], errors="coerce"
+                    ).sum()
+            grand_df = pd.DataFrame(
+                {"supplier": list(supplier_totals.keys()), "grand_total": list(supplier_totals.values())}
+            )
+            grand_converted_df = grand_df.copy()
+            if not grand_converted_df.empty:
+                grand_converted_df["grand_total"] = (
+                    pd.to_numeric(grand_converted_df["grand_total"], errors="coerce") * conversion_factor
+                )
 
-            c1, c2 = st.columns([3, 2])
-            with c1:
-                st.markdown("**Celkové součty (napříč listy):**")
+            base_totals_col, converted_totals_col = st.columns(2)
+            with base_totals_col:
+                st.markdown("**Celkové součty (CZK):**")
                 show_df(grand_df)
-            with c2:
+            with converted_totals_col:
+                st.markdown(f"**Celkové součty ({target_currency}):**")
+                show_df(grand_converted_df)
+
+            if not grand_df.empty:
                 try:
-                    fig = px.bar(grand_df, x="supplier", y="grand_total", title=f"Celkové součty ({currency} bez DPH)")
+                    fig = px.bar(
+                        grand_df,
+                        x="supplier",
+                        y="grand_total",
+                        color="supplier",
+                        color_discrete_map=chart_color_map,
+                        title=f"Celkové součty ({currency})",
+                    )
+                    fig.update_layout(showlegend=False)
                     st.plotly_chart(fig, use_container_width=True)
                 except Exception:
-                    pass
+                    show_df(grand_df)
 
 with tab_rekap:
     if not bids_overview_dict:
@@ -1065,7 +1238,15 @@ with tab_dashboard:
                 st.markdown("**Součet za list (včetně Master):**")
                 totals_chart_df = pd.DataFrame({"supplier": [c.replace(" total", "") for c in total_cols], "total": [df[c].sum() for c in total_cols]})
                 try:
-                    fig_tot = px.bar(totals_chart_df, x="supplier", y="total", title=f"Součet za list: {sel_sheet} ({currency} bez DPH)")
+                    fig_tot = px.bar(
+                        totals_chart_df,
+                        x="supplier",
+                        y="total",
+                        color="supplier",
+                        color_discrete_map=chart_color_map,
+                        title=f"Součet za list: {sel_sheet} ({currency})",
+                    )
+                    fig_tot.update_layout(showlegend=False)
                     st.plotly_chart(fig_tot, use_container_width=True)
                 except Exception:
                     show_df(totals_chart_df)
@@ -1078,21 +1259,46 @@ with tab_dashboard:
                 heat_df.columns = [c.replace(" Δ vs LOWEST", "") for c in heat_df.columns]
                 # aggregate top N worst deltas by sum
                 sum_deltas = heat_df.sum().sort_values(ascending=False)
+                sum_deltas_df = sum_deltas.rename_axis("supplier").reset_index(name="value")
                 st.markdown("**Součet odchylek vs. nejnižší (vyšší = horší):**")
                 try:
-                    fig = px.bar(sum_deltas, title="Součet Δ vs. LOWEST (po dodavatelích)")
+                    fig = px.bar(
+                        sum_deltas_df,
+                        x="supplier",
+                        y="value",
+                        color="supplier",
+                        color_discrete_map=chart_color_map,
+                        title="Součet Δ vs. nejnižší nabídku (po dodavatelích)",
+                    )
+                    fig.update_layout(showlegend=False)
                     st.plotly_chart(fig, use_container_width=True)
                 except Exception:
-                    show_df(sum_deltas.to_frame("sum_delta"))
+                    show_df(sum_deltas_df)
 
                 # Top položky podle rozdílu mezi nejlepší a vybraným dodavatelem
                 st.markdown("**Top 20 položek s nejvyšší odchylkou od nejnižší ceny (součet přes dodavatele):**")
+                item_abs = heat_df.abs()
+                item_deltas = item_abs.sum(axis=1).sort_values(ascending=False).head(20)
+                leading_supplier = item_abs.loc[item_deltas.index].idxmax(axis=1)
+                item_chart_df = pd.DataFrame(
+                    {
+                        "item": item_deltas.index,
+                        "value": item_deltas.values,
+                        "supplier": leading_supplier.values,
+                    }
+                )
                 try:
-                    item_deltas = heat_df.abs().sum(axis=1).sort_values(ascending=False).head(20)
-                    fig2 = px.bar(item_deltas, title="Top 20 položek podle absolutní Δ")
+                    fig2 = px.bar(
+                        item_chart_df,
+                        x="item",
+                        y="value",
+                        color="supplier",
+                        color_discrete_map=chart_color_map,
+                        title="Top 20 položek podle absolutní Δ",
+                    )
                     st.plotly_chart(fig2, use_container_width=True)
                 except Exception:
-                    show_df(item_deltas.to_frame("abs_sum_delta"))
+                    show_df(item_chart_df)
             else:
                 st.info("Pro zvolený list zatím nejsou k dispozici delty (nahraj nabídky a ověř mapování).")
 
@@ -1104,7 +1310,8 @@ with tab_qa:
         for sheet, per_sup in qa.items():
             st.subheader(f"List: {sheet}")
             for sup, d in per_sup.items():
-                st.markdown(f"**Dodavatel:** {sup}")
+                alias = display_names.get(sup, sup)
+                st.markdown(f"**Dodavatel:** {alias}")
                 c1, c2, c3, c4 = st.columns(4)
                 with c1:
                     st.markdown("**Chybějící položky**")
