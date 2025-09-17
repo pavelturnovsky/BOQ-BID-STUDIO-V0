@@ -508,8 +508,34 @@ def compare(master: WorkbookData, bids: Dict[str, WorkbookData], join_mode: str 
             mtab = mtab[~mtab["is_summary"].fillna(False).astype(bool)]
         mtab = mtab[mtab["description"].astype(str).str.strip() != ""]
         base = mtab[["__key__", "code", "description", "unit", "quantity", "total_price"]].copy()
-        base["total_price"] = base["total_price"].fillna(0)
-        base = base.drop_duplicates("__key__")
+
+        def first_nonempty(series: pd.Series):
+            for val in series:
+                if pd.isna(val):
+                    continue
+                if isinstance(val, str):
+                    if val.strip() == "":
+                        continue
+                return val
+            for val in series:
+                if not pd.isna(val):
+                    return val
+            return ""
+
+        def sum_or_zero(series: pd.Series):
+            return series.fillna(0).sum()
+
+        base = (
+            base.groupby("__key__", sort=False, dropna=False)
+            .agg(
+                code=("code", first_nonempty),
+                description=("description", first_nonempty),
+                unit=("unit", first_nonempty),
+                quantity=("quantity", sum_or_zero),
+                total_price=("total_price", sum_or_zero),
+            )
+            .reset_index()
+        )
         base.rename(columns={"total_price": "Master total"}, inplace=True)
         comp = base.copy()
 

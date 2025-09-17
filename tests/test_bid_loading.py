@@ -22,6 +22,7 @@ apply_master_mapping = module.apply_master_mapping
 compare = module.compare
 validate_totals = module.validate_totals
 overview_comparison = module.overview_comparison
+summarize = module.summarize
 
 
 def make_workbook(df: pd.DataFrame) -> io.BytesIO:
@@ -403,3 +404,48 @@ def test_overview_comparison_missing_and_indirect_total() -> None:
     mtot = indirect_total.set_index("supplier").loc["Master", "total"]
     btot = indirect_total.set_index("supplier").loc["B", "total"]
     assert mtot == 5 and btot == 7
+
+
+def test_compare_aggregates_master_totals() -> None:
+    master_table = pd.DataFrame(
+        {
+            "__key__": ["A | Item1", "A | Item1", "B | Item2"],
+            "code": ["A", "A", "B"],
+            "description": ["Item1", "Item1", "Item2"],
+            "unit": ["", "ks", "m2"],
+            "quantity": [1.0, 2.0, 3.0],
+            "total_price": [100.0, 150.0, 300.0],
+        }
+    )
+    master = WorkbookData(name="m", sheets={"Sheet1": {"table": master_table}})
+
+    bid_table = pd.DataFrame(
+        {
+            "__key__": ["A | Item1", "B | Item2"],
+            "code": ["A", "B"],
+            "description": ["Item1", "Item2"],
+            "unit": ["ks", "m2"],
+            "quantity": [np.nan, np.nan],
+            "quantity_supplier": [2.5, 3.5],
+            "unit_price_material": [80.0, 90.0],
+            "unit_price_install": [20.0, 10.0],
+            "total_price": [250.0, 400.0],
+        }
+    )
+    bid = WorkbookData(name="b", sheets={"Sheet1": {"table": bid_table}})
+
+    results = compare(master, {"Bid": bid})
+    assert "Sheet1" in results
+    comp = results["Sheet1"].set_index("__key__")
+    assert comp.shape[0] == 2
+
+    row = comp.loc["A | Item1"]
+    assert np.isclose(row["Master total"], 250.0)
+    assert np.isclose(row["quantity"], 3.0)
+    assert row["unit"] == "ks"
+    assert np.isclose(row["Bid total"], 250.0)
+    assert np.isclose(row["Bid Δ qty"], -0.5)
+
+    summary = summarize(results)
+    assert np.isclose(summary.loc[summary["sheet"] == "Sheet1", "Master total"].iloc[0], 550.0)
+    assert np.isclose(summary.loc[summary["sheet"] == "Sheet1", "Bid total"].iloc[0], 650.0)
