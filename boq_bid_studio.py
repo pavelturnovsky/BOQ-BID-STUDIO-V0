@@ -2,7 +2,7 @@
 import re
 import json
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -662,6 +662,66 @@ def rename_total_columns(df: pd.DataFrame, mapping: Dict[str, str]) -> pd.DataFr
     rename_map = {f"{raw} total": f"{alias} total" for raw, alias in mapping.items()}
     return df.rename(columns=rename_map)
 
+
+def infer_section_group(code: Any, description: Any) -> str:
+    """Return a heuristic section identifier based on code/description."""
+
+    code_str = str(code if code is not None else "").strip()
+    if code_str:
+        cleaned = re.sub(r"[\u2013\u2014\u2012\u2010]", "-", code_str)
+        cleaned = cleaned.replace("\\", ".").replace("/", ".")
+        cleaned = re.sub(r"\s+", " ", cleaned)
+        for sep in (".", "-", " "):
+            if sep in cleaned:
+                token = cleaned.split(sep)[0].strip()
+                if token:
+                    return token
+        match = re.match(r"[A-Za-z]*\d+", cleaned)
+        if match:
+            return match.group(0)
+        return cleaned
+
+    desc_str = str(description if description is not None else "").strip()
+    if desc_str:
+        token = re.split(r"[\s/\-]+", desc_str)[0]
+        token = re.sub(r"[^0-9A-Za-z]+", "", token)
+        if token:
+            return token.upper()
+    return ""
+
+
+def ensure_group_key(candidate: str, code: Any, description: Any, index: int) -> str:
+    candidate = (candidate or "").strip()
+    if candidate:
+        return candidate
+
+    code_str = str(code if code is not None else "").strip()
+    if code_str:
+        return re.sub(r"\s+", " ", code_str)
+
+    desc_str = str(description if description is not None else "").strip()
+    if desc_str:
+        token = re.split(r"[\s/\-]+", desc_str)[0]
+        token = re.sub(r"[^0-9A-Za-z]+", "", token)
+        if token:
+            return token.upper()
+    return f"ODDIL_{index + 1}"
+
+
+def build_group_label(key: str, description: Any) -> str:
+    key = (key or "").strip()
+    desc_str = str(description if description is not None else "").strip()
+    if key and desc_str:
+        if desc_str.lower().startswith(key.lower()):
+            return desc_str
+        return f"{key} — {desc_str}"
+    if desc_str:
+        return desc_str
+    if key:
+        return key
+    return "Bez kódu"
+
+
 def overview_comparison(
     master: WorkbookData, bids: Dict[str, WorkbookData], sheet_name: str
 ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
@@ -717,6 +777,30 @@ def overview_comparison(
     view["description"] = view["description"].fillna("").astype(str)
     view = view[view["description"].str.strip() != ""]
     view = view.sort_values(by="__row_order__").reset_index(drop=True)
+
+    auto_keys: List[str] = []
+    for idx, row in view.iterrows():
+        candidate = infer_section_group(row.get("code"), row.get("description"))
+        auto_keys.append(ensure_group_key(candidate, row.get("code"), row.get("description"), idx))
+    view["auto_group_key"] = pd.Series(auto_keys, index=view.index).astype(str)
+
+    ordered = view.sort_values("__row_order__")
+    first_desc_map = ordered.groupby("auto_group_key")["description"].first().to_dict()
+    view["auto_group_label"] = view.apply(
+        lambda r: build_group_label(
+            r["auto_group_key"], first_desc_map.get(r["auto_group_key"], r.get("description"))
+        ),
+        axis=1,
+    )
+    order_map = ordered.groupby("auto_group_key")["__row_order__"].min().to_dict()
+    view["auto_group_order"] = view["auto_group_key"].map(order_map)
+    view["auto_group_label"] = view["auto_group_label"].fillna(view["auto_group_key"])
+    view.loc[view["auto_group_label"].astype(str).str.strip() == "", "auto_group_label"] = view[
+        "auto_group_key"
+    ]
+    view["auto_group_order"] = pd.to_numeric(view["auto_group_order"], errors="coerce")
+    view["auto_group_order"] = view["auto_group_order"].fillna(view["__row_order__"])
+
     indirect_mask = view["description"].str.contains("vedlej", case=False, na=False)
     added_mask = view["description"].str.contains("dodavat", case=False, na=False)
     sections_df = view[~(indirect_mask | added_mask)].copy()
@@ -753,15 +837,240 @@ def overview_comparison(
         indirect_total.rename(columns={"index": "supplier"}, inplace=True)
         indirect_total["supplier"] = indirect_total["supplier"].str.replace(" total", "", regex=False)
 
-    for df_part in (sections_df, indirect_df, added_df):
+    if "__row_order__" in sections_df.columns:
+        sections_df.rename(columns={"__row_order__": "source_order"}, inplace=True)
+    if "source_order" in sections_df.columns:
+        sections_df["source_order"] = pd.to_numeric(sections_df["source_order"], errors="coerce")
+    if "auto_group_order" in sections_df.columns:
+        sections_df["auto_group_order"] = pd.to_numeric(
+            sections_df["auto_group_order"], errors="coerce"
+        )
+    if "auto_group_key" in sections_df.columns:
+        sections_df["auto_group_key"] = sections_df["auto_group_key"].astype(str)
+    if "auto_group_label" in sections_df.columns:
+        sections_df["auto_group_label"] = sections_df["auto_group_label"].astype(str)
+
+    for df_part in (indirect_df, added_df):
         if "__row_order__" in df_part.columns:
             df_part.drop(columns="__row_order__", inplace=True)
+        for helper_col in ("auto_group_key", "auto_group_label", "auto_group_order"):
+            if helper_col in df_part.columns:
+                df_part.drop(columns=helper_col, inplace=True)
     if "__row_order__" in view.columns:
         view.drop(columns="__row_order__", inplace=True)
     if not missing_df.empty and "__row_order__" in missing_df.columns:
         missing_df.drop(columns="__row_order__", inplace=True)
 
     return sections_df, indirect_df, added_df, missing_df, indirect_total
+
+
+def prepare_grouped_sections(
+    df: pd.DataFrame, overrides: Dict[str, Dict[str, Any]]
+) -> Tuple[pd.DataFrame, Dict[str, Dict[str, pd.DataFrame]]]:
+    """Prepare grouped overview and per-group detail tables."""
+
+    if df is None or df.empty:
+        return pd.DataFrame(), {}
+
+    working = df.copy()
+    working["code"] = working["code"].fillna("").astype(str)
+    working["description"] = working["description"].fillna("").astype(str)
+    if "source_order" not in working.columns:
+        working["source_order"] = np.arange(len(working))
+    working = working.reset_index(drop=True)
+    working["item_order"] = pd.to_numeric(working["source_order"], errors="coerce")
+    working["item_order"] = working["item_order"].fillna(np.arange(len(working)))
+    if "auto_group_key" not in working.columns:
+        working["auto_group_key"] = working["code"]
+    if "auto_group_label" not in working.columns:
+        working["auto_group_label"] = working["auto_group_key"]
+    if "auto_group_order" not in working.columns:
+        working["auto_group_order"] = working["item_order"]
+    working["auto_group_order"] = pd.to_numeric(working["auto_group_order"], errors="coerce")
+    working["auto_group_order"] = working["auto_group_order"].fillna(working["item_order"])
+
+    overrides = overrides or {}
+
+    def row_group_info(row: pd.Series) -> pd.Series:
+        override = overrides.get(str(row["code"]))
+        manual_group = ""
+        manual_order = np.nan
+        manual_flag = False
+        if override:
+            manual_group = str(override.get("group", "") or "").strip()
+            manual_order_raw = override.get("order")
+            if manual_order_raw not in (None, ""):
+                manual_order = pd.to_numeric(pd.Series([manual_order_raw]), errors="coerce").iloc[0]
+            if manual_group:
+                manual_flag = True
+            if not manual_flag and not pd.isna(manual_order):
+                manual_flag = True
+        base_key = str(row.get("auto_group_key", "")).strip()
+        if not base_key:
+            base_key = ensure_group_key("", row.get("code"), row.get("description"), int(row.name))
+        base_label = str(row.get("auto_group_label", "")).strip()
+        if not base_label:
+            base_label = build_group_label(base_key, row.get("description"))
+        key = manual_group or base_key
+        label = manual_group or base_label or key
+        auto_order = row.get("auto_group_order")
+        item_order = row.get("item_order")
+        order = (
+            manual_order
+            if not pd.isna(manual_order)
+            else auto_order
+            if not pd.isna(auto_order)
+            else item_order
+        )
+        return pd.Series(
+            {
+                "group_key": key,
+                "group_label": label,
+                "group_order": order,
+                "manual_override": manual_flag,
+            }
+        )
+
+    group_meta = working.apply(row_group_info, axis=1)
+    working = pd.concat([working, group_meta], axis=1)
+    working["group_order"] = pd.to_numeric(working["group_order"], errors="coerce")
+    working["group_order"] = working["group_order"].fillna(working["item_order"])
+    working["manual_override"] = working["manual_override"].fillna(False)
+
+    total_cols = [c for c in working.columns if c.endswith(" total")]
+    agg_kwargs: Dict[str, Any] = {
+        "Skupina": pd.NamedAgg(column="group_label", aggfunc="first"),
+        "Referencni_kod": pd.NamedAgg(column="code", aggfunc="first"),
+        "Referencni_popis": pd.NamedAgg(column="description", aggfunc="first"),
+        "__group_order__": pd.NamedAgg(column="group_order", aggfunc="min"),
+        "Rucni_seskupeni": pd.NamedAgg(column="manual_override", aggfunc="max"),
+        "Pocet_polozek": pd.NamedAgg(column="code", aggfunc="count"),
+    }
+    rename_after = {
+        "Referencni_kod": "Referenční kód",
+        "Referencni_popis": "Referenční popis",
+        "Rucni_seskupeni": "Ruční seskupení",
+        "Pocet_polozek": "Počet položek",
+    }
+    for idx, col in enumerate(total_cols):
+        key = f"value_{idx}"
+        agg_kwargs[key] = pd.NamedAgg(column=col, aggfunc="sum")
+        rename_after[key] = col
+
+    grouped = (
+        working.groupby("group_key", dropna=False).agg(**agg_kwargs).reset_index().rename(columns={"group_key": "__group_key__"})
+    )
+    grouped.rename(columns=rename_after, inplace=True)
+    if "Ruční seskupení" in grouped.columns:
+        grouped["Ruční seskupení"] = grouped["Ruční seskupení"].astype(bool)
+    if "Počet položek" in grouped.columns:
+        grouped["Počet položek"] = grouped["Počet položek"].astype(int)
+    grouped = grouped.sort_values(["__group_order__", "Skupina"]).reset_index(drop=True)
+
+    aggregated_display = grouped.drop(columns=["__group_key__", "__group_order__"], errors="ignore").copy()
+    base_cols = [
+        col
+        for col in [
+            "Skupina",
+            "Referenční kód",
+            "Referenční popis",
+            "Počet položek",
+            "Ruční seskupení",
+        ]
+        if col in aggregated_display.columns
+    ]
+    other_cols = [col for col in aggregated_display.columns if col not in base_cols]
+    aggregated_display = aggregated_display[base_cols + other_cols]
+
+    detail_groups: Dict[str, Dict[str, pd.DataFrame]] = {}
+    working = working.sort_values(["group_key", "group_order", "item_order"]).reset_index(drop=True)
+    for _, summary_row in grouped.iterrows():
+        gkey = summary_row.get("__group_key__")
+        label = summary_row.get("Skupina", str(gkey))
+        detail_df = working[working["group_key"] == gkey].copy()
+        detail_cols = [
+            "code",
+            "description",
+            "auto_group_key",
+            "auto_group_label",
+            "group_label",
+            "auto_group_order",
+            "group_order",
+            "manual_override",
+        ]
+        detail_cols.extend(total_cols)
+        detail_cols_existing = [col for col in detail_cols if col in detail_df.columns]
+        detail_display = detail_df[detail_cols_existing].copy()
+        detail_display.rename(
+            columns={
+                "code": "Kód",
+                "description": "Popis",
+                "auto_group_key": "Návrh kódu skupiny",
+                "auto_group_label": "Návrh popisu skupiny",
+                "group_label": "Finální skupina",
+                "auto_group_order": "Pořadí (návrh)",
+                "group_order": "Pořadí (finální)",
+                "manual_override": "Ruční změna",
+            },
+            inplace=True,
+        )
+        if "Ruční změna" in detail_display.columns:
+            detail_display["Ruční změna"] = detail_display["Ruční změna"].astype(bool)
+        for col in ("Pořadí (finální)", "Pořadí (návrh)"):
+            if col in detail_display.columns:
+                detail_display[col] = pd.to_numeric(detail_display[col], errors="coerce")
+        summary_display = summary_row.drop(
+            labels=[c for c in ["__group_key__", "__group_order__"] if c in summary_row.index]
+        ).to_frame().T
+        if "Ruční seskupení" in summary_display.columns:
+            summary_display["Ruční seskupení"] = summary_display["Ruční seskupení"].astype(bool)
+        if "Počet položek" in summary_display.columns:
+            summary_display["Počet položek"] = summary_display["Počet položek"].astype(int)
+        detail_groups[str(label)] = {"summary": summary_display, "data": detail_display}
+
+    return aggregated_display, detail_groups
+
+
+def convert_currency_df(
+    df: pd.DataFrame, factor: float, skip: Optional[List[str]] = None
+) -> pd.DataFrame:
+    """Multiply numeric columns by ``factor`` while keeping helper columns intact."""
+
+    if df is None:
+        return pd.DataFrame()
+    result = df.copy()
+    if result.empty:
+        return result
+    skip_set = set(skip or [])
+    numeric_cols = [
+        col
+        for col in result.select_dtypes(include=[np.number]).columns
+        if col not in skip_set and not pd.api.types.is_bool_dtype(result[col])
+    ]
+    if not numeric_cols or factor == 1.0:
+        return result
+    for col in numeric_cols:
+        result[col] = pd.to_numeric(result[col], errors="coerce") * factor
+    return result
+
+
+def convert_detail_groups(
+    groups: Dict[str, Dict[str, pd.DataFrame]],
+    factor: float,
+    detail_skip: Optional[List[str]] = None,
+    summary_skip: Optional[List[str]] = None,
+) -> Dict[str, Dict[str, pd.DataFrame]]:
+    """Apply currency conversion to grouped detail structures."""
+
+    converted: Dict[str, Dict[str, pd.DataFrame]] = {}
+    for label, payload in groups.items():
+        data_df = payload.get("data", pd.DataFrame())
+        summary_df = payload.get("summary", pd.DataFrame())
+        converted[label] = {
+            "data": convert_currency_df(data_df, factor, skip=detail_skip),
+            "summary": convert_currency_df(summary_df, factor, skip=summary_skip),
+        }
+    return converted
 
 
 def validate_totals(df: pd.DataFrame) -> float:
@@ -1078,31 +1387,28 @@ with tab_compare:
 
                 totals = [(col, total_for_column(col)) for col in total_cols]
                 sums_df = pd.DataFrame(totals, columns=["Součet (sloupec)", "Hodnota"])
-                with st.container():
-                    c1, c2 = st.columns([2, 3])
-                    with c1:
-                        st.markdown("**Součty za list:**")
-                        show_df(sums_df)
-                    with c2:
-                        chart_df = pd.DataFrame(
-                            {
-                                "supplier": [c.replace(" total", "") for c in total_cols],
-                                "total": [total_for_column(c) for c in total_cols],
-                            }
-                        )
-                        try:
-                            fig = px.bar(
-                                chart_df,
-                                x="supplier",
-                                y="total",
-                                color="supplier",
-                                color_discrete_map=chart_color_map,
-                                title=f"Součet za list: {sheet} ({currency})",
-                            )
-                            fig.update_layout(showlegend=False)
-                            st.plotly_chart(fig, use_container_width=True)
-                        except Exception:
-                            show_df(chart_df)
+                st.markdown("**Součty za list:**")
+                show_df(sums_df)
+                chart_df = pd.DataFrame(
+                    {
+                        "supplier": [c.replace(" total", "") for c in total_cols],
+                        "total": [total_for_column(c) for c in total_cols],
+                    }
+                )
+                try:
+                    fig = px.bar(
+                        chart_df,
+                        x="supplier",
+                        y="total",
+                        color="supplier",
+                        color_discrete_map=chart_color_map,
+                        title=f"Součet za list: {sheet} ({currency})",
+                    )
+                    fig.update_layout(showlegend=False)
+                    st.plotly_chart(fig, use_container_width=True)
+                except Exception:
+                    st.markdown("**Součty (tabulkový přehled grafu):**")
+                    show_df(chart_df)
             show_df(df)
 
 with tab_summary:
@@ -1206,21 +1512,291 @@ with tab_rekap:
             st.info(f"List '{overview_sheet}' neobsahuje data pro porovnání.")
         else:
             st.subheader(f"Souhrnný list: {overview_sheet}")
+
+            ctrl_dir, ctrl_rate = st.columns([2, 1])
+            with ctrl_dir:
+                conversion_direction = st.radio(
+                    "Směr přepočtu",
+                    ["CZK → EUR", "EUR → CZK"],
+                    index=0,
+                    horizontal=True,
+                )
+            with ctrl_rate:
+                exchange_rate = st.number_input(
+                    "Kurz (CZK za 1 EUR)",
+                    min_value=0.0001,
+                    value=24.0,
+                    step=0.1,
+                    format="%.4f",
+                )
+
+            base_currency = "CZK" if conversion_direction == "CZK → EUR" else "EUR"
+            target_currency = "EUR" if conversion_direction == "CZK → EUR" else "CZK"
+            conversion_factor = (
+                1.0 / exchange_rate if conversion_direction == "CZK → EUR" else exchange_rate
+            )
+            st.caption(
+                f"Hodnoty jsou nejprve zobrazeny v {base_currency}. Přepočet používá kurz 1 EUR = {exchange_rate:.4f} CZK."
+            )
+
+            grouped_sections_display = pd.DataFrame()
+            detail_groups: Dict[str, Dict[str, pd.DataFrame]] = {}
+            overrides_key = "rekap_group_overrides"
+            overrides = st.session_state.get(overrides_key, {})
+
             if not sections_df.empty:
-                st.markdown("### Celkové ceny oddílů")
+                valid_codes = sections_df["code"].astype(str).tolist()
+                overrides = {k: v for k, v in overrides.items() if k in valid_codes}
+                if st.session_state.get(overrides_key) != overrides:
+                    st.session_state[overrides_key] = overrides
+
+                st.markdown("### Nastavení seskupení oddílů")
+                st.caption(
+                    "Položky jsou seskupeny automaticky podle kódů. V případě potřeby můžeš upravit název skupiny i pořadí."
+                )
+                if st.button("Resetovat ruční seskupení", key="reset_group_overrides"):
+                    overrides = {}
+                    st.session_state[overrides_key] = {}
+
+                editor_cols = [
+                    col
+                    for col in [
+                        "code",
+                        "description",
+                        "auto_group_key",
+                        "auto_group_label",
+                        "auto_group_order",
+                    ]
+                    if col in sections_df.columns
+                ]
+                editor_df = sections_df[editor_cols].copy()
+                if "source_order" in sections_df.columns:
+                    editor_df = editor_df.join(sections_df["source_order"])  # preserve original order
+                    editor_df = editor_df.sort_values("source_order")
+                editor_df.rename(
+                    columns={
+                        "code": "Kód",
+                        "description": "Popis",
+                        "auto_group_key": "Návrh kódu skupiny",
+                        "auto_group_label": "Návrh popisu skupiny",
+                        "auto_group_order": "Pořadí (návrh)",
+                        "source_order": "Původní pořadí",
+                    },
+                    inplace=True,
+                )
+                editor_df["Skupina (ručně)"] = (
+                    editor_df["Kód"].map(lambda code: overrides.get(str(code), {}).get("group", ""))
+                )
+                editor_df["Skupina (ručně)"] = editor_df["Skupina (ručně)"].fillna("")
+                manual_order_series = editor_df["Kód"].map(
+                    lambda code: overrides.get(str(code), {}).get("order")
+                )
+                editor_df["Pořadí (ručně)"] = pd.to_numeric(manual_order_series, errors="coerce")
+
+                column_config: Dict[str, Any] = {
+                    "Kód": st.column_config.Column("Kód", disabled=True, width="small"),
+                    "Popis": st.column_config.Column("Popis", disabled=True, width="large"),
+                    "Skupina (ručně)": st.column_config.TextColumn(
+                        "Skupina (ručně)", help="Zadej kód nebo název cílové skupiny."
+                    ),
+                    "Pořadí (ručně)": st.column_config.NumberColumn(
+                        "Pořadí (ručně)", help="Nižší číslo = vyšší pozice ve výpisu.", format="%.0f"
+                    ),
+                }
+                if "Návrh kódu skupiny" in editor_df.columns:
+                    column_config["Návrh kódu skupiny"] = st.column_config.Column(
+                        "Návrh kódu skupiny", disabled=True, width="small"
+                    )
+                if "Návrh popisu skupiny" in editor_df.columns:
+                    column_config["Návrh popisu skupiny"] = st.column_config.Column(
+                        "Návrh popisu skupiny", disabled=True, width="large"
+                    )
+                if "Pořadí (návrh)" in editor_df.columns:
+                    column_config["Pořadí (návrh)"] = st.column_config.NumberColumn(
+                        "Pořadí (návrh)", disabled=True, format="%.0f"
+                    )
+                if "Původní pořadí" in editor_df.columns:
+                    column_config["Původní pořadí"] = st.column_config.NumberColumn(
+                        "Původní pořadí", disabled=True, format="%.0f"
+                    )
+
+                editor_df = st.data_editor(
+                    editor_df,
+                    hide_index=True,
+                    use_container_width=True,
+                    num_rows="fixed",
+                    column_config=column_config,
+                    key="rekap_group_editor",
+                )
+
+                updated_overrides: Dict[str, Dict[str, Any]] = {}
+                for _, row in editor_df.iterrows():
+                    code = str(row.get("Kód", ""))
+                    if not code:
+                        continue
+                    manual_group = str(row.get("Skupina (ručně)", "") or "").strip()
+                    manual_order_val = pd.to_numeric(
+                        pd.Series([row.get("Pořadí (ručně)")]), errors="coerce"
+                    ).iloc[0]
+                    entry: Dict[str, Any] = {}
+                    if manual_group:
+                        entry["group"] = manual_group
+                    if not pd.isna(manual_order_val):
+                        entry["order"] = float(manual_order_val)
+                    if entry:
+                        updated_overrides[code] = entry
+                overrides = updated_overrides
+                st.session_state[overrides_key] = overrides
+
+                grouped_sections_display, detail_groups = prepare_grouped_sections(
+                    sections_df, overrides
+                )
+
+            if not sections_df.empty and grouped_sections_display.empty:
+                st.warning(
+                    "Nepodařilo se vytvořit seskupení. Níže je zobrazen původní přehled bez úprav."
+                )
                 show_df(sections_df)
+
+            if not grouped_sections_display.empty:
+                st.markdown(f"### Celkové ceny oddílů ({base_currency})")
+                show_df(grouped_sections_display)
+                if detail_groups:
+                    st.caption("Rozklikni skupinu pro detailní položky.")
+                    for label in grouped_sections_display["Skupina"].astype(str).tolist():
+                        payload = detail_groups.get(label, {})
+                        summary_df = payload.get("summary", pd.DataFrame())
+                        detail_df = payload.get("data", pd.DataFrame())
+                        header = label
+                        if not summary_df.empty:
+                            total_cols = [
+                                c for c in summary_df.columns if c.endswith(" total")
+                            ]
+                            primary = next(
+                                (
+                                    c
+                                    for c in total_cols
+                                    if c.lower().startswith("master")
+                                ),
+                                total_cols[0] if total_cols else None,
+                            )
+                            if primary and not pd.isna(summary_df.iloc[0][primary]):
+                                header = (
+                                    f"{header} — {primary}: {format_number(summary_df.iloc[0][primary])} {base_currency}"
+                                )
+                        with st.expander(header, expanded=False):
+                            if not summary_df.empty:
+                                st.markdown("**Souhrn oddílu:**")
+                                show_df(summary_df)
+                            if not detail_df.empty:
+                                st.markdown("**Položky v oddílu:**")
+                                show_df(detail_df)
+
+                with st.expander("Původní tabulka (detailní řádky)", expanded=False):
+                    raw_display = sections_df.copy()
+                    raw_display = raw_display.sort_values(
+                        by="source_order" if "source_order" in raw_display.columns else "code"
+                    )
+                    raw_display = raw_display.rename(
+                        columns={
+                            "auto_group_key": "Návrh kódu skupiny",
+                            "auto_group_label": "Návrh popisu skupiny",
+                            "auto_group_order": "Pořadí (návrh)",
+                            "source_order": "Původní pořadí",
+                        }
+                    )
+                    show_df(raw_display)
+
             if not missing_df.empty:
-                st.markdown("### Chybějící položky dle dodavatele")
+                st.markdown(f"### Chybějící položky dle dodavatele ({base_currency})")
                 show_df(missing_df)
             if not indirect_df.empty:
-                st.markdown("### Vedlejší rozpočtové náklady")
+                st.markdown(f"### Vedlejší rozpočtové náklady ({base_currency})")
                 show_df(indirect_df)
                 if not indirect_total.empty:
-                    st.markdown("**Součet vedlejších nákladů:**")
+                    st.markdown(f"**Součet vedlejších nákladů ({base_currency}):**")
                     show_df(indirect_total)
             if not added_df.empty:
-                st.markdown("### Náklady přidané dodavatelem")
+                st.markdown(f"### Náklady přidané dodavatelem ({base_currency})")
                 show_df(added_df)
+
+            group_skip_cols = ["Počet položek", "Ruční seskupení"]
+            detail_skip_cols = ["Pořadí (návrh)", "Pořadí (finální)", "Ruční změna"]
+
+            converted_grouped = (
+                convert_currency_df(grouped_sections_display, conversion_factor, skip=group_skip_cols)
+                if not grouped_sections_display.empty
+                else pd.DataFrame()
+            )
+            converted_detail_groups = (
+                convert_detail_groups(
+                    detail_groups,
+                    conversion_factor,
+                    detail_skip=detail_skip_cols,
+                    summary_skip=group_skip_cols,
+                )
+                if detail_groups
+                else {}
+            )
+            converted_missing = convert_currency_df(missing_df, conversion_factor)
+            converted_indirect = convert_currency_df(indirect_df, conversion_factor)
+            converted_added = convert_currency_df(added_df, conversion_factor)
+            converted_indirect_total = convert_currency_df(indirect_total, conversion_factor)
+
+            if (
+                not grouped_sections_display.empty
+                or not missing_df.empty
+                or not indirect_df.empty
+                or not added_df.empty
+            ):
+                st.markdown(f"## Přepočet do {target_currency}")
+
+            if not grouped_sections_display.empty:
+                st.markdown(f"### Celkové ceny oddílů ({target_currency})")
+                show_df(converted_grouped)
+                if converted_detail_groups:
+                    st.caption("Přepočtené hodnoty včetně detailů oddílů.")
+                    for label in grouped_sections_display["Skupina"].astype(str).tolist():
+                        payload = converted_detail_groups.get(label, {})
+                        summary_df = payload.get("summary", pd.DataFrame())
+                        detail_df = payload.get("data", pd.DataFrame())
+                        header = label
+                        if not summary_df.empty:
+                            total_cols = [
+                                c for c in summary_df.columns if c.endswith(" total")
+                            ]
+                            primary = next(
+                                (
+                                    c
+                                    for c in total_cols
+                                    if c.lower().startswith("master")
+                                ),
+                                total_cols[0] if total_cols else None,
+                            )
+                            if primary and not pd.isna(summary_df.iloc[0][primary]):
+                                header = (
+                                    f"{header} — {primary}: {format_number(summary_df.iloc[0][primary])} {target_currency}"
+                                )
+                        with st.expander(header, expanded=False):
+                            if not summary_df.empty:
+                                st.markdown("**Souhrn oddílu:**")
+                                show_df(summary_df)
+                            if not detail_df.empty:
+                                st.markdown("**Položky v oddílu:**")
+                                show_df(detail_df)
+
+            if not missing_df.empty:
+                st.markdown(f"### Chybějící položky dle dodavatele ({target_currency})")
+                show_df(converted_missing)
+            if not indirect_df.empty:
+                st.markdown(f"### Vedlejší rozpočtové náklady ({target_currency})")
+                show_df(converted_indirect)
+                if not indirect_total.empty:
+                    st.markdown(f"**Součet vedlejších nákladů ({target_currency}):**")
+                    show_df(converted_indirect_total)
+            if not added_df.empty:
+                st.markdown(f"### Náklady přidané dodavatelem ({target_currency})")
+                show_df(converted_added)
 
 with tab_dashboard:
     if not bids_dict:
