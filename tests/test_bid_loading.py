@@ -114,6 +114,45 @@ def test_multiple_bid_loading() -> None:
     assert df.shape[0] == 1
 
 
+def test_compare_master_total_with_duplicate_supplier_rows() -> None:
+    master_df = pd.DataFrame(
+        {
+            "code": ["A"],
+            "description": ["Item"],
+            "unit": ["m"],
+            "quantity": [2],
+            "total price": [100],
+        }
+    )
+    supplier_df = pd.DataFrame(
+        {
+            "code": ["A", "A"],
+            "description": ["Item", "Item"],
+            "unit": ["m", "m"],
+            "quantity": [1, 1],
+            "total price": [30, 70],
+        }
+    )
+
+    master_file = make_workbook(master_df)
+    supplier_file = make_workbook(supplier_df)
+
+    master_wb = read_workbook(master_file, limit_sheets=["Sheet1"])
+    supplier_wb = read_workbook(supplier_file, limit_sheets=["Sheet1"])
+
+    apply_master_mapping(master_wb, supplier_wb)
+
+    results = compare(master_wb, {"Bid": supplier_wb})
+    assert "Sheet1" in results
+    df = results["Sheet1"]
+    assert df.shape[0] == 1
+    assert np.isclose(df["Master total"].iloc[0], 100)
+    assert np.isclose(df["Master total"].sum(), 100)
+    assert np.isclose(df["Bid total"].iloc[0], 100)
+    assert "master_total_sum" in df.attrs
+    assert np.isclose(df.attrs["master_total_sum"], 100)
+
+
 def test_coerce_numeric_european_formats() -> None:
     s = pd.Series(["1 234,56", "1 234", "1234", "1.234,5", "-"])
     res = module.coerce_numeric(s)

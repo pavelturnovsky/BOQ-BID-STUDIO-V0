@@ -508,10 +508,20 @@ def compare(master: WorkbookData, bids: Dict[str, WorkbookData], join_mode: str 
             mtab = mtab[~mtab["is_summary"].fillna(False).astype(bool)]
         mtab = mtab[mtab["description"].astype(str).str.strip() != ""]
         base = mtab[["__key__", "code", "description", "unit", "quantity", "total_price"]].copy()
-        base["total_price"] = base["total_price"].fillna(0)
-        base = base.drop_duplicates("__key__")
-        base.rename(columns={"total_price": "Master total"}, inplace=True)
-        comp = base.copy()
+        base["quantity"] = pd.to_numeric(base["quantity"], errors="coerce").fillna(0)
+        base["total_price"] = pd.to_numeric(base["total_price"], errors="coerce").fillna(0)
+        base_grouped = base.groupby("__key__", sort=False, as_index=False).agg(
+            {
+                "code": "first",
+                "description": "first",
+                "unit": "first",
+                "quantity": "sum",
+                "total_price": "sum",
+            }
+        )
+        master_total_sum = base_grouped["total_price"].sum()
+        base_grouped.rename(columns={"total_price": "Master total"}, inplace=True)
+        comp = base_grouped.copy()
 
         for sup_name, wb in bids.items():
             tobj = wb.sheets.get(sheet, {})
@@ -526,10 +536,49 @@ def compare(master: WorkbookData, bids: Dict[str, WorkbookData], join_mode: str 
             ttab = ttab[ttab["description"].astype(str).str.strip() != ""]
             # join by __key__ (manual mapping already built in normalized table)
             sup_qty_col = "quantity_supplier" if "quantity_supplier" in ttab.columns else "quantity"
-            tt = ttab[["__key__", sup_qty_col, "unit_price_material", "unit_price_install", "total_price"]].copy()
-            tt["unit_price_combined"] = tt[["unit_price_material", "unit_price_install"]].sum(axis=1, min_count=1)
-            tt["total_price"] = tt["total_price"].fillna(0)
-            comp = comp.merge(tt[["__key__", sup_qty_col, "unit_price_combined", "total_price"]], on="__key__", how="left")
+            cols = [
+                "__key__",
+                sup_qty_col,
+                "unit_price_material",
+                "unit_price_install",
+                "total_price",
+            ]
+            existing_cols = [c for c in cols if c in ttab.columns]
+            tt = ttab[existing_cols].copy()
+            tt[sup_qty_col] = pd.to_numeric(tt[sup_qty_col], errors="coerce")
+            tt["total_price"] = pd.to_numeric(tt["total_price"], errors="coerce").fillna(0)
+            price_cols = [c for c in ["unit_price_material", "unit_price_install"] if c in tt.columns]
+            if price_cols:
+                for col in price_cols:
+                    tt[col] = pd.to_numeric(tt[col], errors="coerce")
+                tt["unit_price_combined"] = tt[price_cols].sum(axis=1, min_count=1)
+            else:
+                tt["unit_price_combined"] = np.nan
+            first_price = (
+                tt.groupby("__key__", sort=False)["unit_price_combined"].first().reset_index(name="first_unit_price")
+            )
+            def _sum_with_min_count(series: pd.Series) -> float:
+                return series.sum(min_count=1)
+
+            tt_grouped = tt.groupby("__key__", sort=False, as_index=False).agg(
+                {
+                    sup_qty_col: _sum_with_min_count,
+                    "total_price": "sum",
+                }
+            )
+            tt_grouped = tt_grouped.merge(first_price, on="__key__", how="left")
+            qty = tt_grouped[sup_qty_col]
+            with np.errstate(divide="ignore", invalid="ignore"):
+                qty_for_division = qty.where(qty != 0)
+                tt_grouped["unit_price_combined"] = tt_grouped["total_price"] / qty_for_division
+            mask = qty_for_division.isna()
+            tt_grouped.loc[mask, "unit_price_combined"] = tt_grouped.loc[mask, "first_unit_price"]
+            tt_grouped.drop(columns=["first_unit_price"], inplace=True)
+            comp = comp.merge(
+                tt_grouped[["__key__", sup_qty_col, "unit_price_combined", "total_price"]],
+                on="__key__",
+                how="left",
+            )
             comp.rename(columns={
                 sup_qty_col: f"{sup_name} quantity",
                 "unit_price_combined": f"{sup_name} unit_price",
@@ -552,6 +601,7 @@ def compare(master: WorkbookData, bids: Dict[str, WorkbookData], join_mode: str 
                 return min(values, key=values.get)
             comp["LOWEST supplier"] = comp.apply(lowest_supplier, axis=1)
 
+        comp.attrs["master_total_sum"] = master_total_sum
         results[sheet] = comp
     return results
 
@@ -912,9 +962,13 @@ with tab_compare:
             # Totals per supplier for this sheet
             total_cols = [c for c in df.columns if c.endswith(" total")]
             if total_cols:
-                sums = df[total_cols].sum().rename("Sum")
-                sums_df = sums.reset_index()
-                sums_df.columns = ["Supplier total (col)", "Value"]
+                def total_for_column(col: str) -> float:
+                    if col == "Master total" and "master_total_sum" in df.attrs:
+                        return df.attrs["master_total_sum"]
+                    return df[col].sum()
+
+                totals = [(col, total_for_column(col)) for col in total_cols]
+                sums_df = pd.DataFrame(totals, columns=["Supplier total (col)", "Value"])
                 with st.container():
                     c1, c2 = st.columns([2, 3])
                 with c1:
@@ -923,7 +977,12 @@ with tab_compare:
                     with c2:
                         # bar chart per sheet
                         try:
-                            chart_df = pd.DataFrame({"supplier": [c.replace(" total","") for c in total_cols], "total": [df[c].sum() for c in total_cols]})
+                            chart_df = pd.DataFrame(
+                                {
+                                    "supplier": [c.replace(" total", "") for c in total_cols],
+                                    "total": [total_for_column(c) for c in total_cols],
+                                }
+                            )
                             fig = px.bar(chart_df, x="supplier", y="total", title=f"Součet za list: {sheet} ({currency} bez DPH)")
                             st.plotly_chart(fig, use_container_width=True)
                         except Exception:
