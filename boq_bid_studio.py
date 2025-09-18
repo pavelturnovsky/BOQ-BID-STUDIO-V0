@@ -116,6 +116,21 @@ def sanitize_key(prefix: str, name: str) -> str:
     safe = re.sub(r"[^0-9a-zA-Z_]+", "_", name)
     return f"{prefix}_{safe}" if safe else f"{prefix}_anon"
 
+
+def _normalize_key_part(value: Any) -> str:
+    """Normalize part of a widget key to avoid Streamlit duplicate IDs."""
+
+    safe = re.sub(r"[^0-9a-zA-Z_]+", "_", str(value))
+    safe = safe.strip("_")
+    return safe or "anon"
+
+
+def make_widget_key(*parts: Any) -> str:
+    """Create a stable widget key from the provided parts."""
+
+    normalized = [_normalize_key_part(p) for p in parts]
+    return "_".join(normalized)
+
 @st.cache_data
 def try_autodetect_mapping(df: pd.DataFrame) -> Tuple[Dict[str, int], int, pd.DataFrame]:
     """Autodetect header mapping using a sampled, vectorized search."""
@@ -359,11 +374,21 @@ def apply_master_mapping(master: WorkbookData, target: WorkbookData) -> None:
         except Exception:
             continue
 
-def mapping_ui(section_title: str, wb: WorkbookData, minimal: bool = False, minimal_sheets: Optional[List[str]] = None) -> bool:
+def mapping_ui(
+    section_title: str,
+    wb: WorkbookData,
+    minimal: bool = False,
+    minimal_sheets: Optional[List[str]] = None,
+    *,
+    section_id: Optional[str] = None,
+) -> bool:
     """Render mapping UI and return True if any mapping changed."""
     st.subheader(section_title)
     tabs = st.tabs(list(wb.sheets.keys()))
     changed_any = False
+    section_key_input = section_id if section_id is not None else f"{wb.name}__{section_title}"
+    section_key = _normalize_key_part(section_key_input)
+
     for tab, (sheet, obj) in zip(tabs, wb.sheets.items()):
         use_minimal = minimal or (minimal_sheets is not None and sheet in minimal_sheets)
         with tab:
@@ -377,7 +402,15 @@ def mapping_ui(section_title: str, wb: WorkbookData, minimal: bool = False, mini
             if hdr_preview is not None:
                 show_df(hdr_preview)
             # Header row selector
-            header_row = st.number_input(f"Řádek s hlavičkou (0 = první řádek) — {sheet}", min_value=0, max_value=9, value=header_row if header_row >= 0 else 0, step=1, key=f"hdr_{section_title}_{sheet}")
+            sheet_key = _normalize_key_part(sheet)
+            header_row = st.number_input(
+                f"Řádek s hlavičkou (0 = první řádek) — {sheet}",
+                min_value=0,
+                max_value=9,
+                value=header_row if header_row >= 0 else 0,
+                step=1,
+                key=make_widget_key("hdr", section_key, sheet_key),
+            )
             # Build header names for the selected row
             if isinstance(raw, pd.DataFrame) and header_row < len(raw):
                 header_names = [normalize_col(x) for x in raw.iloc[header_row].astype(str).tolist()]
@@ -406,7 +439,7 @@ def mapping_ui(section_title: str, wb: WorkbookData, minimal: bool = False, mini
                         cols,
                         format_func=lambda i: header_names[i] if i < len(header_names) else "",
                         index=clamp(pick_default("code")),
-                        key=f"map_code_{section_title}_{sheet}",
+                        key=make_widget_key("map", section_key, sheet_key, "code"),
                     )
                 with c2:
                     desc_idx = st.selectbox(
@@ -414,7 +447,7 @@ def mapping_ui(section_title: str, wb: WorkbookData, minimal: bool = False, mini
                         cols,
                         format_func=lambda i: header_names[i] if i < len(header_names) else "",
                         index=clamp(pick_default("description")),
-                        key=f"map_desc_{section_title}_{sheet}",
+                        key=make_widget_key("map", section_key, sheet_key, "description"),
                     )
                 with c3:
                     total_idx = st.selectbox(
@@ -422,7 +455,7 @@ def mapping_ui(section_title: str, wb: WorkbookData, minimal: bool = False, mini
                         cols,
                         format_func=lambda i: header_names[i] if i < len(header_names) else "",
                         index=clamp(pick_default("total_price")),
-                        key=f"map_total_{section_title}_{sheet}",
+                        key=make_widget_key("map", section_key, sheet_key, "total_price"),
                     )
                 with c4:
                     summ_idx = st.selectbox(
@@ -430,7 +463,7 @@ def mapping_ui(section_title: str, wb: WorkbookData, minimal: bool = False, mini
                         cols,
                         format_func=lambda i: header_names[i] if i < len(header_names) else "",
                         index=clamp(pick_default("summary_total")),
-                        key=f"map_sum_{section_title}_{sheet}",
+                        key=make_widget_key("map", section_key, sheet_key, "summary_total"),
                     )
                 ui_mapping = {
                     "code": code_idx,
@@ -451,7 +484,7 @@ def mapping_ui(section_title: str, wb: WorkbookData, minimal: bool = False, mini
                         cols,
                         format_func=lambda i: header_names[i] if i < len(header_names) else "",
                         index=clamp(pick_default("code")),
-                        key=f"map_code_{section_title}_{sheet}",
+                        key=make_widget_key("map", section_key, sheet_key, "code"),
                     )
                 with c2:
                     desc_idx = st.selectbox(
@@ -459,7 +492,7 @@ def mapping_ui(section_title: str, wb: WorkbookData, minimal: bool = False, mini
                         cols,
                         format_func=lambda i: header_names[i] if i < len(header_names) else "",
                         index=clamp(pick_default("description")),
-                        key=f"map_desc_{section_title}_{sheet}",
+                        key=make_widget_key("map", section_key, sheet_key, "description"),
                     )
                 with c3:
                     unit_idx = st.selectbox(
@@ -467,7 +500,7 @@ def mapping_ui(section_title: str, wb: WorkbookData, minimal: bool = False, mini
                         cols,
                         format_func=lambda i: header_names[i] if i < len(header_names) else "",
                         index=clamp(pick_default("unit")),
-                        key=f"map_unit_{section_title}_{sheet}",
+                        key=make_widget_key("map", section_key, sheet_key, "unit"),
                     )
                 with c4:
                     qty_idx = st.selectbox(
@@ -475,7 +508,7 @@ def mapping_ui(section_title: str, wb: WorkbookData, minimal: bool = False, mini
                         cols,
                         format_func=lambda i: header_names[i] if i < len(header_names) else "",
                         index=clamp(pick_default("quantity")),
-                        key=f"map_qty_{section_title}_{sheet}",
+                        key=make_widget_key("map", section_key, sheet_key, "quantity"),
                     )
                 c5, c6, c7, c8, c9 = st.columns(5)
                 with c5:
@@ -484,7 +517,7 @@ def mapping_ui(section_title: str, wb: WorkbookData, minimal: bool = False, mini
                         cols,
                         format_func=lambda i: header_names[i] if i < len(header_names) else "",
                         index=clamp(pick_default("quantity_supplier")),
-                        key=f"map_qtysup_{section_title}_{sheet}",
+                        key=make_widget_key("map", section_key, sheet_key, "quantity_supplier"),
                     )
                 with c6:
                     upm_idx = st.selectbox(
@@ -492,7 +525,7 @@ def mapping_ui(section_title: str, wb: WorkbookData, minimal: bool = False, mini
                         cols,
                         format_func=lambda i: header_names[i] if i < len(header_names) else "",
                         index=clamp(pick_default("unit_price_material")),
-                        key=f"map_upm_{section_title}_{sheet}",
+                        key=make_widget_key("map", section_key, sheet_key, "unit_price_material"),
                     )
                 with c7:
                     upi_idx = st.selectbox(
@@ -500,7 +533,7 @@ def mapping_ui(section_title: str, wb: WorkbookData, minimal: bool = False, mini
                         cols,
                         format_func=lambda i: header_names[i] if i < len(header_names) else "",
                         index=clamp(pick_default("unit_price_install")),
-                        key=f"map_upi_{section_title}_{sheet}",
+                        key=make_widget_key("map", section_key, sheet_key, "unit_price_install"),
                     )
                 with c8:
                     total_idx = st.selectbox(
@@ -508,7 +541,7 @@ def mapping_ui(section_title: str, wb: WorkbookData, minimal: bool = False, mini
                         cols,
                         format_func=lambda i: header_names[i] if i < len(header_names) else "",
                         index=clamp(pick_default("total_price")),
-                        key=f"map_total_{section_title}_{sheet}",
+                        key=make_widget_key("map", section_key, sheet_key, "total_price"),
                     )
                 with c9:
                     summ_idx = st.selectbox(
@@ -516,7 +549,7 @@ def mapping_ui(section_title: str, wb: WorkbookData, minimal: bool = False, mini
                         cols,
                         format_func=lambda i: header_names[i] if i < len(header_names) else "",
                         index=clamp(pick_default("summary_total")),
-                        key=f"map_sum_{section_title}_{sheet}",
+                        key=make_widget_key("map", section_key, sheet_key, "summary_total"),
                     )
 
                 ui_mapping = {
@@ -1341,6 +1374,7 @@ with tab_data:
         "Master",
         master_wb,
         minimal_sheets=[overview_sheet] if overview_sheet in compare_sheets else None,
+        section_id="master",
     )
     if master_changed:
         for wb in bids_dict.values():
@@ -1350,7 +1384,9 @@ with tab_data:
                 apply_master_mapping(master_wb, wb)
     if overview_sheet not in compare_sheets:
         with st.expander("Mapování — Master rekapitulace", expanded=False):
-            master_over_changed = mapping_ui("Master rekapitulace", master_overview_wb, minimal=True)
+            master_over_changed = mapping_ui(
+                "Master rekapitulace", master_overview_wb, minimal=True, section_id="master_recap"
+            )
         if master_over_changed:
             for wb in bids_overview_dict.values():
                 apply_master_mapping(master_overview_wb, wb)
@@ -1362,12 +1398,18 @@ with tab_data:
                     alias,
                     wb,
                     minimal_sheets=[overview_sheet] if overview_sheet in compare_sheets else None,
+                    section_id=f"bid_{sup_name}",
                 )
         if overview_sheet not in compare_sheets:
             for sup_name, wb in bids_overview_dict.items():
                 alias = display_names.get(sup_name, sup_name)
                 with st.expander(f"Mapování rekapitulace — {alias}", expanded=False):
-                    mapping_ui(f"{alias} rekapitulace", wb, minimal=True)
+                    mapping_ui(
+                        f"{alias} rekapitulace",
+                        wb,
+                        minimal=True,
+                        section_id=f"bid_recap_{sup_name}",
+                    )
     st.success("Mapování připraveno. Přepni na záložku **Porovnání**.")
 
 # Pre-compute comparison results for reuse in tabs (after mapping)
