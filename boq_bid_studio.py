@@ -23,7 +23,7 @@ HEADER_HINTS = {
     "code": [
         "code",
         "item",
-        "č.",
+        "regex:^č\\.?$",
         "číslo položky",
         "cislo polozky",
         "kód",
@@ -1771,22 +1771,56 @@ with tab_rekap:
                     return subset.sum(skipna=True)
                 return pd.Series(0.0, index=value_cols, dtype=float)
 
-            st.markdown("### Přehled hlavních položek (kódy 0–5, VE, 15)")
-            main_tokens = ["0", "1", "2", "3", "4", "5", "VE", "15"]
+            st.markdown("### Rekapitulace finančních nákladů stavby")
+            recap_labels = [
+                "Demolice a sanace",
+                "Objekt",
+                "Fit-out kanceláře pronájem",
+                "Fit-out kanceláře objekt",
+                "Fit-out retail",
+                "Shell and core",
+                "Alternativní řešení zadané objednatelem",
+                "Opční položky",
+            ]
             main_detail = pd.DataFrame()
             if not working_sections.empty and value_cols:
-                detail_mask = working_sections["__code_token__"].isin(main_tokens)
-                if detail_mask.any():
-                    main_detail = working_sections.loc[
-                        detail_mask, ["code", "description"] + value_cols
-                    ].copy()
-                    order_map = {token: idx for idx, token in enumerate(main_tokens)}
-                    main_detail["__order__"] = main_detail["code"].map(
-                        lambda v: order_map.get(extract_code_token(v), len(main_tokens))
-                    )
-                    main_detail = main_detail.sort_values("__order__")
-                    main_detail.drop(columns="__order__", inplace=True)
-                    main_detail.rename(columns={"code": "č.", "description": "Položka"}, inplace=True)
+                working_sections["__canonical_desc__"] = (
+                    working_sections.get("__norm_desc__", pd.Series("", index=working_sections.index))
+                    .astype(str)
+                    .map(lambda text: re.sub(r"[^0-9a-z]+", "", text))
+                )
+
+                def canonical_label(text: Any) -> str:
+                    return re.sub(r"[^0-9a-z]+", "", normalize_text(text))
+
+                recap_rows: List[Dict[str, Any]] = []
+                for label in recap_labels:
+                    target_key = canonical_label(label)
+                    if "__canonical_desc__" in working_sections.columns:
+                        mask = working_sections["__canonical_desc__"] == target_key
+                    else:
+                        mask = pd.Series(False, index=working_sections.index)
+                    sums = sum_for_mask(mask)
+                    if not mask.any():
+                        sums = pd.Series(np.nan, index=value_cols, dtype=float)
+                    codes: List[str] = []
+                    if mask.any() and "code" in working_sections.columns:
+                        raw_codes = working_sections.loc[mask, "code"]
+                        cleaned_codes: List[str] = []
+                        for val in raw_codes:
+                            text = str(val).strip()
+                            if text and text.lower() != "nan":
+                                cleaned_codes.append(text)
+                        codes = sorted(set(cleaned_codes), key=natural_sort_key)
+                    recap_row: Dict[str, Any] = {
+                        "č": ", ".join(codes),
+                        "Položka": label,
+                    }
+                    for col in value_cols:
+                        recap_row[col] = sums.get(col, np.nan)
+                    recap_rows.append(recap_row)
+                if recap_rows:
+                    main_detail = pd.DataFrame(recap_rows)
                     for col in value_cols:
                         if col in main_detail.columns:
                             main_detail[col] = pd.to_numeric(main_detail[col], errors="coerce")
@@ -1802,16 +1836,16 @@ with tab_rekap:
                                 pd.to_numeric(converted_main[col], errors="coerce")
                                 * conversion_factor
                             )
-                    st.markdown(f"**Přehled v {target_currency}:**")
+                    st.markdown(f"**Rekapitulace v {target_currency}:**")
                     show_df(
                         rename_value_columns_for_display(
                             converted_main, f" — CELKEM {target_currency}"
                         )
                     )
                 else:
-                    st.info("V datech chybí požadované kódy 0–5, VE nebo 15.")
+                    st.info("V datech se nepodařilo najít požadované položky rekapitulace.")
             else:
-                st.info("Pro zobrazení rekapitulace hlavních položek je potřeba načíst data z listu.")
+                st.info("Pro zobrazení rekapitulace finančních nákladů je potřeba načíst data z listu.")
 
             st.markdown("### Souhrn hlavních položek a vedlejších nákladů")
             plus_tokens = {"0", "1", "2", "3", "4", "5"}
