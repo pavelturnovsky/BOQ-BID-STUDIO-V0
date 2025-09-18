@@ -110,8 +110,6 @@ def update_exchange_rate_shared(value: Any) -> float:
             st.session_state.get(EXCHANGE_RATE_STATE_KEY, DEFAULT_EXCHANGE_RATE)
         )
     st.session_state[EXCHANGE_RATE_STATE_KEY] = exchange_rate
-    for widget_key in EXCHANGE_RATE_WIDGET_KEYS.values():
-        st.session_state[widget_key] = exchange_rate
     return exchange_rate
 
 def normalize_col(c):
