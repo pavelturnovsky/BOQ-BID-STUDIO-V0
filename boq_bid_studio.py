@@ -110,6 +110,8 @@ def update_exchange_rate_shared(value: Any) -> float:
             st.session_state.get(EXCHANGE_RATE_STATE_KEY, DEFAULT_EXCHANGE_RATE)
         )
     st.session_state[EXCHANGE_RATE_STATE_KEY] = exchange_rate
+    for widget_key in EXCHANGE_RATE_WIDGET_KEYS.values():
+        st.session_state[widget_key] = exchange_rate
     return exchange_rate
 
 def normalize_col(c):
@@ -387,10 +389,8 @@ def show_df(df: pd.DataFrame) -> None:
     if not isinstance(df, pd.DataFrame):
         st.dataframe(df)
         return
-    df_to_show = df
-    if isinstance(df.columns, pd.Index) and df.columns.duplicated().any():
-        df_to_show = df.copy()
-        df_to_show.columns = make_unique_columns(df.columns)
+    df_to_show = df.copy()
+    df_to_show.columns = make_unique_columns(df_to_show.columns)
     numeric_cols = df_to_show.select_dtypes(include=[np.number]).columns
     if len(numeric_cols) == 0:
         st.dataframe(df_to_show)
