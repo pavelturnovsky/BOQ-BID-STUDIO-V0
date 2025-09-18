@@ -2,6 +2,7 @@
 import math
 import re
 import json
+import unicodedata
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -129,6 +130,61 @@ def supplier_default_alias(name: str, max_length: int = 30) -> str:
 def sanitize_key(prefix: str, name: str) -> str:
     safe = re.sub(r"[^0-9a-zA-Z_]+", "_", name)
     return f"{prefix}_{safe}" if safe else f"{prefix}_anon"
+
+
+def normalize_text(value: Any) -> str:
+    """Return lower-case text without diacritics for fuzzy comparisons."""
+
+    if value is None:
+        return ""
+    text = str(value).strip()
+    if not text:
+        return ""
+    normalized = unicodedata.normalize("NFKD", text)
+    without_diacritics = "".join(ch for ch in normalized if not unicodedata.combining(ch))
+    return without_diacritics.lower()
+
+
+def extract_code_token(value: Any) -> str:
+    """Return a canonical code token for grouping (e.g. "7.7", "VE")."""
+
+    if value is None:
+        return ""
+    text = str(value).strip()
+    if not text:
+        return ""
+    text = text.replace(",", ".")
+    text = re.sub(r"\s+", " ", text)
+    match = re.match(r"([A-Za-z0-9]+(?:[.\-][A-Za-z0-9]+)*)", text)
+    token = match.group(1) if match else text.split()[0]
+    token = token.replace("-", ".").strip(".")
+    return token.upper()
+
+
+def natural_sort_key(value: str) -> Tuple[Any, ...]:
+    """Return a tuple usable for natural sorting of alphanumeric codes."""
+
+    if value is None:
+        return ("",)
+    text = str(value)
+    parts = re.split(r"(\d+)", text)
+    key: List[Any] = []
+    for part in parts:
+        if part.isdigit():
+            key.append(int(part))
+        else:
+            key.append(part.lower())
+    return tuple(key)
+
+
+def rename_value_columns_for_display(df: pd.DataFrame, suffix: str) -> pd.DataFrame:
+    """Rename columns ending with " total" to include a human friendly suffix."""
+
+    rename_map = {}
+    for col in df.columns:
+        if col.endswith(" total"):
+            rename_map[col] = f"{col.replace(' total', '')}{suffix}"
+    return df.rename(columns=rename_map)
 
 
 def ensure_unique_aliases(
@@ -1696,161 +1752,424 @@ with tab_rekap:
                 1.0 / exchange_rate if conversion_direction == "CZK → EUR" else exchange_rate
             )
             st.caption(
-                f"Hodnoty jsou nejprve zobrazeny v {base_currency}. Přepočet používá kurz 1 EUR = {exchange_rate:.4f} CZK."
+                f"Hodnoty jsou nejprve zobrazeny v {base_currency}. Přepočet používá kurz 1 EUR = {exchange_rate:.4f} CZK a uplatňuje se pouze na první dvě tabulky."
             )
 
-            grouped_sections_display = pd.DataFrame()
-            detail_groups: Dict[str, Dict[str, pd.DataFrame]] = {}
-            overrides_key = "rekap_group_overrides"
-            overrides = st.session_state.get(overrides_key, {})
+            working_sections = sections_df.copy()
+            if not working_sections.empty:
+                working_sections["__code_token__"] = working_sections["code"].map(extract_code_token)
+                working_sections["__norm_desc__"] = working_sections["description"].map(normalize_text)
+            value_cols = [c for c in working_sections.columns if c.endswith(" total")]
 
-            if not sections_df.empty:
-                valid_codes = sections_df["code"].astype(str).tolist()
-                overrides = {k: v for k, v in overrides.items() if k in valid_codes}
-                if st.session_state.get(overrides_key) != overrides:
-                    st.session_state[overrides_key] = overrides
+            def sum_for_mask(mask: pd.Series, absolute: bool = False) -> pd.Series:
+                if value_cols and not working_sections.empty and mask.any():
+                    subset = working_sections.loc[mask, value_cols].apply(
+                        pd.to_numeric, errors="coerce"
+                    )
+                    if absolute:
+                        subset = subset.abs()
+                    return subset.sum(skipna=True)
+                return pd.Series(0.0, index=value_cols, dtype=float)
 
-                st.markdown("### Nastavení seskupení oddílů")
-                st.caption(
-                    "Položky jsou seskupeny automaticky podle kódů. V případě potřeby můžeš upravit název skupiny i pořadí."
-                )
-                if st.button("Resetovat ruční seskupení", key="reset_group_overrides"):
-                    overrides = {}
-                    st.session_state[overrides_key] = {}
+            st.markdown("### Přehled hlavních položek (kódy 0–5, VE, 15)")
+            main_tokens = ["0", "1", "2", "3", "4", "5", "VE", "15"]
+            main_detail = pd.DataFrame()
+            if not working_sections.empty and value_cols:
+                detail_mask = working_sections["__code_token__"].isin(main_tokens)
+                if detail_mask.any():
+                    main_detail = working_sections.loc[
+                        detail_mask, ["code", "description"] + value_cols
+                    ].copy()
+                    order_map = {token: idx for idx, token in enumerate(main_tokens)}
+                    main_detail["__order__"] = main_detail["code"].map(
+                        lambda v: order_map.get(extract_code_token(v), len(main_tokens))
+                    )
+                    main_detail = main_detail.sort_values("__order__")
+                    main_detail.drop(columns="__order__", inplace=True)
+                    main_detail.rename(columns={"code": "č.", "description": "Položka"}, inplace=True)
+                    for col in value_cols:
+                        if col in main_detail.columns:
+                            main_detail[col] = pd.to_numeric(main_detail[col], errors="coerce")
+                    show_df(
+                        rename_value_columns_for_display(
+                            main_detail.copy(), f" — CELKEM {base_currency}"
+                        )
+                    )
+                    converted_main = main_detail.copy()
+                    for col in value_cols:
+                        if col in converted_main.columns:
+                            converted_main[col] = (
+                                pd.to_numeric(converted_main[col], errors="coerce")
+                                * conversion_factor
+                            )
+                    st.markdown(f"**Přehled v {target_currency}:**")
+                    show_df(
+                        rename_value_columns_for_display(
+                            converted_main, f" — CELKEM {target_currency}"
+                        )
+                    )
+                else:
+                    st.info("V datech chybí požadované kódy 0–5, VE nebo 15.")
+            else:
+                st.info("Pro zobrazení rekapitulace hlavních položek je potřeba načíst data z listu.")
 
-                editor_cols = [
-                    col
-                    for col in [
-                        "code",
-                        "description",
-                        "auto_group_key",
-                        "auto_group_label",
-                        "auto_group_order",
-                    ]
-                    if col in sections_df.columns
+            st.markdown("### Souhrn hlavních položek a vedlejších nákladů")
+            plus_tokens = {"0", "1", "2", "3", "4", "5"}
+            deduction_tokens = {"VE", "15"}
+            plus_sum = sum_for_mask(working_sections["__code_token__"].isin(plus_tokens))
+            deduction_sum = sum_for_mask(
+                working_sections["__code_token__"].isin(deduction_tokens), absolute=True
+            )
+            net_sum = plus_sum - deduction_sum
+
+            indirect_sum = pd.Series(0.0, index=value_cols, dtype=float)
+            if not indirect_df.empty and value_cols:
+                for col in value_cols:
+                    if col in indirect_df.columns:
+                        indirect_sum[col] = pd.to_numeric(
+                            indirect_df[col], errors="coerce"
+                        ).sum()
+            ratio_sum = pd.Series(np.nan, index=value_cols, dtype=float)
+            for col in value_cols:
+                base_val = net_sum.get(col)
+                indirect_val = indirect_sum.get(col)
+                if pd.notna(base_val) and base_val != 0:
+                    ratio_sum[col] = (indirect_val / base_val) * 100 if pd.notna(indirect_val) else np.nan
+
+            summary_rows = [
+                ("Součet kódů 0–5", "CZK", plus_sum),
+                ("Součet odpočtů (VE, 15.)", "CZK", deduction_sum),
+                ("Cena po odečtech", "CZK", net_sum),
+                ("Vedlejší rozpočtové náklady", "CZK", indirect_sum),
+                ("Podíl vedlejších nákladů (%)", "%", ratio_sum),
+            ]
+            summary_base = pd.DataFrame(
+                [
+                    {
+                        "Ukazatel": label,
+                        "Jednotka": unit,
+                        **{col: values.get(col, np.nan) for col in value_cols},
+                    }
+                    for label, unit, values in summary_rows
                 ]
-                editor_df = sections_df[editor_cols].copy()
-                if "source_order" in sections_df.columns:
-                    editor_df = editor_df.join(sections_df["source_order"])  # preserve original order
-                    editor_df = editor_df.sort_values("source_order")
-                editor_df.rename(
+            )
+            if not summary_base.empty:
+                summary_display = rename_value_columns_for_display(summary_base.copy(), "")
+                show_df(summary_display)
+                summary_converted = summary_base.copy()
+                currency_mask = summary_converted["Jednotka"].str.upper() == "CZK"
+                for col in value_cols:
+                    summary_converted.loc[currency_mask, col] = (
+                        pd.to_numeric(summary_converted.loc[currency_mask, col], errors="coerce")
+                        * conversion_factor
+                    )
+                summary_converted.loc[currency_mask, "Jednotka"] = target_currency
+                st.markdown(f"**Souhrn v {target_currency}:**")
+                show_df(rename_value_columns_for_display(summary_converted, ""))
+            else:
+                st.info("Souhrnná tabulka nedokázala zpracovat žádná čísla.")
+
+            net_chart_series = net_sum.reindex(value_cols) if value_cols else pd.Series(dtype=float)
+            if not net_chart_series.dropna().empty:
+                chart_df = pd.DataFrame(
+                    {
+                        "Dodavatel": [col.replace(" total", "") for col in value_cols],
+                        "Cena po odečtech": [net_chart_series.get(col) for col in value_cols],
+                    }
+                )
+                master_val = net_chart_series.get("Master total")
+                deltas: List[float] = []
+                for col in value_cols:
+                    value = net_chart_series.get(col)
+                    if col == "Master total" and pd.notna(value):
+                        deltas.append(0.0)
+                    elif pd.notna(master_val) and master_val != 0 and pd.notna(value):
+                        deltas.append(((value - master_val) / master_val) * 100)
+                    else:
+                        deltas.append(np.nan)
+                chart_df["Odchylka vs Master (%)"] = deltas
+                chart_df["Popisek"] = chart_df["Odchylka vs Master (%)"].apply(
+                    lambda v: "0,00 %" if pd.isna(v) else f"{v:+.2f} %"
+                )
+                try:
+                    fig_recap = px.bar(
+                        chart_df,
+                        x="Dodavatel",
+                        y="Cena po odečtech",
+                        color="Dodavatel",
+                        color_discrete_map=chart_color_map,
+                        title="Cena po odečtech hlavních položek",
+                    )
+                    fig_recap.update_traces(text=chart_df["Popisek"], textposition="outside")
+                    fig_recap.update_layout(yaxis_title=f"{base_currency}", showlegend=False)
+                    st.plotly_chart(fig_recap, use_container_width=True)
+                except Exception:
+                    st.warning("Graf se nepodařilo vykreslit, zobrazují se hodnoty v tabulce.")
+                    show_df(chart_df)
+
+            st.markdown("### Interaktivní součet podsekcí")
+            if not working_sections.empty and value_cols:
+                tokens_df = working_sections[
+                    working_sections["__code_token__"].astype(str).str.strip() != ""
+                ][["__code_token__", "description"]]
+                if tokens_df.empty:
+                    st.info("V datech nejsou dostupné kódy podsekcí.")
+                else:
+                    desc_map = (
+                        tokens_df.groupby("__code_token__")["description"]
+                        .apply(
+                            lambda series: next(
+                                (str(val).strip() for val in series if str(val).strip()),
+                                "",
+                            )
+                        )
+                        .to_dict()
+                    )
+                    token_options = sorted(desc_map.keys(), key=natural_sort_key)
+                    selected_token = st.selectbox(
+                        "Vyber kód (např. 7.7) pro součet napříč celým rozpočtem",
+                        options=token_options,
+                        format_func=lambda token: (
+                            f"{token} — {desc_map.get(token, '')}".strip(" —")
+                        ),
+                    )
+                    selection_mask = working_sections["__code_token__"] == selected_token
+                    if selection_mask.any():
+                        label = desc_map.get(selected_token, "")
+                        sum_values = sum_for_mask(selection_mask)
+                        sum_row = {
+                            "Položka": f"Součet pro {selected_token}",
+                            "Jednotka": base_currency,
+                        }
+                        sum_row.update({col: sum_values.get(col, np.nan) for col in value_cols})
+                        sum_df = pd.DataFrame([sum_row])
+                        st.markdown("**Součet vybrané podsekce:**")
+                        show_df(rename_value_columns_for_display(sum_df, ""))
+
+                        detail_selection = working_sections.loc[
+                            selection_mask, ["code", "description"] + value_cols
+                        ].copy()
+                        detail_selection.rename(
+                            columns={"code": "č.", "description": "Položka"}, inplace=True
+                        )
+                        for col in value_cols:
+                            if col in detail_selection.columns:
+                                detail_selection[col] = pd.to_numeric(
+                                    detail_selection[col], errors="coerce"
+                                )
+                        st.markdown("**Detail položek v rámci vybraného kódu:**")
+                        show_df(
+                            rename_value_columns_for_display(
+                                detail_selection, f" — CELKEM {base_currency}"
+                            )
+                        )
+                    else:
+                        st.info("Pro zvolený kód nejsou k dispozici žádné položky.")
+            else:
+                st.info("Pro interaktivní součet je nutné mít načtené položky s kódy.")
+
+            st.markdown("### Value Engineering (VE)")
+            ve_tokens = ["VE", "A", "B", "C.1", "C.2", "C.3"]
+            ve_rows: List[Dict[str, Any]] = []
+            for token in ve_tokens:
+                mask = working_sections["__code_token__"] == token if not working_sections.empty else pd.Series(False)
+                if not working_sections.empty and mask.any():
+                    desc_series = working_sections.loc[mask, "description"].astype(str)
+                    desc_value = next((val.strip() for val in desc_series if val.strip()), "")
+                    sums = sum_for_mask(mask)
+                    row = {
+                        "Kód": token,
+                        "Popis": desc_value,
+                        "Jednotka": base_currency,
+                    }
+                    row.update({col: sums.get(col, np.nan) for col in value_cols})
+                    ve_rows.append(row)
+            if ve_rows:
+                ve_df = pd.DataFrame(ve_rows)
+                show_df(rename_value_columns_for_display(ve_df, ""))
+            else:
+                st.info("V datech se nenachází žádné položky Value Engineering.")
+
+            def aggregate_fixed_table(items: List[Dict[str, Any]]) -> pd.DataFrame:
+                rows: List[Dict[str, Any]] = []
+                for item in items:
+                    codes = {
+                        extract_code_token(code)
+                        for code in item.get("codes", [])
+                        if code is not None
+                    }
+                    keywords = [normalize_text(k) for k in item.get("keywords", []) if k]
+                    match_all = bool(item.get("match_all_keywords"))
+                    if working_sections.empty or not value_cols:
+                        mask = pd.Series(False, index=working_sections.index)
+                    else:
+                        mask = pd.Series(False, index=working_sections.index)
+                        if codes:
+                            mask = mask | working_sections["__code_token__"].isin(codes)
+                        if keywords:
+                            norm_desc = working_sections.get("__norm_desc__", pd.Series("", index=working_sections.index))
+                            if match_all:
+                                keyword_mask = norm_desc.apply(
+                                    lambda text: all(kw in text for kw in keywords)
+                                )
+                            else:
+                                keyword_mask = norm_desc.apply(
+                                    lambda text: any(kw in text for kw in keywords)
+                                )
+                            mask = mask | keyword_mask
+                    sums = sum_for_mask(mask)
+                    row = {
+                        "Položka": item.get("label", ""),
+                        "Jednotka": base_currency,
+                    }
+                    row.update({col: sums.get(col, np.nan) for col in value_cols})
+                    rows.append(row)
+                return pd.DataFrame(rows)
+
+            fixed_tables: List[Tuple[str, List[Dict[str, Any]]]] = [
+                (
+                    "Vnitřní konstrukce",
+                    [
+                        {"label": "4 - Vnitřní konstrukce", "codes": ["4"]},
+                        {"label": "4.1 - Příčky", "codes": ["4.1"]},
+                        {"label": "4.2 - Dveře", "codes": ["4.2"]},
+                        {
+                            "label": "4.4 - Zámečnické a klempířské výrobky",
+                            "codes": ["4.4"],
+                        },
+                    ],
+                ),
+                (
+                    "Úpravy povrchů",
+                    [
+                        {"label": "5 - Úpravy povrchů", "codes": ["5"]},
+                        {"label": "5.1 - Úpravy podlah", "codes": ["5.1"]},
+                        {"label": "5.2 - Úpravy stropů", "codes": ["5.2"]},
+                        {"label": "5.3 - Úpravy stěn", "codes": ["5.3"]},
+                    ],
+                ),
+                (
+                    "Vnitřní vybavení",
+                    [
+                        {"label": "6 - Vnitřní vybavení", "codes": ["6"]},
+                        {"label": "6.1 - Vnitřní vybavení", "codes": ["6.1"]},
+                        {
+                            "label": "6.2 - Protipožární vybavení",
+                            "codes": ["6.2"],
+                        },
+                    ],
+                ),
+                (
+                    "Technické zařízení budov",
+                    [
+                        {"label": "7 - Technické zařízení budov", "codes": ["7"]},
+                        {
+                            "label": "7.1 - Kanalizace",
+                            "keywords": ["kanalizace"],
+                        },
+                        {
+                            "label": "7.2 - Vodovod",
+                            "keywords": ["vodovod"],
+                        },
+                        {
+                            "label": "7.3 - Zařizovací předměty",
+                            "keywords": ["zarizovaci", "predmet"],
+                            "match_all_keywords": True,
+                        },
+                        {
+                            "label": "7.4 - Vytápění a chlazení",
+                            "keywords": ["vytapeni", "chlazeni"],
+                            "match_all_keywords": True,
+                        },
+                        {
+                            "label": "7.6 - Vzduchotechnika",
+                            "codes": ["7.6"],
+                        },
+                        {
+                            "label": "7.7 - Měření a regulace",
+                            "keywords": ["mereni", "regulace"],
+                            "match_all_keywords": True,
+                        },
+                        {
+                            "label": "7.8 - Silnoproud",
+                            "keywords": ["silnoproud"],
+                        },
+                        {
+                            "label": "7.9 - Slaboproud",
+                            "keywords": ["slaboproud"],
+                        },
+                        {
+                            "label": "7.10 - Stabilní hasicí zařízení - MHZ",
+                            "keywords": ["stabilni hasi", "mhz"],
+                            "match_all_keywords": True,
+                        },
+                        {
+                            "label": "7.11 - Elektro slaboproud - EPS",
+                            "keywords": ["elektro slaboproud", "eps"],
+                            "match_all_keywords": True,
+                        },
+                        {
+                            "label": "7.12 - Technologie gastro",
+                            "keywords": ["technologie gastro"],
+                        },
+                        {
+                            "label": "7.13 - Gastrovoz - chlazení",
+                            "keywords": ["gastrovoz", "chlazeni"],
+                            "match_all_keywords": True,
+                        },
+                    ],
+                ),
+            ]
+
+            for title, items in fixed_tables:
+                st.markdown(f"### {title}")
+                table_df = aggregate_fixed_table(items)
+                show_df(rename_value_columns_for_display(table_df, ""))
+
+            if not indirect_total.empty:
+                st.markdown("### Vedlejší rozpočtové náklady — součty")
+                indirect_display = indirect_total.copy()
+                indirect_display.rename(
                     columns={
-                        "code": "Kód",
-                        "description": "Popis",
-                        "auto_group_key": "Návrh kódu skupiny",
-                        "auto_group_label": "Návrh popisu skupiny",
-                        "auto_group_order": "Pořadí (návrh)",
-                        "source_order": "Původní pořadí",
+                        "supplier": "Dodavatel",
+                        "total": f"Součet ({base_currency})",
                     },
                     inplace=True,
                 )
-                editor_df["Skupina (ručně)"] = (
-                    editor_df["Kód"].map(lambda code: overrides.get(str(code), {}).get("group", ""))
-                )
-                editor_df["Skupina (ručně)"] = editor_df["Skupina (ručně)"].fillna("")
-                manual_order_series = editor_df["Kód"].map(
-                    lambda code: overrides.get(str(code), {}).get("order")
-                )
-                editor_df["Pořadí (ručně)"] = pd.to_numeric(manual_order_series, errors="coerce")
+                show_df(indirect_display)
 
-                column_config: Dict[str, Any] = {
-                    "Kód": st.column_config.Column("Kód", disabled=True, width="small"),
-                    "Popis": st.column_config.Column("Popis", disabled=True, width="large"),
-                    "Skupina (ručně)": st.column_config.TextColumn(
-                        "Skupina (ručně)", help="Zadej kód nebo název cílové skupiny."
-                    ),
-                    "Pořadí (ručně)": st.column_config.NumberColumn(
-                        "Pořadí (ručně)", help="Nižší číslo = vyšší pozice ve výpisu.", format="%.0f"
-                    ),
-                }
-                if "Návrh kódu skupiny" in editor_df.columns:
-                    column_config["Návrh kódu skupiny"] = st.column_config.Column(
-                        "Návrh kódu skupiny", disabled=True, width="small"
+            if not missing_df.empty:
+                st.markdown("### Chybějící položky dle dodavatele — součet")
+                missing_work = missing_df.copy()
+                if "Master total" in missing_work.columns:
+                    missing_work["Master total"] = pd.to_numeric(
+                        missing_work["Master total"], errors="coerce"
                     )
-                if "Návrh popisu skupiny" in editor_df.columns:
-                    column_config["Návrh popisu skupiny"] = st.column_config.Column(
-                        "Návrh popisu skupiny", disabled=True, width="large"
-                    )
-                if "Pořadí (návrh)" in editor_df.columns:
-                    column_config["Pořadí (návrh)"] = st.column_config.NumberColumn(
-                        "Pořadí (návrh)", disabled=True, format="%.0f"
-                    )
-                if "Původní pořadí" in editor_df.columns:
-                    column_config["Původní pořadí"] = st.column_config.NumberColumn(
-                        "Původní pořadí", disabled=True, format="%.0f"
-                    )
-
-                editor_df = st.data_editor(
-                    editor_df,
-                    hide_index=True,
-                    use_container_width=True,
-                    num_rows="fixed",
-                    column_config=column_config,
-                    key="rekap_group_editor",
+                summary_missing = (
+                    missing_work.groupby("missing_in")["Master total"].sum().reset_index()
+                    if "missing_in" in missing_work.columns
+                    else pd.DataFrame()
                 )
-
-                updated_overrides: Dict[str, Dict[str, Any]] = {}
-                for _, row in editor_df.iterrows():
-                    code = str(row.get("Kód", ""))
-                    if not code:
-                        continue
-                    manual_group = str(row.get("Skupina (ručně)", "") or "").strip()
-                    manual_order_val = pd.to_numeric(
-                        pd.Series([row.get("Pořadí (ručně)")]), errors="coerce"
-                    ).iloc[0]
-                    entry: Dict[str, Any] = {}
-                    if manual_group:
-                        entry["group"] = manual_group
-                    if not pd.isna(manual_order_val):
-                        entry["order"] = float(manual_order_val)
-                    if entry:
-                        updated_overrides[code] = entry
-                overrides = updated_overrides
-                st.session_state[overrides_key] = overrides
-
-                grouped_sections_display, detail_groups = prepare_grouped_sections(
-                    sections_df, overrides
+                if not summary_missing.empty:
+                    summary_missing.rename(
+                        columns={
+                            "missing_in": "Dodavatel",
+                            "Master total": f"Součet chybějících položek ({base_currency})",
+                        },
+                        inplace=True,
+                    )
+                    show_df(summary_missing)
+                detail_missing = missing_df.copy()
+                detail_missing.rename(
+                    columns={
+                        "code": "č.",
+                        "description": "Položka",
+                        "missing_in": "Dodavatel",
+                    },
+                    inplace=True,
                 )
-
-            if not sections_df.empty and grouped_sections_display.empty:
-                st.warning(
-                    "Nepodařilo se vytvořit seskupení. Níže je zobrazen původní přehled bez úprav."
-                )
-                show_df(sections_df)
-
-            if not grouped_sections_display.empty:
-                st.markdown(f"### Celkové ceny oddílů ({base_currency})")
-                show_df(grouped_sections_display)
-                if detail_groups:
-                    st.caption("Rozklikni skupinu pro detailní položky.")
-                    for label in grouped_sections_display["Skupina"].astype(str).tolist():
-                        payload = detail_groups.get(label, {})
-                        summary_df = payload.get("summary", pd.DataFrame())
-                        detail_df = payload.get("data", pd.DataFrame())
-                        header = label
-                        if not summary_df.empty:
-                            total_cols = [
-                                c for c in summary_df.columns if c.endswith(" total")
-                            ]
-                            primary = next(
-                                (
-                                    c
-                                    for c in total_cols
-                                    if c.lower().startswith("master")
-                                ),
-                                total_cols[0] if total_cols else None,
-                            )
-                            if primary and not pd.isna(summary_df.iloc[0][primary]):
-                                header = (
-                                    f"{header} — {primary}: {format_number(summary_df.iloc[0][primary])} {base_currency}"
-                                )
-                        with st.expander(header, expanded=False):
-                            if not summary_df.empty:
-                                st.markdown("**Souhrn oddílu:**")
-                                show_df(summary_df)
-                            if not detail_df.empty:
-                                st.markdown("**Položky v oddílu:**")
-                                show_df(detail_df)
+                st.markdown("**Detail chybějících položek (v původní měně):**")
+                show_df(detail_missing)
 
                 with st.expander("Původní tabulka (detailní řádky)", expanded=False):
                     raw_display = sections_df.copy()
