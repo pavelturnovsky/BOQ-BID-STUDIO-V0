@@ -3,7 +3,7 @@ import math
 import re
 import json
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -69,6 +69,7 @@ EXCHANGE_RATE_WIDGET_KEYS = {
     "summary": "summary_exchange_rate",
     "recap": "recap_exchange_rate",
 }
+RESERVED_ALIAS_NAMES = {"Master", "LOWEST"}
 
 
 def ensure_exchange_rate_state(default: float = DEFAULT_EXCHANGE_RATE) -> None:
@@ -98,6 +99,19 @@ def ensure_exchange_rate_state(default: float = DEFAULT_EXCHANGE_RATE) -> None:
     for widget_key in EXCHANGE_RATE_WIDGET_KEYS.values():
         st.session_state[widget_key] = shared_value
 
+
+def update_exchange_rate_shared(value: Any) -> float:
+    """Persist the provided exchange rate into shared session state."""
+
+    try:
+        exchange_rate = float(value)
+    except (TypeError, ValueError):
+        exchange_rate = float(
+            st.session_state.get(EXCHANGE_RATE_STATE_KEY, DEFAULT_EXCHANGE_RATE)
+        )
+    st.session_state[EXCHANGE_RATE_STATE_KEY] = exchange_rate
+    return exchange_rate
+
 def normalize_col(c):
     if not isinstance(c, str):
         c = str(c)
@@ -115,6 +129,37 @@ def supplier_default_alias(name: str, max_length: int = 30) -> str:
 def sanitize_key(prefix: str, name: str) -> str:
     safe = re.sub(r"[^0-9a-zA-Z_]+", "_", name)
     return f"{prefix}_{safe}" if safe else f"{prefix}_anon"
+
+
+def ensure_unique_aliases(
+    raw_to_alias: Dict[str, str], reserved: Optional[Iterable[str]] = None
+) -> Dict[str, str]:
+    """Return a mapping with aliases made unique via numeric suffixes.
+
+    Streamlit tables require unique column labels. When two suppliers share the
+    same alias (or when an alias collides with a reserved name such as
+    "Master"), the comparison columns would otherwise duplicate. We keep the
+    first occurrence intact and append ``" (n)"`` to subsequent duplicates
+    while preserving the semantic suffixes (e.g. ``" total"``) added later in
+    the pipeline.
+    """
+
+    reserved_casefold = {str(name).casefold() for name in (reserved or []) if name}
+    used: set[str] = set(reserved_casefold)
+    unique: Dict[str, str] = {}
+
+    for raw, alias in raw_to_alias.items():
+        alias_str = str(alias).strip() if alias is not None else ""
+        base_alias = alias_str or supplier_default_alias(raw)
+        candidate = base_alias
+        suffix = 2
+        while candidate.casefold() in used:
+            candidate = f"{base_alias} ({suffix})"
+            suffix += 1
+        used.add(candidate.casefold())
+        unique[raw] = candidate
+
+    return unique
 
 
 def _normalize_key_part(value: Any) -> str:
@@ -318,15 +363,41 @@ def format_number(x):
     return f"{x:,.2f}".replace(",", " ").replace(".", ",")
 
 
+def make_unique_columns(columns: Iterable[Any]) -> List[str]:
+    """Generate unique column labels for display purposes."""
+
+    unique_labels: List[str] = []
+    used: set[str] = set()
+    for col in columns:
+        base = str(col) if col is not None else ""
+        base = base.strip()
+        if not base:
+            base = "column"
+        candidate = base
+        suffix = 2
+        while candidate in used:
+            candidate = f"{base} ({suffix})"
+            suffix += 1
+        used.add(candidate)
+        unique_labels.append(candidate)
+    return unique_labels
+
+
 def show_df(df: pd.DataFrame) -> None:
     if not isinstance(df, pd.DataFrame):
         st.dataframe(df)
         return
-    numeric_cols = df.select_dtypes(include=[np.number]).columns
+    df_to_show = df
+    if isinstance(df.columns, pd.Index) and df.columns.duplicated().any():
+        df_to_show = df.copy()
+        df_to_show.columns = make_unique_columns(df.columns)
+    numeric_cols = df_to_show.select_dtypes(include=[np.number]).columns
     if len(numeric_cols) == 0:
-        st.dataframe(df)
+        st.dataframe(df_to_show)
     else:
-        st.dataframe(df.style.format({col: format_number for col in numeric_cols}))
+        st.dataframe(
+            df_to_show.style.format({col: format_number for col in numeric_cols})
+        )
 
 @st.cache_data
 def read_workbook(upload, limit_sheets: Optional[List[str]] = None) -> WorkbookData:
@@ -1350,8 +1421,11 @@ if current_suppliers:
             metadata[raw_name]["alias"] = alias_clean
             metadata[raw_name]["color"] = color_value or color_default
 
-    st.session_state["supplier_metadata"] = metadata
     display_names = {raw: metadata[raw]["alias"] for raw in current_suppliers}
+    display_names = ensure_unique_aliases(display_names, RESERVED_ALIAS_NAMES)
+    for raw, display_alias in display_names.items():
+        metadata[raw]["alias_display"] = display_alias
+    st.session_state["supplier_metadata"] = metadata
     color_map = {display_names[raw]: metadata[raw]["color"] for raw in current_suppliers}
 
 chart_color_map = color_map.copy()
@@ -1522,9 +1596,7 @@ with tab_summary:
                     format="%.4f",
                     key=EXCHANGE_RATE_WIDGET_KEYS["summary"],
                 )
-                exchange_rate = float(exchange_rate)
-                st.session_state[EXCHANGE_RATE_STATE_KEY] = exchange_rate
-                st.session_state[EXCHANGE_RATE_WIDGET_KEYS["recap"]] = exchange_rate
+                exchange_rate = update_exchange_rate_shared(exchange_rate)
 
             st.caption(
                 "Tabulka zobrazuje původní hodnoty v CZK. Přepočet níže pracuje pouze se souhrnnými hodnotami pro rychlost."
@@ -1614,9 +1686,7 @@ with tab_rekap:
                     format="%.4f",
                     key=EXCHANGE_RATE_WIDGET_KEYS["recap"],
                 )
-                exchange_rate = float(exchange_rate)
-                st.session_state[EXCHANGE_RATE_STATE_KEY] = exchange_rate
-                st.session_state[EXCHANGE_RATE_WIDGET_KEYS["summary"]] = exchange_rate
+                exchange_rate = update_exchange_rate_shared(exchange_rate)
 
             base_currency = "CZK" if conversion_direction == "CZK → EUR" else "EUR"
             target_currency = "EUR" if conversion_direction == "CZK → EUR" else "CZK"
