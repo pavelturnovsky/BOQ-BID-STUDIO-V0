@@ -520,8 +520,7 @@ def mapping_ui(
             st.markdown(f"**List:** `{sheet}`")
             raw = obj.get("raw")
             header_row = obj.get("header_row", -1)
-            mapping = obj.get("mapping", {}).copy()
-            prev_mapping = mapping.copy()
+            stored_mapping = obj.get("mapping", {}).copy()
             prev_header = header_row
             hdr_preview = raw.head(10) if isinstance(raw, pd.DataFrame) else None
             if hdr_preview is not None:
@@ -538,23 +537,70 @@ def mapping_ui(
             )
             # Build header names for the selected row
             if isinstance(raw, pd.DataFrame) and header_row < len(raw):
-                header_names = [normalize_col(x) for x in raw.iloc[header_row].astype(str).tolist()]
+                header_names = [
+                    normalize_col(x)
+                    for x in raw.iloc[header_row].astype(str).tolist()
+                ]
             else:
                 header_names = obj.get("header_names", [])
+            header_names = [normalize_col(x) for x in header_names]
+
+            header_lookup: Dict[str, int] = {}
+            for idx, name in enumerate(header_names):
+                raw_key = str(name).strip()
+                if raw_key and raw_key not in header_lookup:
+                    header_lookup[raw_key] = idx
+                normalized_key = normalize_col(raw_key)
+                if normalized_key and normalized_key not in header_lookup:
+                    header_lookup[normalized_key] = idx
+
+            def sanitize_index(value: Any) -> int:
+                if isinstance(value, (int, np.integer)):
+                    idx_val = int(value)
+                elif isinstance(value, (float, np.floating)):
+                    as_float = float(value)
+                    if math.isnan(as_float):
+                        return 0
+                    idx_val = int(as_float)
+                elif isinstance(value, str):
+                    stripped = value.strip()
+                    if not stripped:
+                        return 0
+                    try:
+                        idx_val = int(float(stripped))
+                    except ValueError:
+                        normalized = normalize_col(stripped)
+                        idx_val = header_lookup.get(
+                            normalized, header_lookup.get(stripped, 0)
+                        )
+                else:
+                    idx_val = 0
+                return int(idx_val)
+
+            mapping = {key: sanitize_index(val) for key, val in stored_mapping.items()}
+            prev_mapping = mapping.copy()
+
             # Select boxes for mapping
             cols = list(range(len(header_names)))
             if not cols:
                 cols = [0]
 
-            def pick_default(key):
+            def pick_default(key: str) -> int:
+                if key in mapping:
+                    return mapping[key]
                 hints = HEADER_HINTS.get(key, [])
                 for i, col in enumerate(header_names):
                     if any(p in col for p in hints):
                         return i
-                return mapping.get(key, 0)
+                return 0
 
-            def clamp(idx: int) -> int:
-                return max(0, min(idx, len(cols) - 1))
+            def clamp(idx: Any) -> int:
+                try:
+                    idx_int = int(idx)
+                except (TypeError, ValueError):
+                    idx_int = 0
+                idx_int = max(0, min(idx_int, len(cols) - 1))
+                return idx_int
 
             if use_minimal:
                 c1, c2, c3, c4 = st.columns(4)
