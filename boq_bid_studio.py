@@ -1017,7 +1017,11 @@ def prepare_grouped_sections(
         working["source_order"] = np.arange(len(working))
     working = working.reset_index(drop=True)
     working["item_order"] = pd.to_numeric(working["source_order"], errors="coerce")
-    working["item_order"] = working["item_order"].fillna(np.arange(len(working)))
+    if working["item_order"].isna().any():
+        fallback_order = pd.Series(
+            np.arange(len(working), dtype=float), index=working.index
+        )
+        working["item_order"] = working["item_order"].fillna(fallback_order)
     if "auto_group_key" not in working.columns:
         working["auto_group_key"] = working["code"]
     if "auto_group_label" not in working.columns:
