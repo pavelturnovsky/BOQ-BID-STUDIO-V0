@@ -1,4 +1,5 @@
 
+import math
 import re
 import json
 from pathlib import Path
@@ -61,6 +62,41 @@ HEADER_HINTS = {
 
 # For některé souhrnné listy nemusí být množství dostupné
 REQUIRED_KEYS = ["code", "description"]  # unit & quantity can be optional at parse time
+
+DEFAULT_EXCHANGE_RATE = 24.0
+EXCHANGE_RATE_STATE_KEY = "exchange_rate_shared_value"
+EXCHANGE_RATE_WIDGET_KEYS = {
+    "summary": "summary_exchange_rate",
+    "recap": "recap_exchange_rate",
+}
+
+
+def ensure_exchange_rate_state(default: float = DEFAULT_EXCHANGE_RATE) -> None:
+    """Synchronize exchange rate widgets across tabs without duplicate IDs."""
+
+    shared_value = float(st.session_state.get(EXCHANGE_RATE_STATE_KEY, default))
+    if EXCHANGE_RATE_STATE_KEY not in st.session_state:
+        st.session_state[EXCHANGE_RATE_STATE_KEY] = shared_value
+
+    for widget_key in EXCHANGE_RATE_WIDGET_KEYS.values():
+        if widget_key not in st.session_state:
+            st.session_state[widget_key] = shared_value
+
+    for widget_key in EXCHANGE_RATE_WIDGET_KEYS.values():
+        widget_value = st.session_state.get(widget_key)
+        if widget_value is None:
+            continue
+        try:
+            widget_float = float(widget_value)
+        except (TypeError, ValueError):
+            continue
+        if not math.isclose(widget_float, shared_value, rel_tol=1e-9, abs_tol=1e-9):
+            shared_value = widget_float
+            st.session_state[EXCHANGE_RATE_STATE_KEY] = shared_value
+            break
+
+    for widget_key in EXCHANGE_RATE_WIDGET_KEYS.values():
+        st.session_state[widget_key] = shared_value
 
 def normalize_col(c):
     if not isinstance(c, str):
@@ -1288,6 +1324,8 @@ if current_suppliers:
 chart_color_map = color_map.copy()
 chart_color_map.setdefault("Master", "#636EFA")
 
+ensure_exchange_rate_state()
+
 # ------------- Tabs -------------
 tab_data, tab_compare, tab_summary, tab_rekap, tab_dashboard, tab_qa = st.tabs([
     "📑 Mapování",
@@ -1437,10 +1475,14 @@ with tab_summary:
                 exchange_rate = st.number_input(
                     rate_label,
                     min_value=0.0001,
-                    value=24.0,
+                    value=float(st.session_state[EXCHANGE_RATE_STATE_KEY]),
                     step=0.1,
                     format="%.4f",
+                    key=EXCHANGE_RATE_WIDGET_KEYS["summary"],
                 )
+                exchange_rate = float(exchange_rate)
+                st.session_state[EXCHANGE_RATE_STATE_KEY] = exchange_rate
+                st.session_state[EXCHANGE_RATE_WIDGET_KEYS["recap"]] = exchange_rate
 
             st.caption(
                 "Tabulka zobrazuje původní hodnoty v CZK. Přepočet níže pracuje pouze se souhrnnými hodnotami pro rychlost."
@@ -1525,10 +1567,14 @@ with tab_rekap:
                 exchange_rate = st.number_input(
                     "Kurz (CZK za 1 EUR)",
                     min_value=0.0001,
-                    value=24.0,
+                    value=float(st.session_state[EXCHANGE_RATE_STATE_KEY]),
                     step=0.1,
                     format="%.4f",
+                    key=EXCHANGE_RATE_WIDGET_KEYS["recap"],
                 )
+                exchange_rate = float(exchange_rate)
+                st.session_state[EXCHANGE_RATE_STATE_KEY] = exchange_rate
+                st.session_state[EXCHANGE_RATE_WIDGET_KEYS["summary"]] = exchange_rate
 
             base_currency = "CZK" if conversion_direction == "CZK → EUR" else "EUR"
             target_currency = "EUR" if conversion_direction == "CZK → EUR" else "CZK"
