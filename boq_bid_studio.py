@@ -555,27 +555,34 @@ def mapping_ui(
                     header_lookup[normalized_key] = idx
 
             def sanitize_index(value: Any) -> int:
+                idx_val: Optional[int]
                 if isinstance(value, (int, np.integer)):
                     idx_val = int(value)
                 elif isinstance(value, (float, np.floating)):
                     as_float = float(value)
                     if math.isnan(as_float):
-                        return 0
+                        return -1
                     idx_val = int(as_float)
                 elif isinstance(value, str):
                     stripped = value.strip()
                     if not stripped:
-                        return 0
+                        return -1
                     try:
                         idx_val = int(float(stripped))
                     except ValueError:
                         normalized = normalize_col(stripped)
-                        idx_val = header_lookup.get(
-                            normalized, header_lookup.get(stripped, 0)
-                        )
+                        if normalized in header_lookup:
+                            idx_val = header_lookup[normalized]
+                        elif stripped in header_lookup:
+                            idx_val = header_lookup[stripped]
+                        else:
+                            return -1
                 else:
-                    idx_val = 0
-                return int(idx_val)
+                    return -1
+                idx_int = int(idx_val)
+                if idx_int < 0 or idx_int >= len(header_names):
+                    return -1
+                return idx_int
 
             mapping = {key: sanitize_index(val) for key, val in stored_mapping.items()}
             prev_mapping = mapping.copy()
@@ -586,8 +593,12 @@ def mapping_ui(
                 cols = [0]
 
             def pick_default(key: str) -> int:
-                if key in mapping:
-                    return mapping[key]
+                stored_value = mapping.get(key)
+                if (
+                    stored_value is not None
+                    and 0 <= int(stored_value) < len(header_names)
+                ):
+                    return int(stored_value)
                 hints = HEADER_HINTS.get(key, [])
                 for i, col in enumerate(header_names):
                     if any(p in col for p in hints):
@@ -1842,8 +1853,9 @@ with tab_rekap:
                 recap_rows: List[Dict[str, Any]] = []
                 for label in recap_labels:
                     target_key = canonical_label(label)
-                    if "__canonical_desc__" in working_sections.columns:
-                        mask = working_sections["__canonical_desc__"] == target_key
+                    if "__canonical_desc__" in working_sections.columns and target_key:
+                        canon_series = working_sections["__canonical_desc__"].astype(str)
+                        mask = canon_series.str.contains(target_key, na=False, regex=False)
                     else:
                         mask = pd.Series(False, index=working_sections.index)
                     sums = sum_for_mask(mask)
@@ -1894,9 +1906,25 @@ with tab_rekap:
                 st.info("Pro zobrazení rekapitulace finančních nákladů je potřeba načíst data z listu.")
 
             st.markdown("### Souhrn hlavních položek a vedlejších nákladů")
-            plus_tokens = {"0", "1", "2", "3", "4", "5"}
             deduction_tokens = {"VE", "15"}
-            plus_sum = sum_for_mask(working_sections["__code_token__"].isin(plus_tokens))
+
+            def positive_recap_sum() -> pd.Series:
+                if main_detail.empty:
+                    plus_tokens = {"0", "1", "2", "3", "4", "5"}
+                    base_sum = sum_for_mask(
+                        working_sections["__code_token__"].isin(plus_tokens)
+                    )
+                    return base_sum.reindex(value_cols, fill_value=0.0)
+                numeric_cols = [col for col in value_cols if col in main_detail.columns]
+                if not numeric_cols:
+                    return pd.Series(0.0, index=value_cols, dtype=float)
+                numeric_values = main_detail[numeric_cols].apply(
+                    pd.to_numeric, errors="coerce"
+                )
+                result = numeric_values.clip(lower=0).sum(skipna=True)
+                return result.reindex(value_cols, fill_value=0.0)
+
+            plus_sum = positive_recap_sum()
             deduction_sum = sum_for_mask(
                 working_sections["__code_token__"].isin(deduction_tokens), absolute=True
             )
@@ -1917,7 +1945,7 @@ with tab_rekap:
                     ratio_sum[col] = (indirect_val / base_val) * 100 if pd.notna(indirect_val) else np.nan
 
             summary_rows = [
-                ("Součet kódů 0–5", "CZK", plus_sum),
+                ("Součet kladných položek rekapitulace", "CZK", plus_sum),
                 ("Součet odpočtů (VE, 15.)", "CZK", deduction_sum),
                 ("Cena po odečtech", "CZK", net_sum),
                 ("Vedlejší rozpočtové náklady", "CZK", indirect_sum),
