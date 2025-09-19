@@ -72,6 +72,51 @@ EXCHANGE_RATE_WIDGET_KEYS = {
 }
 RESERVED_ALIAS_NAMES = {"Master", "LOWEST"}
 
+RECAP_CATEGORY_CONFIG = [
+    {
+        "code_token": "0",
+        "match_label": "Demolice a sanace",
+        "fallback_label": "Demolice a sanace",
+    },
+    {
+        "code_token": "1",
+        "match_label": "Objekt",
+        "fallback_label": "Objekt",
+    },
+    {
+        "code_token": "2",
+        "match_label": "Fit-out - Kanceláře pronájem 4.NP, 5.NP, 7.NP",
+        "fallback_label": "Fit-out - Kanceláře pronájem 4.NP, 5.NP, 7.NP",
+    },
+    {
+        "code_token": "3",
+        "match_label": "Fit-out - Kanceláře objekt 4.NP - 5.NP",
+        "fallback_label": "Fit-out - Kanceláře objekt 4.NP - 5.NP",
+    },
+    {
+        "code_token": "4",
+        "match_label": "Fit-out - Retail 1.PP, 1.NP - 3.NP, 5.NP, 6.NP",
+        "fallback_label": "Fit-out - Retail 1.PP, 1.NP - 3.NP, 5.NP, 6.NP",
+    },
+    {
+        "code_token": "5",
+        "match_label": "SHELL @ CORE (Automyčka 1.PP)",
+        "fallback_label": "SHELL @ CORE (Automyčka 1.PP)",
+    },
+    {
+        "code_token": "VE",
+        "match_label": "VE Alternativní řešení zadané objednatelem",
+        "fallback_label": "VE Alternativní řešení zadané objednatelem",
+        "is_deduction": True,
+    },
+    {
+        "code_token": "15",
+        "match_label": "15. Opční položky",
+        "fallback_label": "15. Opční položky",
+        "is_deduction": True,
+    },
+]
+
 
 def ensure_exchange_rate_state(default: float = DEFAULT_EXCHANGE_RATE) -> None:
     """Synchronize exchange rate widgets across tabs without duplicate IDs."""
@@ -239,22 +284,54 @@ def try_autodetect_mapping(df: pd.DataFrame) -> Tuple[Dict[str, int], int, pd.Da
     nprobe = min(len(df), max(10, min(50, len(df) // 100)))
     sample = df.head(nprobe).astype(str).applymap(normalize_col)
 
-    regex_map = {}
+    hint_patterns: Dict[str, Dict[str, List[str]]] = {}
     for key, hints in HEADER_HINTS.items():
-        patterns: List[str] = []
+        exact_terms: List[str] = []
+        regex_terms: List[str] = []
+        contains_terms: List[str] = []
         for h in hints:
+            if not h:
+                continue
             if h.startswith("regex:"):
-                patterns.append(h[len("regex:"):])
+                regex_terms.append(h[len("regex:"):])
             else:
-                patterns.append(re.escape(h))
-        regex_map[key] = "|".join(patterns)
+                normalized_hint = normalize_col(h)
+                if normalized_hint:
+                    exact_terms.append(normalized_hint)
+                    escaped = re.escape(normalized_hint)
+                    contains_terms.append(rf"(?:^|\\b){escaped}(?:\\b|$)")
+        hint_patterns[key] = {
+            "exact": exact_terms,
+            "regex": regex_terms,
+            "contains": contains_terms,
+        }
 
     def detect_row(row: pd.Series) -> Dict[str, int]:
         mapping: Dict[str, int] = {}
-        for key, regex in regex_map.items():
-            matches = row.str.contains(regex, regex=True, na=False)
-            if matches.any():
-                mapping[key] = matches.idxmax()
+        for key, patterns in hint_patterns.items():
+            exact_terms = patterns.get("exact", [])
+            regex_terms = patterns.get("regex", [])
+            contains_terms = patterns.get("contains", [])
+
+            exact_mask = pd.Series(False, index=row.index)
+            for term in exact_terms:
+                exact_mask = exact_mask | (row == term)
+            if exact_mask.any():
+                mapping[key] = exact_mask.idxmax()
+                continue
+
+            regex_mask = pd.Series(False, index=row.index)
+            for pattern in regex_terms:
+                regex_mask = regex_mask | row.str.contains(pattern, regex=True, na=False)
+            if regex_mask.any():
+                mapping[key] = regex_mask.idxmax()
+                continue
+
+            contains_mask = pd.Series(False, index=row.index)
+            for pattern in contains_terms:
+                contains_mask = contains_mask | row.str.contains(pattern, regex=True, na=False)
+            if contains_mask.any():
+                mapping[key] = contains_mask.idxmax()
         return mapping
 
     mappings = sample.apply(detect_row, axis=1)
@@ -1829,17 +1906,17 @@ with tab_rekap:
                 return pd.Series(0.0, index=value_cols, dtype=float)
 
             st.markdown("### Rekapitulace finančních nákladů stavby")
-            recap_labels = [
-                "Demolice a sanace",
-                "Objekt",
-                "Fit-out kanceláře pronájem",
-                "Fit-out kanceláře objekt",
-                "Fit-out retail",
-                "Shell and core",
-                "Alternativní řešení zadané objednatelem",
-                "Opční položky",
-            ]
             main_detail = pd.DataFrame()
+            positive_tokens = {
+                str(item.get("code_token", ""))
+                for item in RECAP_CATEGORY_CONFIG
+                if item.get("code_token") and not item.get("is_deduction")
+            }
+            deduction_tokens = {
+                str(item.get("code_token", ""))
+                for item in RECAP_CATEGORY_CONFIG
+                if item.get("code_token") and item.get("is_deduction")
+            }
             if not working_sections.empty and value_cols:
                 working_sections["__canonical_desc__"] = (
                     working_sections.get("__norm_desc__", pd.Series("", index=working_sections.index))
@@ -1850,16 +1927,29 @@ with tab_rekap:
                 def canonical_label(text: Any) -> str:
                     return re.sub(r"[^0-9a-z]+", "", normalize_text(text))
 
+                available_mask = pd.Series(True, index=working_sections.index)
                 recap_rows: List[Dict[str, Any]] = []
-                for label in recap_labels:
-                    target_key = canonical_label(label)
-                    if "__canonical_desc__" in working_sections.columns and target_key:
+                for item in RECAP_CATEGORY_CONFIG:
+                    code_token = str(item.get("code_token", "") or "").strip()
+                    match_label = item.get("match_label", "")
+                    fallback_label = item.get("fallback_label", match_label)
+                    target_key = canonical_label(match_label)
+                    mask = available_mask.copy()
+                    if code_token:
+                        mask = mask & (working_sections["__code_token__"] == code_token)
+                    if target_key:
                         canon_series = working_sections["__canonical_desc__"].astype(str)
-                        mask = canon_series.str.contains(target_key, na=False, regex=False)
+                        exact_mask = mask & (canon_series == target_key)
+                        if exact_mask.any():
+                            mask = exact_mask
+                        else:
+                            partial_mask = mask & canon_series.str.contains(target_key, na=False)
+                            if partial_mask.any():
+                                mask = partial_mask
+                    if mask.any():
+                        sums = sum_for_mask(mask)
+                        available_mask.loc[mask] = False
                     else:
-                        mask = pd.Series(False, index=working_sections.index)
-                    sums = sum_for_mask(mask)
-                    if not mask.any():
                         sums = pd.Series(np.nan, index=value_cols, dtype=float)
                     codes: List[str] = []
                     if mask.any() and "code" in working_sections.columns:
@@ -1870,9 +1960,16 @@ with tab_rekap:
                             if text and text.lower() != "nan":
                                 cleaned_codes.append(text)
                         codes = sorted(set(cleaned_codes), key=natural_sort_key)
+                    display_label = fallback_label
+                    if mask.any() and "description" in working_sections.columns:
+                        desc_series = working_sections.loc[mask, "description"].astype(str)
+                        display_label = next(
+                            (val.strip() for val in desc_series if val and val.strip()),
+                            fallback_label,
+                        )
                     recap_row: Dict[str, Any] = {
                         "č": ", ".join(codes),
-                        "Položka": label,
+                        "Položka": display_label,
                     }
                     for col in value_cols:
                         recap_row[col] = sums.get(col, np.nan)
@@ -1906,13 +2003,13 @@ with tab_rekap:
                 st.info("Pro zobrazení rekapitulace finančních nákladů je potřeba načíst data z listu.")
 
             st.markdown("### Souhrn hlavních položek a vedlejších nákladů")
-            deduction_tokens = {"VE", "15"}
 
             def positive_recap_sum() -> pd.Series:
                 if main_detail.empty:
-                    plus_tokens = {"0", "1", "2", "3", "4", "5"}
+                    if not positive_tokens:
+                        return pd.Series(0.0, index=value_cols, dtype=float)
                     base_sum = sum_for_mask(
-                        working_sections["__code_token__"].isin(plus_tokens)
+                        working_sections["__code_token__"].isin(positive_tokens)
                     )
                     return base_sum.reindex(value_cols, fill_value=0.0)
                 numeric_cols = [col for col in value_cols if col in main_detail.columns]
@@ -1944,9 +2041,17 @@ with tab_rekap:
                 if pd.notna(base_val) and base_val != 0:
                     ratio_sum[col] = (indirect_val / base_val) * 100 if pd.notna(indirect_val) else np.nan
 
+            if deduction_tokens:
+                formatted_tokens = ", ".join(
+                    f"{token}." if str(token).isdigit() else str(token)
+                    for token in sorted(deduction_tokens)
+                )
+                deduction_label = f"Součet odpočtů ({formatted_tokens})"
+            else:
+                deduction_label = "Součet odpočtů"
             summary_rows = [
                 ("Součet kladných položek rekapitulace", "CZK", plus_sum),
-                ("Součet odpočtů (VE, 15.)", "CZK", deduction_sum),
+                (deduction_label, "CZK", deduction_sum),
                 ("Cena po odečtech", "CZK", net_sum),
                 ("Vedlejší rozpočtové náklady", "CZK", indirect_sum),
                 ("Podíl vedlejších nákladů (%)", "%", ratio_sum),
@@ -2014,6 +2119,122 @@ with tab_rekap:
                 except Exception:
                     st.warning("Graf se nepodařilo vykreslit, zobrazují se hodnoty v tabulce.")
                     show_df(chart_df)
+
+            st.markdown("### Výběr položek pro vlastní součet")
+            selection_state_key = make_widget_key("recap", "selection_state")
+            if not working_sections.empty and value_cols:
+                selection_columns = ["code", "description"] + value_cols
+                selection_columns = [
+                    col for col in selection_columns if col in working_sections.columns
+                ]
+                if selection_columns:
+                    selection_source = working_sections.loc[:, selection_columns].copy()
+                    selection_source.insert(0, "__selected__", False)
+                    column_config: Dict[str, Any] = {
+                        "__selected__": st.column_config.CheckboxColumn("Vybrat", default=False)
+                    }
+                    if "code" in selection_source.columns:
+                        column_config["code"] = st.column_config.TextColumn("č.", disabled=True)
+                    if "description" in selection_source.columns:
+                        column_config["description"] = st.column_config.TextColumn(
+                            "Položka", disabled=True
+                        )
+                    for col in value_cols:
+                        if col in selection_source.columns:
+                            column_config[col] = st.column_config.NumberColumn(
+                                label=f"{col.replace(' total', '')} — CELKEM {base_currency}",
+                                format="%.2f",
+                                disabled=True,
+                            )
+                    selection_editor = st.data_editor(
+                        selection_source,
+                        hide_index=True,
+                        column_config=column_config,
+                        key=make_widget_key("recap", "selection_editor"),
+                        use_container_width=True,
+                    )
+                    selected_indices: List[int] = []
+                    if (
+                        isinstance(selection_editor, pd.DataFrame)
+                        and "__selected__" in selection_editor.columns
+                    ):
+                        selected_flags = selection_editor["__selected__"].fillna(False)
+                        for idx, flag in selected_flags.items():
+                            if not bool(flag):
+                                continue
+                            try:
+                                selected_indices.append(int(idx))
+                            except (TypeError, ValueError):
+                                continue
+                    if st.button(
+                        "Vytvořit tabulku z výběru",
+                        key=make_widget_key("recap", "selection_button"),
+                    ):
+                        if selected_indices:
+                            st.session_state[selection_state_key] = selected_indices
+                        else:
+                            st.session_state.pop(selection_state_key, None)
+                            st.warning(
+                                "Pro vytvoření souhrnu je potřeba vybrat alespoň jednu položku."
+                            )
+
+                    stored_indices = st.session_state.get(selection_state_key, [])
+                    if stored_indices:
+                        stored_mask = pd.Series(False, index=working_sections.index)
+                        valid_indices: List[int] = []
+                        for idx in stored_indices:
+                            try:
+                                idx_int = int(idx)
+                            except (TypeError, ValueError):
+                                continue
+                            if idx_int in stored_mask.index:
+                                valid_indices.append(idx_int)
+                        if valid_indices:
+                            stored_mask.loc[valid_indices] = True
+                        if stored_mask.any():
+                            selected_rows = working_sections.loc[stored_mask, selection_columns].copy()
+                            detail_display = selected_rows.rename(
+                                columns={"code": "č.", "description": "Položka"}
+                            )
+                            for col in value_cols:
+                                if col in detail_display.columns:
+                                    detail_display[col] = pd.to_numeric(
+                                        detail_display[col], errors="coerce"
+                                    )
+                            st.markdown("**Vybrané položky:**")
+                            show_df(
+                                rename_value_columns_for_display(
+                                    detail_display, f" — CELKEM {base_currency}"
+                                )
+                            )
+                            totals = sum_for_mask(stored_mask)
+                            summary_row = {
+                                "Položka": "Součet vybraných položek",
+                                "Jednotka": base_currency,
+                            }
+                            summary_row.update(
+                                {col: totals.get(col, np.nan) for col in value_cols}
+                            )
+                            summary_df = pd.DataFrame([summary_row])
+                            st.markdown("**Součet vybraných položek:**")
+                            show_df(
+                                rename_value_columns_for_display(
+                                    summary_df, f" — CELKEM {base_currency}"
+                                )
+                            )
+                        else:
+                            st.warning(
+                                "Vybrané položky již nejsou v aktuálních datech k dispozici."
+                            )
+                            st.session_state.pop(selection_state_key, None)
+                else:
+                    st.info(
+                        "Tabulka rekapitulace neobsahuje sloupce potřebné pro vytvoření výběru."
+                    )
+                    st.session_state.pop(selection_state_key, None)
+            else:
+                st.info("Pro výběr položek je potřeba načíst rekapitulaci s hodnotami.")
+                st.session_state.pop(selection_state_key, None)
 
             st.markdown("### Interaktivní součet podsekcí")
             if not working_sections.empty and value_cols:
