@@ -1915,10 +1915,28 @@ with tab_rekap:
                 f"Hodnoty jsou nejprve zobrazeny v {base_currency}. Přepočet používá kurz 1 EUR = {exchange_rate:.4f} CZK a uplatňuje se pouze na první dvě tabulky."
             )
 
-            working_sections = sections_df.copy()
+            # Combine hlavní, vedlejší i dodatečné položky pro interaktivní přehledy,
+            # aby byly dostupné ve výběrové tabulce i v součtech dle kódů.
+            section_frames: List[pd.DataFrame] = [
+                df.copy()
+                for df in (sections_df, indirect_df, added_df)
+                if isinstance(df, pd.DataFrame) and not df.empty
+            ]
+            if section_frames:
+                working_sections = (
+                    pd.concat(section_frames, axis=0, ignore_index=False, sort=False)
+                    .sort_index()
+                    .reset_index(drop=True)
+                )
+            else:
+                working_sections = sections_df.copy()
             if not working_sections.empty:
-                working_sections["__code_token__"] = working_sections["code"].map(extract_code_token)
-                working_sections["__norm_desc__"] = working_sections["description"].map(normalize_text)
+                working_sections["__code_token__"] = working_sections["code"].map(
+                    extract_code_token
+                )
+                working_sections["__norm_desc__"] = working_sections["description"].map(
+                    normalize_text
+                )
             value_cols = [c for c in working_sections.columns if c.endswith(" total")]
 
             def sum_for_mask(mask: pd.Series, absolute: bool = False) -> pd.Series:
