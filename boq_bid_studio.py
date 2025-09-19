@@ -1070,12 +1070,23 @@ def overview_comparison(
         mtab["__row_order__"] = np.arange(len(mtab))
     mtab["total_for_sum"] = mtab["total_price"].fillna(0)
 
-    df = (
-        mtab[["code", "description", "__row_order__", "total_for_sum"]]
-        .groupby(["code", "description"], as_index=False, dropna=False)
-        .agg({"total_for_sum": "sum", "__row_order__": "min"})
-        .rename(columns={"total_for_sum": "Master total"})
+    master_key_df = pd.DataFrame(
+        {
+            "__code_key__": mtab.get("code", pd.Series(index=mtab.index, dtype=object))
+            .fillna("")
+            .astype(str),
+            "__desc_key__": mtab.get("description", pd.Series(index=mtab.index, dtype=object))
+            .fillna("")
+            .astype(str),
+        },
+        index=mtab.index,
     )
+    mtab["__line_id__"] = (
+        master_key_df.groupby(["__code_key__", "__desc_key__"], sort=False).cumcount()
+    )
+
+    df = mtab[["code", "description", "__row_order__", "__line_id__", "total_for_sum"]].copy()
+    df.rename(columns={"total_for_sum": "Master total"}, inplace=True)
 
     for sup_name, wb in bids.items():
         tobj = wb.sheets.get(sheet_name, {})
@@ -1091,15 +1102,26 @@ def overview_comparison(
                 ttab = ttab[~ttab["is_summary"].fillna(False).astype(bool)]
             ttab = ttab.copy()
             ttab["total_for_sum"] = ttab["total_price"].fillna(0)
-            tdf = (
-                ttab[["code", "description", "total_for_sum"]]
-                .groupby(["code", "description"], as_index=False, dropna=False)["total_for_sum"].sum()
+            supplier_key_df = pd.DataFrame(
+                {
+                    "__code_key__": ttab.get("code", pd.Series(index=ttab.index, dtype=object))
+                    .fillna("")
+                    .astype(str),
+                    "__desc_key__": ttab.get("description", pd.Series(index=ttab.index, dtype=object))
+                    .fillna("")
+                    .astype(str),
+                },
+                index=ttab.index,
             )
-            df = df.merge(tdf, on=["code", "description"], how="left")
-            df.rename(columns={"total_for_sum": f"{sup_name} total"}, inplace=True)
+            ttab["__line_id__"] = (
+                supplier_key_df.groupby(["__code_key__", "__desc_key__"], sort=False).cumcount()
+            )
+            tdf = ttab[["code", "description", "__line_id__", "total_for_sum"]].copy()
+            tdf.rename(columns={"total_for_sum": f"{sup_name} total"}, inplace=True)
+            df = df.merge(tdf, on=["code", "description", "__line_id__"], how="left")
 
     total_cols = [c for c in df.columns if c.endswith(" total")]
-    view_cols = ["code", "description", "__row_order__"] + total_cols
+    view_cols = ["code", "description", "__row_order__", "__line_id__"] + total_cols
     view = df[view_cols].copy()
     view["code"] = view["code"].fillna("").astype(str)
     view["description"] = view["description"].fillna("").astype(str)
@@ -1134,6 +1156,10 @@ def overview_comparison(
     sections_df = view[~(indirect_mask | added_mask)].copy()
     indirect_df = view[indirect_mask].copy()
     added_df = view[added_mask].copy()
+
+    for df_part in (view, sections_df, indirect_df, added_df):
+        if "__line_id__" in df_part.columns:
+            df_part.drop(columns="__line_id__", inplace=True)
 
     # Missing items per supplier
     missing_rows: List[pd.DataFrame] = []
@@ -2130,6 +2156,17 @@ with tab_rekap:
                 if selection_columns:
                     selection_source = working_sections.loc[:, selection_columns].copy()
                     selection_source.insert(0, "__selected__", False)
+                    preselected_indices: List[int] = []
+                    stored_prefill = st.session_state.get(selection_state_key, [])
+                    for raw_idx in stored_prefill:
+                        try:
+                            idx_int = int(raw_idx)
+                        except (TypeError, ValueError):
+                            continue
+                        if idx_int in selection_source.index:
+                            preselected_indices.append(idx_int)
+                    if preselected_indices:
+                        selection_source.loc[preselected_indices, "__selected__"] = True
                     column_config: Dict[str, Any] = {
                         "__selected__": st.column_config.CheckboxColumn("Vybrat", default=False)
                     }
@@ -2146,13 +2183,18 @@ with tab_rekap:
                                 format="%.2f",
                                 disabled=True,
                             )
-                    selection_editor = st.data_editor(
-                        selection_source,
-                        hide_index=True,
-                        column_config=column_config,
-                        key=make_widget_key("recap", "selection_editor"),
-                        use_container_width=True,
-                    )
+                    selection_editor: Optional[pd.DataFrame] = None
+                    submit_selection: bool = False
+                    with st.form(key=make_widget_key("recap", "selection_form")):
+                        selection_editor = st.data_editor(
+                            selection_source,
+                            hide_index=True,
+                            column_config=column_config,
+                            key=make_widget_key("recap", "selection_editor"),
+                            use_container_width=True,
+                        )
+                        submit_selection = st.form_submit_button("Vytvořit tabulku z výběru")
+
                     selected_indices: List[int] = []
                     if (
                         isinstance(selection_editor, pd.DataFrame)
@@ -2166,10 +2208,7 @@ with tab_rekap:
                                 selected_indices.append(int(idx))
                             except (TypeError, ValueError):
                                 continue
-                    if st.button(
-                        "Vytvořit tabulku z výběru",
-                        key=make_widget_key("recap", "selection_button"),
-                    ):
+                    if submit_selection:
                         if selected_indices:
                             st.session_state[selection_state_key] = selected_indices
                         else:
@@ -2216,6 +2255,11 @@ with tab_rekap:
                                 {col: totals.get(col, np.nan) for col in value_cols}
                             )
                             summary_df = pd.DataFrame([summary_row])
+                            for col in value_cols:
+                                if col in summary_df.columns:
+                                    summary_df[col] = pd.to_numeric(
+                                        summary_df[col], errors="coerce"
+                                    )
                             st.markdown("**Součet vybraných položek:**")
                             show_df(
                                 rename_value_columns_for_display(
