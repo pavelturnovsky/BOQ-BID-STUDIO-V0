@@ -18,6 +18,8 @@ from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4, landscape
 from reportlab.lib.styles import getSampleStyleSheet
 from reportlab.lib.units import mm
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.platypus import (
     Image as RLImage,
     Paragraph,
@@ -27,6 +29,7 @@ from reportlab.platypus import (
     TableStyle,
 )
 from workbook import WorkbookData
+from embedded_fonts import get_noto_sans_bold, get_noto_sans_regular
 
 # ------------- App Config -------------
 st.set_page_config(page_title="BoQ Bid Studio V.04", layout="wide")
@@ -88,6 +91,15 @@ EXCHANGE_RATE_WIDGET_KEYS = {
 }
 RESERVED_ALIAS_NAMES = {"Master", "LOWEST"}
 DEFAULT_STORAGE_DIR = Path.home() / ".boq_bid_studio"
+
+try:
+    MODULE_DIR = Path(__file__).resolve().parent
+except NameError:
+    MODULE_DIR = Path.cwd()
+
+PDF_FONT_REGULAR = "NotoSans"
+PDF_FONT_BOLD = "NotoSans-Bold"
+_PDF_FONT_STATE: Optional[Tuple[str, str]] = None
 
 RECAP_CATEGORY_CONFIG = [
     {
@@ -174,6 +186,33 @@ def update_exchange_rate_shared(value: Any) -> float:
         )
     st.session_state[EXCHANGE_RATE_STATE_KEY] = exchange_rate
     return exchange_rate
+
+
+def ensure_pdf_fonts_registered() -> Tuple[str, str]:
+    """Register Unicode-capable fonts for PDF export and return (base, bold)."""
+
+    global _PDF_FONT_STATE
+    if _PDF_FONT_STATE is not None:
+        return _PDF_FONT_STATE
+
+    try:
+        pdfmetrics.registerFont(
+            TTFont(PDF_FONT_REGULAR, io.BytesIO(get_noto_sans_regular()))
+        )
+        pdfmetrics.registerFont(
+            TTFont(PDF_FONT_BOLD, io.BytesIO(get_noto_sans_bold()))
+        )
+        pdfmetrics.registerFontFamily(
+            PDF_FONT_REGULAR,
+            normal=PDF_FONT_REGULAR,
+            bold=PDF_FONT_BOLD,
+            italic=PDF_FONT_REGULAR,
+            boldItalic=PDF_FONT_BOLD,
+        )
+        _PDF_FONT_STATE = (PDF_FONT_REGULAR, PDF_FONT_BOLD)
+    except Exception:
+        _PDF_FONT_STATE = ("Helvetica", "Helvetica-Bold")
+    return _PDF_FONT_STATE
 
 def normalize_col(c):
     if not isinstance(c, str):
@@ -538,6 +577,7 @@ def generate_recap_pdf(
     chart_figure: Optional[Any] = None,
 ) -> bytes:
     buffer = io.BytesIO()
+    base_font, bold_font = ensure_pdf_fonts_registered()
     doc = SimpleDocTemplate(
         buffer,
         pagesize=landscape(A4),
@@ -547,6 +587,13 @@ def generate_recap_pdf(
         bottomMargin=15 * mm,
     )
     styles = getSampleStyleSheet()
+    for style_name in ("Normal", "BodyText", "Title", "Heading1", "Heading2", "Heading3"):
+        if style_name in styles:
+            styles[style_name].fontName = bold_font if "Heading" in style_name or style_name == "Title" else base_font
+    styles["Title"].fontName = bold_font
+    styles["Heading2"].fontName = bold_font
+    styles["Heading1"].fontName = bold_font
+    styles["Heading3"].fontName = bold_font
     story: List[Any] = [Paragraph(title, styles["Title"]), Spacer(1, 6)]
 
     table_style = TableStyle(
@@ -554,7 +601,8 @@ def generate_recap_pdf(
             ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#f0f0f0")),
             ("TEXTCOLOR", (0, 0), (-1, 0), colors.black),
             ("ALIGN", (0, 0), (-1, 0), "CENTER"),
-            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+            ("FONTNAME", (0, 0), (-1, 0), bold_font),
+            ("FONTNAME", (0, 1), (-1, -1), base_font),
             ("FONTSIZE", (0, 0), (-1, -1), 8),
             ("BOTTOMPADDING", (0, 0), (-1, 0), 6),
             ("BACKGROUND", (0, 1), (-1, -1), colors.white),
@@ -682,20 +730,24 @@ def try_autodetect_mapping(df: pd.DataFrame) -> Tuple[Dict[str, int], int, pd.Da
     return {}, -1, df
 
 def coerce_numeric(s: pd.Series) -> pd.Series:
-    """Coerce various textual numeric formats into floats.
+    """Coerce textual numbers (with currencies, commas, NBSP) into floats."""
 
-    Handles European formats like "1 234,56" by removing thousand
-    separators (spaces/non‑breaking spaces) and converting decimal comma to
-    a dot before calling ``pd.to_numeric``.
-    """
     if not isinstance(s, pd.Series):
         s = pd.Series(s)
-    s = s.astype(str).str.replace(r"\s+", "", regex=True)
-    # If both comma and dot present, assume dot is thousands separator
-    mask = s.str.contains(",") & s.str.contains(".")
-    s = s.where(~mask, s.str.replace(".", "", regex=False))
-    s = s.str.replace(",", ".", regex=False)
-    return pd.to_numeric(s, errors="coerce")
+    if s.empty:
+        return pd.to_numeric(s, errors="coerce")
+
+    cleaned = s.astype(str)
+    cleaned = cleaned.str.replace(r"\s+", "", regex=True)
+    cleaned = cleaned.str.replace(r"\u00A0", "", regex=True)
+    cleaned = cleaned.str.replace(r"(?i)(czk|kč|eur|€|usd|\$|gbp|£)", "", regex=True)
+    cleaned = cleaned.str.replace(r"[+-]$", "", regex=True)
+    cleaned = cleaned.str.replace(r"[^0-9,\.\-+]", "", regex=True)
+    mask = cleaned.str.contains(",") & cleaned.str.contains(".")
+    cleaned = cleaned.where(~mask, cleaned.str.replace(".", "", regex=False))
+    cleaned = cleaned.str.replace(",", ".", regex=False)
+    cleaned = cleaned.str.replace(r"[.,]$", "", regex=True)
+    return pd.to_numeric(cleaned, errors="coerce")
 
 
 def detect_summary_rows(df: pd.DataFrame) -> pd.Series:
@@ -2655,7 +2707,15 @@ with tab_rekap:
                             color_discrete_map=chart_color_map,
                             title="Cena po odečtech hlavních položek",
                         )
-                        fig_recap.update_traces(text=chart_df["Popisek"], textposition="outside")
+                        fig_recap.update_traces(
+                            text=chart_df["Popisek"],
+                            textposition="outside",
+                            texttemplate="%{text}",
+                            hovertemplate=(
+                                "<b>%{x}</b><br>Cena po odečtech: %{y:,.2f} "
+                                f"{base_currency}<br>Odchylka vs Master: %{text}<extra></extra>"
+                            ),
+                        )
                         fig_recap.update_layout(yaxis_title=f"{base_currency}", showlegend=False)
                         st.plotly_chart(fig_recap, use_container_width=True)
                     except Exception:

@@ -163,6 +163,15 @@ def test_coerce_numeric_european_formats() -> None:
     assert pd.isna(res.iloc[4])
 
 
+def test_coerce_numeric_strips_currency_and_suffix() -> None:
+    s = pd.Series(["1 234,50 Kč", "2 500,-", "-1 111,11 €", "3.750,00CZK"])
+    res = module.coerce_numeric(s)
+    assert np.isclose(res.iloc[0], 1234.5)
+    assert np.isclose(res.iloc[1], 2500.0)
+    assert np.isclose(res.iloc[2], -1111.11)
+    assert np.isclose(res.iloc[3], 3750.0)
+
+
 def test_total_diff_and_summary_detection() -> None:
     df = pd.DataFrame(
         {
