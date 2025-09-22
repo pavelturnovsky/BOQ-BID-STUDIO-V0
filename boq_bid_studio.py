@@ -1,8 +1,12 @@
 
+import hashlib
+import io
 import math
 import re
 import json
+import time
 import unicodedata
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -10,6 +14,18 @@ import numpy as np
 import pandas as pd
 import plotly.express as px
 import streamlit as st
+from reportlab.lib import colors
+from reportlab.lib.pagesizes import A4, landscape
+from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.lib.units import mm
+from reportlab.platypus import (
+    Image as RLImage,
+    Paragraph,
+    SimpleDocTemplate,
+    Spacer,
+    Table,
+    TableStyle,
+)
 from workbook import WorkbookData
 
 # ------------- App Config -------------
@@ -64,13 +80,14 @@ HEADER_HINTS = {
 # For některé souhrnné listy nemusí být množství dostupné
 REQUIRED_KEYS = ["code", "description"]  # unit & quantity can be optional at parse time
 
-DEFAULT_EXCHANGE_RATE = 24.0
+DEFAULT_EXCHANGE_RATE = 25.51
 EXCHANGE_RATE_STATE_KEY = "exchange_rate_shared_value"
 EXCHANGE_RATE_WIDGET_KEYS = {
     "summary": "summary_exchange_rate",
     "recap": "recap_exchange_rate",
 }
 RESERVED_ALIAS_NAMES = {"Master", "LOWEST"}
+DEFAULT_STORAGE_DIR = Path.home() / ".boq_bid_studio"
 
 RECAP_CATEGORY_CONFIG = [
     {
@@ -261,6 +278,328 @@ def ensure_unique_aliases(
         unique[raw] = candidate
 
     return unique
+
+
+class OfferStorage:
+    """Persist uploaded workbooks on disk for reuse between sessions."""
+
+    def __init__(self, base_dir: Optional[Path] = None) -> None:
+        self.base_dir = Path(base_dir) if base_dir else DEFAULT_STORAGE_DIR
+        self.index_file = self.base_dir / "index.json"
+        self.base_dir.mkdir(parents=True, exist_ok=True)
+        self._index = self._load_index()
+        self._cleanup_missing()
+
+    def _load_index(self) -> Dict[str, Dict[str, Any]]:
+        if not self.index_file.exists():
+            return {"master": {}, "bids": {}}
+        try:
+            with self.index_file.open("r", encoding="utf-8") as handle:
+                data = json.load(handle)
+        except (OSError, json.JSONDecodeError):
+            return {"master": {}, "bids": {}}
+        if not isinstance(data, dict):
+            return {"master": {}, "bids": {}}
+        data.setdefault("master", {})
+        data.setdefault("bids", {})
+        return data  # type: ignore[return-value]
+
+    def _write_index(self) -> None:
+        try:
+            with self.index_file.open("w", encoding="utf-8") as handle:
+                json.dump(self._index, handle, ensure_ascii=False, indent=2)
+        except OSError:
+            # Best-effort persistence; ignore filesystem issues.
+            pass
+
+    def _category_dir(self, category: str) -> Path:
+        path = self.base_dir / category
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def _path_for(self, category: str, display_name: str) -> Path:
+        digest = hashlib.sha1(display_name.encode("utf-8")).hexdigest()
+        suffix = Path(display_name).suffix or ".bin"
+        return self._category_dir(category) / f"{digest}{suffix}"
+
+    def _write_file(self, category: str, display_name: str, file_obj: Any) -> Path:
+        entries = self._index.setdefault(category, {})
+        existing = entries.get(display_name)
+        dest = self._path_for(category, display_name)
+        if existing:
+            old_path = self._category_dir(category) / existing.get("path", "")
+            if old_path.exists() and old_path != dest:
+                try:
+                    old_path.unlink()
+                except OSError:
+                    pass
+        if hasattr(file_obj, "seek"):
+            try:
+                file_obj.seek(0)
+            except (OSError, AttributeError):
+                pass
+        data: bytes
+        if hasattr(file_obj, "read"):
+            raw = file_obj.read()
+            if isinstance(raw, str):
+                data = raw.encode("utf-8")
+            else:
+                data = bytes(raw)
+        elif hasattr(file_obj, "getbuffer"):
+            data = bytes(file_obj.getbuffer())
+        else:
+            data = bytes(file_obj)
+        dest.write_bytes(data)
+        if hasattr(file_obj, "seek"):
+            try:
+                file_obj.seek(0)
+            except (OSError, AttributeError):
+                pass
+        entries[display_name] = {"path": dest.name, "updated_at": time.time()}
+        self._write_index()
+        return dest
+
+    def _load_file(self, category: str, display_name: str) -> io.BytesIO:
+        entries = self._index.get(category, {})
+        meta = entries.get(display_name)
+        if not meta:
+            raise FileNotFoundError(display_name)
+        path = self._category_dir(category) / meta.get("path", "")
+        if not path.exists():
+            raise FileNotFoundError(display_name)
+        buffer = io.BytesIO(path.read_bytes())
+        buffer.name = display_name  # type: ignore[attr-defined]
+        buffer.seek(0)
+        return buffer
+
+    def _delete_file(self, category: str, display_name: str) -> bool:
+        entries = self._index.get(category, {})
+        meta = entries.pop(display_name, None)
+        if not meta:
+            return False
+        path = self._category_dir(category) / meta.get("path", "")
+        try:
+            if path.exists():
+                path.unlink()
+        except OSError:
+            pass
+        self._write_index()
+        return True
+
+    def _cleanup_missing(self) -> None:
+        changed = False
+        for category in ("master", "bids"):
+            entries = self._index.get(category, {})
+            for name, meta in list(entries.items()):
+                path = self._category_dir(category) / meta.get("path", "")
+                if not path.exists():
+                    entries.pop(name, None)
+                    changed = True
+        if changed:
+            self._write_index()
+
+    def save_master(self, file_obj: Any, *, display_name: Optional[str] = None) -> str:
+        name = display_name or getattr(file_obj, "name", "Master.xlsx")
+        self._write_file("master", name, file_obj)
+        return name
+
+    def save_bid(self, file_obj: Any, *, display_name: Optional[str] = None) -> str:
+        name = display_name or getattr(file_obj, "name", "Bid.xlsx")
+        self._write_file("bids", name, file_obj)
+        return name
+
+    def load_master(self, display_name: str) -> io.BytesIO:
+        return self._load_file("master", display_name)
+
+    def load_bid(self, display_name: str) -> io.BytesIO:
+        return self._load_file("bids", display_name)
+
+    def delete_master(self, display_name: str) -> bool:
+        return self._delete_file("master", display_name)
+
+    def delete_bid(self, display_name: str) -> bool:
+        return self._delete_file("bids", display_name)
+
+    def list_entries(self, category: str) -> List[Dict[str, Any]]:
+        entries = self._index.get(category, {})
+        results: List[Dict[str, Any]] = []
+        for name, meta in entries.items():
+            path = self._category_dir(category) / meta.get("path", "")
+            results.append(
+                {
+                    "name": name,
+                    "path": path,
+                    "updated_at": meta.get("updated_at"),
+                }
+            )
+        results.sort(key=lambda item: item["name"].casefold())
+        return results
+
+    def list_master(self) -> List[Dict[str, Any]]:
+        return self.list_entries("master")
+
+    def list_bids(self) -> List[Dict[str, Any]]:
+        return self.list_entries("bids")
+
+
+def format_timestamp(timestamp: Optional[float]) -> str:
+    if not timestamp:
+        return ""
+    try:
+        dt = datetime.fromtimestamp(float(timestamp))
+    except (TypeError, ValueError, OSError, OverflowError):
+        return ""
+    return dt.strftime("%d.%m.%Y %H:%M")
+
+
+def format_percent_label(value: Any) -> str:
+    if pd.isna(value):
+        return "–"
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return str(value)
+    text = f"{numeric:+.2f} %"
+    return text.replace(".", ",")
+
+
+def build_recap_chart_data(value_cols: List[str], net_series: pd.Series) -> pd.DataFrame:
+    if not value_cols:
+        return pd.DataFrame(
+            columns=[
+                "Dodavatel",
+                "Cena po odečtech",
+                "Odchylka vs Master (%)",
+                "Popisek",
+            ]
+        )
+    if not isinstance(net_series, pd.Series):
+        net_series = pd.Series(net_series)
+    chart_df = pd.DataFrame(
+        {
+            "Dodavatel": [col.replace(" total", "") for col in value_cols],
+            "Cena po odečtech": [net_series.get(col) for col in value_cols],
+        }
+    )
+    master_mask = chart_df["Dodavatel"].astype(str).str.casefold() == "master"
+    master_val: Optional[float] = None
+    if master_mask.any():
+        master_values = pd.to_numeric(
+            chart_df.loc[master_mask, "Cena po odečtech"], errors="coerce"
+        ).dropna()
+        if not master_values.empty:
+            master_val = float(master_values.iloc[0])
+    deltas: List[float] = []
+    for supplier, value in zip(chart_df["Dodavatel"], chart_df["Cena po odečtech"]):
+        supplier_cf = str(supplier).casefold()
+        if supplier_cf == "master":
+            deltas.append(0.0 if pd.notna(value) else np.nan)
+            continue
+        if master_val is None or pd.isna(value) or math.isclose(
+            master_val, 0.0, rel_tol=1e-9, abs_tol=1e-9
+        ):
+            deltas.append(np.nan)
+            continue
+        deltas.append(((float(value) - master_val) / master_val) * 100.0)
+    chart_df["Odchylka vs Master (%)"] = deltas
+    chart_df["Popisek"] = chart_df["Odchylka vs Master (%)"].apply(format_percent_label)
+    return chart_df
+
+
+def format_table_value(value: Any) -> str:
+    if pd.isna(value):
+        return "–"
+    if isinstance(value, (np.integer, int)) and not isinstance(value, bool):
+        return f"{int(value):,}".replace(",", "\u00A0")
+    if isinstance(value, (np.floating, float)):
+        return f"{float(value):,.2f}".replace(",", "\u00A0").replace(".", ",")
+    return str(value)
+
+
+def dataframe_to_table_data(df: pd.DataFrame) -> List[List[str]]:
+    if df is None or df.empty:
+        return []
+    headers = [str(col) for col in df.columns]
+    data: List[List[str]] = [headers]
+    for _, row in df.iterrows():
+        data.append([format_table_value(row[col]) for col in df.columns])
+    return data
+
+
+def generate_recap_pdf(
+    title: str,
+    base_currency: str,
+    target_currency: str,
+    main_detail_base: pd.DataFrame,
+    main_detail_converted: pd.DataFrame,
+    summary_base: pd.DataFrame,
+    summary_converted: pd.DataFrame,
+    chart_df: pd.DataFrame,
+    chart_figure: Optional[Any] = None,
+) -> bytes:
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(
+        buffer,
+        pagesize=landscape(A4),
+        leftMargin=15 * mm,
+        rightMargin=15 * mm,
+        topMargin=15 * mm,
+        bottomMargin=15 * mm,
+    )
+    styles = getSampleStyleSheet()
+    story: List[Any] = [Paragraph(title, styles["Title"]), Spacer(1, 6)]
+
+    table_style = TableStyle(
+        [
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#f0f0f0")),
+            ("TEXTCOLOR", (0, 0), (-1, 0), colors.black),
+            ("ALIGN", (0, 0), (-1, 0), "CENTER"),
+            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+            ("FONTSIZE", (0, 0), (-1, -1), 8),
+            ("BOTTOMPADDING", (0, 0), (-1, 0), 6),
+            ("BACKGROUND", (0, 1), (-1, -1), colors.white),
+            ("GRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#cccccc")),
+        ]
+    )
+
+    def append_table(title_text: str, df: pd.DataFrame) -> None:
+        table_data = dataframe_to_table_data(df)
+        if not table_data:
+            return
+        story.append(Paragraph(title_text, styles["Heading2"]))
+        story.append(Spacer(1, 4))
+        table = Table(table_data, repeatRows=1)
+        table.setStyle(table_style)
+        story.append(table)
+        story.append(Spacer(1, 8))
+
+    append_table(f"Rekapitulace hlavních položek ({base_currency})", main_detail_base)
+    append_table(f"Rekapitulace hlavních položek ({target_currency})", main_detail_converted)
+    append_table("Souhrn", summary_base)
+    append_table(f"Souhrn ({target_currency})", summary_converted)
+
+    image_rendered = False
+    if chart_figure is not None:
+        try:
+            image_bytes = chart_figure.to_image(format="png", scale=2)
+        except Exception:
+            image_bytes = None
+        if image_bytes:
+            story.append(Paragraph("Graf odchylek vs Master", styles["Heading2"]))
+            story.append(Spacer(1, 4))
+            chart_image = RLImage(io.BytesIO(image_bytes))
+            chart_image.drawHeight = 90 * mm
+            chart_image.drawWidth = 160 * mm
+            story.append(chart_image)
+            story.append(Spacer(1, 8))
+            image_rendered = True
+
+    if not image_rendered:
+        append_table("Hodnoty grafu", chart_df)
+
+    doc.build(story)
+    buffer.seek(0)
+    return buffer.getvalue()
 
 
 def _normalize_key_part(value: Any) -> str:
@@ -1578,20 +1917,136 @@ def qa_checks(master: WorkbookData, bids: Dict[str, WorkbookData]) -> Dict[str, 
 
 # ------------- Sidebar Inputs -------------
 
+offer_storage = OfferStorage()
+stored_master_entries = offer_storage.list_master()
+stored_bid_entries = offer_storage.list_bids()
+
 st.sidebar.header("Vstupy")
-master_file = st.sidebar.file_uploader(
+st.sidebar.caption(
+    "Nahrané soubory se automaticky ukládají pro další použití."
+)
+
+master_selection = ""
+if stored_master_entries:
+    master_display_map = {"": "— bez výběru —"}
+    master_options = [""]
+    for entry in stored_master_entries:
+        name = entry["name"]
+        timestamp = format_timestamp(entry.get("updated_at"))
+        master_options.append(name)
+        master_display_map[name] = (
+            f"{name} ({timestamp})" if timestamp else name
+        )
+    master_selection = st.sidebar.selectbox(
+        "Uložené Master soubory",
+        master_options,
+        format_func=lambda value: master_display_map.get(value, value),
+    )
+
+uploaded_master = st.sidebar.file_uploader(
     "Master BoQ (.xlsx/.xlsm)", type=["xlsx", "xlsm"], key="master"
 )
-bid_files = st.sidebar.file_uploader(
+if uploaded_master is not None:
+    offer_storage.save_master(uploaded_master)
+    master_file = uploaded_master
+else:
+    master_file = None
+    if master_selection:
+        try:
+            master_file = offer_storage.load_master(master_selection)
+        except FileNotFoundError:
+            st.sidebar.warning(
+                f"Uložený Master '{master_selection}' se nepodařilo načíst."
+            )
+
+bid_files: List[Any] = []
+uploaded_bids = st.sidebar.file_uploader(
     "Nabídky dodavatelů (max 7)",
     type=["xlsx", "xlsm"],
     accept_multiple_files=True,
     key="bids",
 )
+if uploaded_bids:
+    uploaded_bids = list(uploaded_bids)
+    if len(uploaded_bids) > 7:
+        st.sidebar.warning("Zpracuje se pouze prvních 7 souborů.")
+        uploaded_bids = uploaded_bids[:7]
+    for file_obj in uploaded_bids:
+        offer_storage.save_bid(file_obj)
+        bid_files.append(file_obj)
+
+selected_stored_bids: List[str] = []
+if stored_bid_entries:
+    bid_display_map = {}
+    bid_options: List[str] = []
+    for entry in stored_bid_entries:
+        bid_options.append(entry["name"])
+        timestamp = format_timestamp(entry.get("updated_at"))
+        bid_display_map[entry["name"]] = (
+            f"{entry['name']} ({timestamp})" if timestamp else entry["name"]
+        )
+    selected_stored_bids = st.sidebar.multiselect(
+        "Přidat uložené nabídky",
+        bid_options,
+        format_func=lambda value: bid_display_map.get(value, value),
+    )
+    for name in selected_stored_bids:
+        try:
+            bid_files.append(offer_storage.load_bid(name))
+        except FileNotFoundError:
+            st.sidebar.warning(
+                f"Uloženou nabídku '{name}' se nepodařilo načíst."
+            )
+
+if len(bid_files) > 7:
+    st.sidebar.warning("Bylo vybráno více než 7 nabídek, zpracuje se prvních 7.")
+    bid_files = bid_files[:7]
+
 currency = st.sidebar.text_input("Popisek měny", value="CZK")
 
+stored_master_entries = offer_storage.list_master()
+stored_bid_entries = offer_storage.list_bids()
+
+with st.sidebar.expander("Správa uložených souborů"):
+    st.caption(
+        "Nahraj nový soubor se stejným názvem, aby se nahradil uložený."
+    )
+    if stored_master_entries:
+        st.markdown("**Master**")
+        for entry in stored_master_entries:
+            label = entry["name"]
+            timestamp = format_timestamp(entry.get("updated_at"))
+            display = f"{label} — {timestamp}" if timestamp else label
+            cols = st.columns([3, 1])
+            cols[0].write(display)
+            if cols[1].button(
+                "Smazat",
+                key=make_widget_key("delete_master", label),
+            ):
+                offer_storage.delete_master(label)
+                st.experimental_rerun()
+    else:
+        st.caption("Žádný uložený Master soubor.")
+
+    if stored_bid_entries:
+        st.markdown("**Nabídky**")
+        for entry in stored_bid_entries:
+            label = entry["name"]
+            timestamp = format_timestamp(entry.get("updated_at"))
+            display = f"{label} — {timestamp}" if timestamp else label
+            cols = st.columns([3, 1])
+            cols[0].write(display)
+            if cols[1].button(
+                "Smazat",
+                key=make_widget_key("delete_bid", label),
+            ):
+                offer_storage.delete_bid(label)
+                st.experimental_rerun()
+    else:
+        st.caption("Žádné uložené nabídky.")
+
 if not master_file:
-    st.info("➡️ Nahraj Master BoQ v levém panelu.")
+    st.info("➡️ Nahraj Master BoQ v levém panelu nebo vyber uložený soubor.")
     st.stop()
 
 # Determine sheet names without loading all sheets
@@ -2005,6 +2460,12 @@ with tab_rekap:
 
             st.markdown("### Rekapitulace finančních nákladů stavby")
             main_detail = pd.DataFrame()
+            main_detail_display_base = pd.DataFrame()
+            main_detail_display_converted = pd.DataFrame()
+            summary_display = pd.DataFrame()
+            summary_display_converted = pd.DataFrame()
+            chart_df = pd.DataFrame()
+            fig_recap = None
             positive_tokens = {
                 str(item.get("code_token", ""))
                 for item in RECAP_CATEGORY_CONFIG
@@ -2077,11 +2538,10 @@ with tab_rekap:
                     for col in value_cols:
                         if col in main_detail.columns:
                             main_detail[col] = pd.to_numeric(main_detail[col], errors="coerce")
-                    show_df(
-                        rename_value_columns_for_display(
-                            main_detail.copy(), f" — CELKEM {base_currency}"
-                        )
+                    main_detail_display_base = rename_value_columns_for_display(
+                        main_detail.copy(), f" — CELKEM {base_currency}"
                     )
+                    show_df(main_detail_display_base)
                     converted_main = main_detail.copy()
                     for col in value_cols:
                         if col in converted_main.columns:
@@ -2090,11 +2550,10 @@ with tab_rekap:
                                 * conversion_factor
                             )
                     st.markdown(f"**Rekapitulace v {target_currency}:**")
-                    show_df(
-                        rename_value_columns_for_display(
-                            converted_main, f" — CELKEM {target_currency}"
-                        )
+                    main_detail_display_converted = rename_value_columns_for_display(
+                        converted_main, f" — CELKEM {target_currency}"
                     )
+                    show_df(main_detail_display_converted)
                 else:
                     st.info("V datech se nepodařilo najít požadované položky rekapitulace.")
             else:
@@ -2176,47 +2635,62 @@ with tab_rekap:
                     )
                 summary_converted.loc[currency_mask, "Jednotka"] = target_currency
                 st.markdown(f"**Souhrn v {target_currency}:**")
-                show_df(rename_value_columns_for_display(summary_converted, ""))
+                summary_display_converted = rename_value_columns_for_display(
+                    summary_converted.copy(), ""
+                )
+                show_df(summary_display_converted)
             else:
                 st.info("Souhrnná tabulka nedokázala zpracovat žádná čísla.")
 
             net_chart_series = net_sum.reindex(value_cols) if value_cols else pd.Series(dtype=float)
             if not net_chart_series.dropna().empty:
-                chart_df = pd.DataFrame(
-                    {
-                        "Dodavatel": [col.replace(" total", "") for col in value_cols],
-                        "Cena po odečtech": [net_chart_series.get(col) for col in value_cols],
-                    }
-                )
-                master_val = net_chart_series.get("Master total")
-                deltas: List[float] = []
-                for col in value_cols:
-                    value = net_chart_series.get(col)
-                    if col == "Master total" and pd.notna(value):
-                        deltas.append(0.0)
-                    elif pd.notna(master_val) and master_val != 0 and pd.notna(value):
-                        deltas.append(((value - master_val) / master_val) * 100)
-                    else:
-                        deltas.append(np.nan)
-                chart_df["Odchylka vs Master (%)"] = deltas
-                chart_df["Popisek"] = chart_df["Odchylka vs Master (%)"].apply(
-                    lambda v: "0,00 %" if pd.isna(v) else f"{v:+.2f} %"
-                )
+                chart_df = build_recap_chart_data(value_cols, net_chart_series)
+                if not chart_df.empty:
+                    try:
+                        fig_recap = px.bar(
+                            chart_df,
+                            x="Dodavatel",
+                            y="Cena po odečtech",
+                            color="Dodavatel",
+                            color_discrete_map=chart_color_map,
+                            title="Cena po odečtech hlavních položek",
+                        )
+                        fig_recap.update_traces(text=chart_df["Popisek"], textposition="outside")
+                        fig_recap.update_layout(yaxis_title=f"{base_currency}", showlegend=False)
+                        st.plotly_chart(fig_recap, use_container_width=True)
+                    except Exception:
+                        st.warning(
+                            "Graf se nepodařilo vykreslit, zobrazují se hodnoty v tabulce."
+                        )
+                        show_df(chart_df)
+
+            if (
+                not main_detail_display_base.empty
+                or not main_detail_display_converted.empty
+                or not summary_display.empty
+                or not summary_display_converted.empty
+                or not chart_df.empty
+            ):
                 try:
-                    fig_recap = px.bar(
-                        chart_df,
-                        x="Dodavatel",
-                        y="Cena po odečtech",
-                        color="Dodavatel",
-                        color_discrete_map=chart_color_map,
-                        title="Cena po odečtech hlavních položek",
+                    pdf_bytes = generate_recap_pdf(
+                        title=f"Rekapitulace — {overview_sheet}",
+                        base_currency=base_currency,
+                        target_currency=target_currency,
+                        main_detail_base=main_detail_display_base,
+                        main_detail_converted=main_detail_display_converted,
+                        summary_base=summary_display,
+                        summary_converted=summary_display_converted,
+                        chart_df=chart_df,
+                        chart_figure=fig_recap,
                     )
-                    fig_recap.update_traces(text=chart_df["Popisek"], textposition="outside")
-                    fig_recap.update_layout(yaxis_title=f"{base_currency}", showlegend=False)
-                    st.plotly_chart(fig_recap, use_container_width=True)
+                    st.download_button(
+                        "📄 Stáhnout rekapitulaci (PDF)",
+                        data=pdf_bytes,
+                        file_name="rekapitulace.pdf",
+                        mime="application/pdf",
+                    )
                 except Exception:
-                    st.warning("Graf se nepodařilo vykreslit, zobrazují se hodnoty v tabulce.")
-                    show_df(chart_df)
+                    st.warning("Export do PDF se nezdařil.")
 
             st.markdown("### Výběr položek pro vlastní součet")
             selection_state_key = make_widget_key("recap", "selection_state")

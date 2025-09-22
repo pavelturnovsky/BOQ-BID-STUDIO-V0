@@ -4,3 +4,5 @@ openpyxl
 plotly
 numpy
 cloudpickle
+reportlab
+kaleido
