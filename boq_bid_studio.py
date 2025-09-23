@@ -147,6 +147,10 @@ RECAP_CATEGORY_CONFIG = [
 ]
 
 
+PERCENT_DIFF_SUFFIX = "_pct_diff"
+PERCENT_DIFF_LABEL = " — ODCHYLKA VS MASTER (%)"
+
+
 def ensure_exchange_rate_state(default: float = DEFAULT_EXCHANGE_RATE) -> None:
     """Synchronize exchange rate widgets across tabs without duplicate IDs."""
 
@@ -279,13 +283,60 @@ def natural_sort_key(value: str) -> Tuple[Any, ...]:
 
 
 def rename_value_columns_for_display(df: pd.DataFrame, suffix: str) -> pd.DataFrame:
-    """Rename columns ending with " total" to include a human friendly suffix."""
+    """Rename columns ending with " total" to include a human friendly suffix.
 
-    rename_map = {}
+    Columns produced for percentage comparisons are also converted into a human
+    readable label so that tables clearly indicate the percentage difference
+    versus Master.
+    """
+
+    rename_map: Dict[str, str] = {}
     for col in df.columns:
         if col.endswith(" total"):
             rename_map[col] = f"{col.replace(' total', '')}{suffix}"
+        elif col.endswith(PERCENT_DIFF_SUFFIX):
+            base = col[: -len(PERCENT_DIFF_SUFFIX)].replace(" total", "")
+            rename_map[col] = f"{base}{PERCENT_DIFF_LABEL}"
     return df.rename(columns=rename_map)
+
+
+def compute_percent_difference(values: pd.Series, reference: Any) -> pd.Series:
+    """Return percentage difference of ``values`` relative to ``reference``.
+
+    ``reference`` can be either a scalar or a Series aligned with ``values``.
+    When the reference is zero, the function returns ``0`` if the compared
+    value is also zero and ``NaN`` otherwise to avoid division errors.
+    """
+
+    if values is None:
+        return pd.Series(dtype=float)
+
+    numeric_values = pd.to_numeric(values, errors="coerce")
+    if isinstance(reference, pd.Series):
+        aligned_reference = pd.to_numeric(
+            reference.reindex(numeric_values.index), errors="coerce"
+        )
+    else:
+        aligned_reference = pd.Series(reference, index=numeric_values.index, dtype=float)
+
+    if aligned_reference.empty:
+        return pd.Series(np.nan, index=numeric_values.index, dtype=float)
+
+    result = pd.Series(np.nan, index=numeric_values.index, dtype=float)
+    valid_mask = aligned_reference.notna()
+    nonzero_mask = valid_mask & (aligned_reference != 0)
+    if nonzero_mask.any():
+        result.loc[nonzero_mask] = (
+            (numeric_values.loc[nonzero_mask] - aligned_reference.loc[nonzero_mask])
+            / aligned_reference.loc[nonzero_mask]
+        ) * 100.0
+
+    zero_mask = valid_mask & (aligned_reference == 0)
+    if zero_mask.any():
+        zero_values = numeric_values.loc[zero_mask]
+        result.loc[zero_mask & zero_values.fillna(np.nan).eq(0)] = 0.0
+
+    return result
 
 
 def ensure_unique_aliases(
@@ -644,6 +695,64 @@ def generate_recap_pdf(
 
     if not image_rendered:
         append_table("Hodnoty grafu", chart_df)
+
+    doc.build(story)
+    buffer.seek(0)
+    return buffer.getvalue()
+
+
+def generate_tables_pdf(title: str, tables: List[Tuple[str, pd.DataFrame]]) -> bytes:
+    """Return a PDF containing the provided tables on subsequent pages."""
+
+    buffer = io.BytesIO()
+    base_font, bold_font = ensure_pdf_fonts_registered()
+    doc = SimpleDocTemplate(
+        buffer,
+        pagesize=landscape(A4),
+        leftMargin=15 * mm,
+        rightMargin=15 * mm,
+        topMargin=15 * mm,
+        bottomMargin=15 * mm,
+    )
+    styles = getSampleStyleSheet()
+    for style_name in ("Normal", "BodyText", "Title", "Heading1", "Heading2", "Heading3"):
+        if style_name in styles:
+            styles[style_name].fontName = (
+                bold_font if "Heading" in style_name or style_name == "Title" else base_font
+            )
+    styles["Title"].fontName = bold_font
+    styles["Heading2"].fontName = bold_font
+    story: List[Any] = [Paragraph(title, styles["Title"]), Spacer(1, 6)]
+
+    table_style = TableStyle(
+        [
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#f0f0f0")),
+            ("TEXTCOLOR", (0, 0), (-1, 0), colors.black),
+            ("ALIGN", (0, 0), (-1, 0), "CENTER"),
+            ("FONTNAME", (0, 0), (-1, 0), bold_font),
+            ("FONTNAME", (0, 1), (-1, -1), base_font),
+            ("FONTSIZE", (0, 0), (-1, -1), 8),
+            ("BOTTOMPADDING", (0, 0), (-1, 0), 6),
+            ("BACKGROUND", (0, 1), (-1, -1), colors.white),
+            ("GRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#cccccc")),
+        ]
+    )
+
+    appended = False
+    for table_title, df in tables:
+        table_data = dataframe_to_table_data(df)
+        if not table_data:
+            continue
+        story.append(Paragraph(table_title, styles["Heading2"]))
+        story.append(Spacer(1, 4))
+        table = Table(table_data, repeatRows=1)
+        table.setStyle(table_style)
+        story.append(table)
+        story.append(Spacer(1, 8))
+        appended = True
+
+    if not appended:
+        story.append(Paragraph("Tabulky nejsou k dispozici.", styles["Normal"]))
 
     doc.build(story)
     buffer.seek(0)
@@ -2315,8 +2424,13 @@ with tab_compare:
             if total_cols:
                 def total_for_column(col: str) -> float:
                     if col == "Master total" and "master_total_sum" in df.attrs:
-                        return df.attrs["master_total_sum"]
-                    return df[col].sum()
+                        master_total = df.attrs["master_total_sum"]
+                        try:
+                            return float(master_total)
+                        except (TypeError, ValueError):
+                            pass
+                    series = pd.to_numeric(df[col], errors="coerce")
+                    return float(series.sum(skipna=True))
 
                 totals = [(col, total_for_column(col)) for col in total_cols]
                 sums_df = pd.DataFrame(totals, columns=["Součet (sloupec)", "Hodnota"])
@@ -2590,6 +2704,14 @@ with tab_rekap:
                     for col in value_cols:
                         if col in main_detail.columns:
                             main_detail[col] = pd.to_numeric(main_detail[col], errors="coerce")
+                    if "Master total" in value_cols and "Master total" in main_detail.columns:
+                        master_reference = main_detail["Master total"]
+                        for col in value_cols:
+                            if col in main_detail.columns:
+                                pct_col = f"{col}{PERCENT_DIFF_SUFFIX}"
+                                main_detail[pct_col] = compute_percent_difference(
+                                    main_detail[col], master_reference
+                                )
                     main_detail_display_base = rename_value_columns_for_display(
                         main_detail.copy(), f" — CELKEM {base_currency}"
                     )
@@ -2650,6 +2772,22 @@ with tab_rekap:
                 if pd.notna(base_val) and base_val != 0:
                     ratio_sum[col] = (indirect_val / base_val) * 100 if pd.notna(indirect_val) else np.nan
 
+            percent_row_map: Dict[str, pd.Series] = {}
+            if value_cols and "Master total" in value_cols:
+                reference_index = pd.Index(value_cols)
+                plus_reference = pd.Series(
+                    plus_sum.get("Master total"), index=reference_index, dtype=float
+                )
+                net_reference = pd.Series(
+                    net_sum.get("Master total"), index=reference_index, dtype=float
+                )
+                percent_row_map["Součet kladných položek rekapitulace"] = compute_percent_difference(
+                    plus_sum.reindex(value_cols), plus_reference
+                )
+                percent_row_map["Cena po odečtech"] = compute_percent_difference(
+                    net_sum.reindex(value_cols), net_reference
+                )
+
             if deduction_tokens:
                 formatted_tokens = ", ".join(
                     f"{token}." if str(token).isdigit() else str(token)
@@ -2665,16 +2803,23 @@ with tab_rekap:
                 ("Vedlejší rozpočtové náklady", "CZK", indirect_sum),
                 ("Podíl vedlejších nákladů (%)", "%", ratio_sum),
             ]
-            summary_base = pd.DataFrame(
-                [
-                    {
-                        "Ukazatel": label,
-                        "Jednotka": unit,
-                        **{col: values.get(col, np.nan) for col in value_cols},
-                    }
-                    for label, unit, values in summary_rows
-                ]
-            )
+            summary_records: List[Dict[str, Any]] = []
+            for label, unit, values in summary_rows:
+                row: Dict[str, Any] = {"Ukazatel": label, "Jednotka": unit}
+                if isinstance(values, pd.Series):
+                    working_values = values.reindex(value_cols)
+                else:
+                    working_values = pd.Series(np.nan, index=value_cols, dtype=float)
+                percent_values = percent_row_map.get(label)
+                for col in value_cols:
+                    row[col] = working_values.get(col, np.nan)
+                    pct_col = f"{col}{PERCENT_DIFF_SUFFIX}"
+                    if percent_values is not None:
+                        row[pct_col] = percent_values.get(col, np.nan)
+                    else:
+                        row[pct_col] = np.nan
+                summary_records.append(row)
+            summary_base = pd.DataFrame(summary_records)
             if not summary_base.empty:
                 summary_display = rename_value_columns_for_display(summary_base.copy(), "")
                 show_df(summary_display)
@@ -3100,10 +3245,30 @@ with tab_rekap:
                 ),
             ]
 
+            pdf_tables: List[Tuple[str, pd.DataFrame]] = []
             for title, items in fixed_tables:
                 st.markdown(f"### {title}")
                 table_df = aggregate_fixed_table(items)
-                show_df(rename_value_columns_for_display(table_df, ""))
+                display_df = rename_value_columns_for_display(table_df.copy(), "")
+                show_df(display_df)
+                if not display_df.empty:
+                    pdf_tables.append((title, display_df.copy()))
+
+            available_tables = [(title, df) for title, df in pdf_tables if not df.empty]
+            if available_tables:
+                try:
+                    themed_pdf = generate_tables_pdf(
+                        title=f"Tematické tabulky — {overview_sheet}",
+                        tables=available_tables,
+                    )
+                    st.download_button(
+                        "📄 Stáhnout tematické tabulky (PDF)",
+                        data=themed_pdf,
+                        file_name="tematicke_tabulky.pdf",
+                        mime="application/pdf",
+                    )
+                except Exception:
+                    st.warning("Export tematických tabulek do PDF se nezdařil.")
 
             if not indirect_total.empty:
                 st.markdown("### Vedlejší rozpočtové náklady — součty")
