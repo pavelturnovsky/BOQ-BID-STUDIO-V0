@@ -1,0 +1,34 @@
+paths:
+  master: ../sample_data/master.csv
+  bids:
+    - name: Supplier Alpha
+      path: ../sample_data/bid_alpha.csv
+    - name: Supplier Beta
+      path: ../sample_data/bid_beta.csv
+
+columns:
+  code: ItemCode
+  description: Description
+  unit: Unit
+  quantity: Quantity
+  unit_price: UnitPrice
+  total_price: TotalPrice
+
+comparison:
+  key_columns: [code]
+  numeric_columns: [quantity, total_price]
+  currency: CZK
+  chunk_size: 5000
+
+search:
+  provider: tfidf
+  fields: [description]
+  top_k: 5
+  metadata_fields: [code, description, record_key]
+
+output:
+  directory: output
+  item_report: item_differences.csv
+  summary_report: summary.csv
+  unmatched_report: unmatched_items.csv
+  audit_log: comparison_audit.json
