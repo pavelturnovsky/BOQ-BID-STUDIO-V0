@@ -6,3 +6,5 @@ numpy
 cloudpickle
 reportlab
 kaleido
+PyYAML
+scikit-learn

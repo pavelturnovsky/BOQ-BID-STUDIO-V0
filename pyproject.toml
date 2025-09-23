@@ -1,0 +1,14 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "boq-bid-studio"
+version = "0.1.0"
+description = "Command line comparison tool for bill-of-quantities bids"
+authors = [{ name = "Bid Studio" }]
+requires-python = ">=3.10"
+readme = "README.md"
+
+[project.scripts]
+boq-bid-studio = "bidstudio.cli:main"
