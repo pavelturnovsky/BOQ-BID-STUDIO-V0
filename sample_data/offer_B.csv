@@ -1,6 +1,0 @@
-code,item description,unit,quantity,unit price,line total,discipline,currency,vat
-03-AHU,Air handling unit with recuperation,piece,2,9000,18000,VZT,EUR,0.21
-03-DUCT,Galvanized duct sections,sqm,160,32,5120,VZT,EUR,0.21
-02-PANEL,Main switchboard,piece,1,6500,6500,ELE,EUR,0.21
-02-LIGHT,Recessed office luminaire,piece,22,120,2640,ELE,EUR,0.21
-01-PIPING,Cold water piping run,meter,75,38,2850,ZTI,EUR,0.15

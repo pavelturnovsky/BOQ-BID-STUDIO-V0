@@ -1,7 +1,0 @@
-code,name,description,discipline,unit
-01.01,Rozvody vody,Potrubí studené a teplé vody,ZTI,m
-01.02,Zařizovací předměty,Sanitární zařizovací předměty,ZTI,pcs
-02.01,Rozvaděče,Elektrické rozvaděče a panely,ELE,pcs
-02.02,Kabeláž,Napájecí a datová kabeláž,ELE,m
-03.01,Vzduchotechnické jednotky,Dodávka AHU jednotek,VZT,pcs
-03.02,Vzduchotechnické potrubí,Potrubní sítě a příslušenství,VZT,m2
