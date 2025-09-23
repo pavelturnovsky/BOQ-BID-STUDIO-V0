@@ -1,0 +1,6 @@
+Pol.,Popis,MJ,Množství,Cena za MJ,Cena celkem,Disciplína,Měna,DPH
+VZT-001,Vzduchotechnická jednotka s rekuperací,ks,2,250000,,VZT,CZK,0.21
+VZT-002,Pozinkované potrubí hranaté,m2,150,850,127500,VZT,CZK,0.21
+ELE-100,Silnoproudý rozvaděč typu A,ks,1,180000,180000,ELE,CZK,0.21
+ELE-200,LED svítidlo do kanceláří,ks,20,3200,64000,ELE,CZK,0.21
+ZTI-010,Instalace hlavního potrubí studené vody,m,80,950,76000,ZTI,CZK,0.15

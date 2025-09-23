@@ -1,8 +1,15 @@
 streamlit
 pandas
 openpyxl
+xlrd
 plotly
 numpy
 cloudpickle
 reportlab
 kaleido
+python-levenshtein
+rapidfuzz
+scikit-learn
+tabulate
+pyyaml
+xlsxwriter
