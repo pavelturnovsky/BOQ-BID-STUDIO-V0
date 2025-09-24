@@ -1331,27 +1331,106 @@ def read_workbook(upload, limit_sheets: Optional[List[str]] = None) -> WorkbookD
 
 def apply_master_mapping(master: WorkbookData, target: WorkbookData) -> None:
     """Copy mapping and header row from master workbook into target workbook."""
+
+    def _coerce_index(value: Any) -> int:
+        if isinstance(value, (int, np.integer)):
+            return int(value)
+        if isinstance(value, (float, np.floating)):
+            if math.isnan(float(value)):
+                return -1
+            return int(value)
+        if isinstance(value, str):
+            stripped = value.strip()
+            if not stripped:
+                return -1
+            try:
+                return int(float(stripped))
+            except ValueError:
+                return -1
+        return -1
+
+    def _infer_header_row(raw_df: pd.DataFrame, preferred: int, expected: Sequence[str]) -> int:
+        if 0 <= preferred < len(raw_df):
+            return preferred
+        expected_set = {name for name in expected if name}
+        if not expected_set:
+            return max(0, min(len(raw_df) - 1, preferred)) if len(raw_df) else 0
+        search_limit = min(len(raw_df), 15)
+        best_row = 0
+        best_score = -1
+        for idx in range(search_limit):
+            try:
+                row_values = [
+                    normalize_col(x)
+                    for x in raw_df.iloc[idx].astype(str).tolist()
+                ]
+            except Exception:
+                continue
+            score = sum(1 for name in expected_set if name in row_values)
+            if score > best_score:
+                best_row = idx
+                best_score = score
+                if score == len(expected_set):
+                    break
+        return best_row
+
     for sheet, mobj in master.sheets.items():
         if sheet not in target.sheets:
             continue
         raw = target.sheets[sheet].get("raw")
         mapping = mobj.get("mapping", {})
         header_row = mobj.get("header_row", -1)
-        if not isinstance(raw, pd.DataFrame) or not mapping or header_row < 0:
+        if not isinstance(raw, pd.DataFrame) or not mapping:
             continue
+
+        master_header_names = [normalize_col(x) for x in mobj.get("header_names", [])]
+        if not master_header_names:
+            master_raw = mobj.get("raw")
+            if isinstance(master_raw, pd.DataFrame) and header_row >= 0 and header_row < len(master_raw):
+                master_header_names = [
+                    normalize_col(x) for x in master_raw.iloc[header_row].astype(str).tolist()
+                ]
+
+        preferred_row = _coerce_index(header_row)
+        if preferred_row < 0 and master_header_names:
+            # try to locate the most similar row in target
+            preferred_row = _infer_header_row(raw, 0, master_header_names)
+        elif preferred_row < 0:
+            preferred_row = 0
+
         try:
-            header = [normalize_col(x) for x in raw.iloc[header_row].astype(str).tolist()]
-            body = raw.iloc[header_row+1:].reset_index(drop=True)
-            body.columns = header
-            table = build_normalized_table(body, mapping)
-            target.sheets[sheet].update({
-                "mapping": mapping,
-                "header_row": header_row,
-                "table": table,
-                "header_names": header,
-            })
+            header_candidates = [normalize_col(x) for x in raw.iloc[preferred_row].astype(str).tolist()]
         except Exception:
             continue
+
+        header_lookup = {name: idx for idx, name in enumerate(header_candidates) if name}
+
+        remapped: Dict[str, int] = {}
+        for key, original in mapping.items():
+            idx_int = _coerce_index(original)
+            mapped_idx = -1
+            if 0 <= idx_int < len(master_header_names):
+                candidate_name = master_header_names[idx_int]
+                mapped_idx = header_lookup.get(candidate_name, -1)
+            if mapped_idx == -1 and 0 <= idx_int < len(header_candidates):
+                mapped_idx = idx_int
+            remapped[key] = mapped_idx
+
+        try:
+            body = raw.iloc[preferred_row + 1 :].reset_index(drop=True)
+            body.columns = header_candidates
+            table = build_normalized_table(body, remapped)
+        except Exception:
+            continue
+
+        target.sheets[sheet].update(
+            {
+                "mapping": remapped,
+                "header_row": preferred_row,
+                "table": table,
+                "header_names": header_candidates,
+            }
+        )
 
 def mapping_ui(
     section_title: str,
@@ -1803,7 +1882,10 @@ def summarize(results: Dict[str, pd.DataFrame]) -> pd.DataFrame:
             continue
         total_cols = [c for c in df.columns if c.endswith(" total")]
         df = df[df["description"].astype(str).str.strip() != ""]
-        sums = {c: df[c].dropna().sum() for c in total_cols}
+        sums: Dict[str, float] = {}
+        for col in total_cols:
+            numeric = pd.to_numeric(df[col], errors="coerce") if col in df else pd.Series(dtype=float)
+            sums[col] = float(numeric.sum(skipna=True)) if not numeric.empty else 0.0
         row = {"sheet": sheet}
         row.update(sums)
         rows.append(row)
