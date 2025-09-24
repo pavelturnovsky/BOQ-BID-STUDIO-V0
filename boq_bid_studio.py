@@ -371,6 +371,8 @@ def ensure_percent_columns(
 
     reference_series = pd.to_numeric(df[reference_col], errors="coerce")
     for col in existing_value_cols:
+        if col == reference_col:
+            continue
         pct_col = f"{col}{PERCENT_DIFF_SUFFIX}"
         if pct_col in df.columns:
             continue
@@ -416,6 +418,22 @@ def drop_percent_columns(df: pd.DataFrame) -> pd.DataFrame:
         return df
     cols = [col for col in df.columns if not str(col).endswith(PERCENT_DIFF_SUFFIX)]
     return df.loc[:, cols]
+
+
+def prepare_recap_table_for_display(
+    df: pd.DataFrame,
+    value_columns: Sequence[str],
+    suffix: str,
+    reference_col: str = "Master total",
+) -> pd.DataFrame:
+    """Return a display-ready table with percentage comparisons interleaved."""
+
+    if df is None or df.empty:
+        return df
+    working = df.copy()
+    ensure_percent_columns(working, value_columns, reference_col=reference_col)
+    working = interleave_percent_columns(working, value_columns)
+    return rename_value_columns_for_display(working, suffix)
 
 
 def ensure_unique_aliases(
@@ -3112,8 +3130,9 @@ with tab_rekap:
                     for col in value_cols:
                         if col in main_detail.columns:
                             main_detail[col] = pd.to_numeric(main_detail[col], errors="coerce")
-                    main_detail_display_base = rename_value_columns_for_display(
-                        drop_percent_columns(main_detail.copy()),
+                    main_detail_display_base = prepare_recap_table_for_display(
+                        main_detail,
+                        value_cols,
                         f" — CELKEM {base_currency}",
                     )
                     show_df(main_detail_display_base)
@@ -3125,8 +3144,9 @@ with tab_rekap:
                                 * conversion_factor
                             )
                     st.markdown(f"**Rekapitulace v {target_currency}:**")
-                    main_detail_display_converted = rename_value_columns_for_display(
-                        drop_percent_columns(converted_main),
+                    main_detail_display_converted = prepare_recap_table_for_display(
+                        converted_main,
+                        value_cols,
                         f" — CELKEM {target_currency}",
                     )
                     show_df(main_detail_display_converted)
@@ -3201,8 +3221,10 @@ with tab_rekap:
                 summary_records.append(row)
             summary_base = pd.DataFrame(summary_records)
             if not summary_base.empty:
-                summary_display = rename_value_columns_for_display(
-                    drop_percent_columns(summary_base.copy()), ""
+                summary_display = prepare_recap_table_for_display(
+                    summary_base,
+                    value_cols,
+                    "",
                 )
                 show_df(summary_display)
                 summary_converted = summary_base.copy()
@@ -3214,8 +3236,10 @@ with tab_rekap:
                     )
                 summary_converted.loc[currency_mask, "Jednotka"] = target_currency
                 st.markdown(f"**Souhrn v {target_currency}:**")
-                summary_display_converted = rename_value_columns_for_display(
-                    drop_percent_columns(summary_converted.copy()), ""
+                summary_display_converted = prepare_recap_table_for_display(
+                    summary_converted,
+                    value_cols,
+                    "",
                 )
                 show_df(summary_display_converted)
             else:
@@ -3434,8 +3458,10 @@ with tab_rekap:
                                     )
                             st.markdown("**Vybrané položky:**")
                             show_df(
-                                rename_value_columns_for_display(
-                                    detail_display, f" — CELKEM {base_currency}"
+                                prepare_recap_table_for_display(
+                                    detail_display,
+                                    value_cols,
+                                    f" — CELKEM {base_currency}",
                                 )
                             )
                             totals = sum_for_mask(stored_mask)
@@ -3454,8 +3480,10 @@ with tab_rekap:
                                     )
                             st.markdown("**Součet vybraných položek:**")
                             show_df(
-                                rename_value_columns_for_display(
-                                    summary_df, f" — CELKEM {base_currency}"
+                                prepare_recap_table_for_display(
+                                    summary_df,
+                                    value_cols,
+                                    f" — CELKEM {base_currency}",
                                 )
                             )
                         else:
@@ -3510,8 +3538,10 @@ with tab_rekap:
                         sum_df = pd.DataFrame([sum_row])
                         st.markdown("**Součet vybrané podsekce:**")
                         show_df(
-                            rename_value_columns_for_display(
-                                drop_percent_columns(sum_df.copy()), ""
+                            prepare_recap_table_for_display(
+                                sum_df,
+                                value_cols,
+                                "",
                             )
                         )
 
@@ -3528,8 +3558,9 @@ with tab_rekap:
                                 )
                         st.markdown("**Detail položek v rámci vybraného kódu:**")
                         show_df(
-                            rename_value_columns_for_display(
-                                drop_percent_columns(detail_selection),
+                            prepare_recap_table_for_display(
+                                detail_selection,
+                                value_cols,
                                 f" — CELKEM {base_currency}",
                             )
                         )
@@ -3557,8 +3588,10 @@ with tab_rekap:
             if ve_rows:
                 ve_df = pd.DataFrame(ve_rows)
                 show_df(
-                    rename_value_columns_for_display(
-                        drop_percent_columns(ve_df.copy()), ""
+                    prepare_recap_table_for_display(
+                        ve_df,
+                        value_cols,
+                        "",
                     )
                 )
             else:
@@ -3599,7 +3632,7 @@ with tab_rekap:
                     row.update({col: sums.get(col, np.nan) for col in value_cols})
                     rows.append(row)
                 table = pd.DataFrame(rows)
-                return drop_percent_columns(table)
+                return table
 
             fixed_tables: List[Tuple[str, List[Dict[str, Any]]]] = [
                 (
@@ -3700,7 +3733,11 @@ with tab_rekap:
             for title, items in fixed_tables:
                 st.markdown(f"### {title}")
                 table_df = aggregate_fixed_table(items)
-                display_df = rename_value_columns_for_display(table_df.copy(), "")
+                display_df = prepare_recap_table_for_display(
+                    table_df,
+                    value_cols,
+                    "",
+                )
                 show_df(display_df)
                 if not display_df.empty:
                     pdf_tables.append((title, display_df.copy()))
