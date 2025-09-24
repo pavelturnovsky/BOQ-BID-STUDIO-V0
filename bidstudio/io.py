@@ -391,11 +391,8 @@ def _ensure_key_columns(
     key_values: List[pd.Series] = []
     for column in key_columns:
         series = frame[column].astype("string").str.strip()
-codex/fix-mapping-between-master-and-supplier-tables-03k78b
         null_like = series.str.lower().isin({"nan", "none", "nat"})
         series = series.mask(null_like, pd.NA)
-
-main
         series = series.replace("", pd.NA)
         key_values.append(series.astype(object))
 
@@ -420,11 +417,7 @@ main
     key_series = key_series.astype(object)
 
     if key_series.isna().any():
-codex/fix-mapping-between-master-and-supplier-tables-03k78b
         prefix = normalise_dataset_label(source)
-
-        prefix = re.sub(r"[^0-9A-Za-z]+", "_", source).strip("_") or "dataset"
-main
         missing_mask = key_series.isna()
         fallback = [
             f"__{prefix}_row_{idx}"
