@@ -77,7 +77,7 @@ def load_master_dataset(
     """Load and normalise the master bill of quantities."""
 
     logger.info("Loading master dataset from %s", path)
-    return _load_dataset(path, columns, key_columns, chunk_size)
+    return _load_dataset(path, columns, key_columns, chunk_size, source="master")
 
 
 def load_bid_dataset(
@@ -89,7 +89,13 @@ def load_bid_dataset(
     """Load and normalise a supplier bid."""
 
     logger.info("Loading bid '%s' from %s", bid.name, bid.path)
-    frame = _load_dataset(bid.path, columns, key_columns, chunk_size)
+    frame = _load_dataset(
+        bid.path,
+        columns,
+        key_columns,
+        chunk_size,
+        source=f"bid:{bid.name}",
+    )
     frame.insert(0, "supplier", bid.name)
     return frame
 
@@ -99,15 +105,17 @@ def _load_dataset(
     columns: ColumnMapping,
     key_columns: Sequence[str],
     chunk_size: Optional[int],
+    *,
+    source: str,
 ) -> pd.DataFrame:
     if not Path(path).exists():
         raise FileNotFoundError(f"Dataset '{path}' does not exist")
 
     ext = path.suffix.lower()
     if ext in {".csv", ".txt"}:
-        frame = _load_csv(path, columns, key_columns, chunk_size)
+        frame = _load_csv(path, columns, key_columns, chunk_size, source=source)
     elif ext in {".xlsx", ".xls"}:
-        frame = _load_excel(path, columns, key_columns)
+        frame = _load_excel(path, columns, key_columns, source=source)
     else:
         raise ValueError(f"Unsupported file extension '{ext}' for dataset '{path}'")
 
@@ -119,35 +127,43 @@ def _load_csv(
     columns: ColumnMapping,
     key_columns: Sequence[str],
     chunk_size: Optional[int],
+    *,
+    source: str,
 ) -> pd.DataFrame:
     logger.debug("Reading CSV %s with chunk size %s", path, chunk_size)
     read_kwargs = {"dtype": str}
     if chunk_size and chunk_size > 0:
         chunks: List[pd.DataFrame] = []
         for chunk in pd.read_csv(path, chunksize=chunk_size, **read_kwargs):
-            chunks.append(_normalise_frame(chunk, columns, key_columns))
+            chunks.append(
+                _normalise_frame(chunk, columns, key_columns, source=source)
+            )
         if not chunks:
             return _empty_frame()
         return pd.concat(chunks, ignore_index=True)
 
     raw = pd.read_csv(path, **read_kwargs)
-    return _normalise_frame(raw, columns, key_columns)
+    return _normalise_frame(raw, columns, key_columns, source=source)
 
 
 def _load_excel(
     path: Path,
     columns: ColumnMapping,
     key_columns: Sequence[str],
+    *,
+    source: str,
 ) -> pd.DataFrame:
     logger.debug("Reading Excel %s", path)
     raw = pd.read_excel(path, dtype=str)
-    return _normalise_frame(raw, columns, key_columns)
+    return _normalise_frame(raw, columns, key_columns, source=source)
 
 
 def _normalise_frame(
     frame: pd.DataFrame,
     columns: ColumnMapping,
     key_columns: Sequence[str],
+    *,
+    source: str,
 ) -> pd.DataFrame:
     resolved_columns = _resolve_column_mapping(frame, columns)
     rename_map = {
@@ -170,7 +186,7 @@ def _normalise_frame(
     for column in NUMERIC_COLUMNS:
         normalised[column] = coerce_numeric(normalised[column])
 
-    _ensure_key_columns(normalised, key_columns)
+    _ensure_key_columns(normalised, key_columns, source)
     return normalised
 
 
@@ -354,7 +370,9 @@ def coerce_numeric(values: pd.Series) -> pd.Series:
     return pd.to_numeric(cleaned, errors="coerce")
 
 
-def _ensure_key_columns(frame: pd.DataFrame, key_columns: Sequence[str]) -> None:
+def _ensure_key_columns(
+    frame: pd.DataFrame, key_columns: Sequence[str], source: str
+) -> None:
     if not key_columns:
         raise ValueError("At least one key column must be defined for comparisons")
 
@@ -362,10 +380,42 @@ def _ensure_key_columns(frame: pd.DataFrame, key_columns: Sequence[str]) -> None
     if missing:
         raise KeyError(f"Missing required key columns: {', '.join(missing)}")
 
-    key_series = frame[key_columns[0]].astype(str).str.strip()
-    for column in key_columns[1:]:
-        key_series = key_series + "||" + frame[column].astype(str).str.strip()
-    frame.insert(0, "record_key", key_series)
+    key_values: List[pd.Series] = []
+    for column in key_columns:
+        series = frame[column].astype("string").str.strip()
+        series = series.replace("", pd.NA)
+        key_values.append(series.astype(object))
+
+    if len(key_values) == 1:
+        key_series = key_values[0]
+    else:
+        key_df = pd.concat(key_values, axis=1)
+
+        def _combine(row: pd.Series) -> str:
+            parts: List[str] = []
+            for value in row:
+                if pd.isna(value):
+                    continue
+                text = str(value).strip()
+                if text:
+                    parts.append(text)
+            return "||".join(parts)
+
+        key_series = key_df.apply(_combine, axis=1)
+        key_series = key_series.replace("", pd.NA)
+
+    key_series = key_series.astype(object)
+
+    if key_series.isna().any():
+        prefix = re.sub(r"[^0-9A-Za-z]+", "_", source).strip("_") or "dataset"
+        missing_mask = key_series.isna()
+        fallback = [
+            f"__{prefix}_row_{idx}"
+            for idx in frame.index[missing_mask]
+        ]
+        key_series.loc[missing_mask] = fallback
+
+    frame.insert(0, "record_key", key_series.astype(str))
 
 
 def _empty_frame() -> pd.DataFrame:
