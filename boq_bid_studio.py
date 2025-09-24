@@ -347,6 +347,68 @@ def compute_percent_difference(values: pd.Series, reference: Any) -> pd.Series:
     return result
 
 
+def ensure_percent_columns(
+    df: pd.DataFrame,
+    value_columns: Sequence[str],
+    reference_col: str = "Master total",
+) -> pd.DataFrame:
+    """Add percentage comparison columns relative to ``reference_col``.
+
+    The function augments ``df`` in place and also returns it for convenience.
+    Existing percentage columns are preserved to avoid recomputation when the
+    helper is called repeatedly on the same DataFrame.
+    """
+
+    if df is None or df.empty:
+        return df
+
+    if reference_col not in df.columns:
+        return df
+
+    existing_value_cols = [col for col in value_columns if col in df.columns]
+    if not existing_value_cols:
+        return df
+
+    reference_series = pd.to_numeric(df[reference_col], errors="coerce")
+    for col in existing_value_cols:
+        pct_col = f"{col}{PERCENT_DIFF_SUFFIX}"
+        if pct_col in df.columns:
+            continue
+        col_values = pd.to_numeric(df[col], errors="coerce")
+        df[pct_col] = compute_percent_difference(col_values, reference_series)
+
+    return df
+
+
+def interleave_percent_columns(
+    df: pd.DataFrame, value_columns: Sequence[str]
+) -> pd.DataFrame:
+    """Ensure percentage columns follow their corresponding value columns."""
+
+    if df is None or df.empty:
+        return df
+
+    value_set = set(value_columns)
+    desired_order: List[str] = []
+    for col in df.columns:
+        desired_order.append(col)
+        if col in value_set:
+            pct_col = f"{col}{PERCENT_DIFF_SUFFIX}"
+            if pct_col in df.columns:
+                desired_order.append(pct_col)
+
+    ordered: List[str] = []
+    for col in desired_order:
+        if col in df.columns and col not in ordered:
+            ordered.append(col)
+
+    for col in df.columns:
+        if col not in ordered:
+            ordered.append(col)
+
+    return df.loc[:, ordered]
+
+
 def ensure_unique_aliases(
     raw_to_alias: Dict[str, str], reserved: Optional[Iterable[str]] = None
 ) -> Dict[str, str]:
@@ -2975,6 +3037,7 @@ with tab_rekap:
                                 main_detail[pct_col] = compute_percent_difference(
                                     main_detail[col], master_reference
                                 )
+                    main_detail = interleave_percent_columns(main_detail, value_cols)
                     main_detail_display_base = rename_value_columns_for_display(
                         main_detail.copy(), f" — CELKEM {base_currency}"
                     )
@@ -2986,6 +3049,9 @@ with tab_rekap:
                                 pd.to_numeric(converted_main[col], errors="coerce")
                                 * conversion_factor
                             )
+                    converted_main = interleave_percent_columns(
+                        converted_main, value_cols
+                    )
                     st.markdown(f"**Rekapitulace v {target_currency}:**")
                     main_detail_display_converted = rename_value_columns_for_display(
                         converted_main, f" — CELKEM {target_currency}"
@@ -3084,6 +3150,8 @@ with tab_rekap:
                 summary_records.append(row)
             summary_base = pd.DataFrame(summary_records)
             if not summary_base.empty:
+                summary_base = ensure_percent_columns(summary_base, value_cols)
+                summary_base = interleave_percent_columns(summary_base, value_cols)
                 summary_display = rename_value_columns_for_display(summary_base.copy(), "")
                 show_df(summary_display)
                 summary_converted = summary_base.copy()
@@ -3095,6 +3163,9 @@ with tab_rekap:
                     )
                 summary_converted.loc[currency_mask, "Jednotka"] = target_currency
                 st.markdown(f"**Souhrn v {target_currency}:**")
+                summary_converted = interleave_percent_columns(
+                    summary_converted, value_cols
+                )
                 summary_display_converted = rename_value_columns_for_display(
                     summary_converted.copy(), ""
                 )
@@ -3330,6 +3401,8 @@ with tab_rekap:
                         }
                         sum_row.update({col: sum_values.get(col, np.nan) for col in value_cols})
                         sum_df = pd.DataFrame([sum_row])
+                        sum_df = ensure_percent_columns(sum_df, value_cols)
+                        sum_df = interleave_percent_columns(sum_df, value_cols)
                         st.markdown("**Součet vybrané podsekce:**")
                         show_df(rename_value_columns_for_display(sum_df, ""))
 
@@ -3344,6 +3417,12 @@ with tab_rekap:
                                 detail_selection[col] = pd.to_numeric(
                                     detail_selection[col], errors="coerce"
                                 )
+                        detail_selection = ensure_percent_columns(
+                            detail_selection, value_cols
+                        )
+                        detail_selection = interleave_percent_columns(
+                            detail_selection, value_cols
+                        )
                         st.markdown("**Detail položek v rámci vybraného kódu:**")
                         show_df(
                             rename_value_columns_for_display(
@@ -3373,6 +3452,8 @@ with tab_rekap:
                     ve_rows.append(row)
             if ve_rows:
                 ve_df = pd.DataFrame(ve_rows)
+                ve_df = ensure_percent_columns(ve_df, value_cols)
+                ve_df = interleave_percent_columns(ve_df, value_cols)
                 show_df(rename_value_columns_for_display(ve_df, ""))
             else:
                 st.info("V datech se nenachází žádné položky Value Engineering.")
@@ -3411,7 +3492,10 @@ with tab_rekap:
                     }
                     row.update({col: sums.get(col, np.nan) for col in value_cols})
                     rows.append(row)
-                return pd.DataFrame(rows)
+                table = pd.DataFrame(rows)
+                table = ensure_percent_columns(table, value_cols)
+                table = interleave_percent_columns(table, value_cols)
+                return table
 
             fixed_tables: List[Tuple[str, List[Dict[str, Any]]]] = [
                 (
