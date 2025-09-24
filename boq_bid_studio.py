@@ -8,12 +8,18 @@ import time
 import unicodedata
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
 import plotly.express as px
 import streamlit as st
+from bidstudio.comparison import (
+    ComparisonConfig,
+    ComparisonResult,
+    compare_bids as engine_compare_bids,
+)
+from bidstudio.search import TfidfSearchProvider
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4, landscape
 from reportlab.lib.styles import getSampleStyleSheet
@@ -149,6 +155,8 @@ RECAP_CATEGORY_CONFIG = [
 
 PERCENT_DIFF_SUFFIX = "_pct_diff"
 PERCENT_DIFF_LABEL = " — ODCHYLKA VS MASTER (%)"
+
+ENGINE_PLACEHOLDER_PREFIX = "__engine_placeholder__::"
 
 
 def ensure_exchange_rate_state(default: float = DEFAULT_EXCHANGE_RATE) -> None:
@@ -859,6 +867,211 @@ def coerce_numeric(s: pd.Series) -> pd.Series:
     return pd.to_numeric(cleaned, errors="coerce")
 
 
+def _make_record_key(sheet: str, base_key: Any, order: Any, index: int) -> str:
+    """Create a stable record key combining sheet and canonical key."""
+
+    candidate = str(base_key if base_key is not None else "").strip()
+    if candidate:
+        return f"{sheet}||{candidate}"
+
+    if order is not None and not pd.isna(order):
+        try:
+            order_int = int(float(order))
+        except (TypeError, ValueError):
+            order_int = index
+        return f"{sheet}||order_{order_int}"
+
+    return f"{sheet}||row_{index}"
+
+
+def _aggregate_table_for_engine(table: pd.DataFrame, *, supplier: bool = False) -> pd.DataFrame:
+    """Return normalized rows ready for the comparison engine."""
+
+    empty = pd.DataFrame(
+        columns=[
+            "__key__",
+            "code",
+            "description",
+            "unit",
+            "total_price",
+            "source_order",
+            "quantity",
+            "unit_price",
+        ]
+    )
+
+    if not isinstance(table, pd.DataFrame) or table.empty:
+        return empty
+
+    working = table.copy()
+    if "is_summary" in working.columns:
+        working = working[~working["is_summary"].fillna(False).astype(bool)]
+    if working.empty:
+        return empty
+
+    desc_series = working.get("description")
+    if desc_series is None:
+        return empty
+    working = working[desc_series.fillna("").astype(str).str.strip() != ""]
+    if working.empty:
+        return empty
+
+    working["__key__"] = working["__key__"].fillna("").astype(str)
+    working["code"] = working.get("code", pd.Series(index=working.index, dtype=object)).fillna("").astype(str)
+    working["description"] = desc_series.fillna("").astype(str)
+    working["unit"] = working.get("unit", pd.Series(index=working.index, dtype=object)).fillna("").astype(str)
+
+    quantity_column = "quantity_supplier" if supplier and "quantity_supplier" in working.columns else "quantity"
+    working["quantity_value"] = coerce_numeric(working.get(quantity_column, 0)).fillna(0.0)
+    working["total_value"] = coerce_numeric(working.get("total_price", 0)).fillna(0.0)
+
+    price_parts: List[pd.Series] = []
+    for price_col in ("unit_price_material", "unit_price_install"):
+        if price_col in working.columns:
+            price_parts.append(coerce_numeric(working[price_col]))
+    if price_parts:
+        price_sum = sum(price_parts)
+        working["unit_price_value"] = price_sum
+    else:
+        working["unit_price_value"] = np.nan
+
+    qty_nonzero = working["quantity_value"].replace({0: np.nan})
+    with np.errstate(divide="ignore", invalid="ignore"):
+        computed_unit = working["total_value"] / qty_nonzero
+    working["unit_price_value"] = working["unit_price_value"].where(
+        working["unit_price_value"].notna(),
+        computed_unit,
+    )
+
+    if "__row_order__" in working.columns:
+        working["source_order"] = pd.to_numeric(working["__row_order__"], errors="coerce")
+    else:
+        working["source_order"] = np.arange(len(working), dtype=float)
+
+    working["weighted_price"] = working["unit_price_value"] * working["quantity_value"]
+
+    grouped = working.groupby("__key__", sort=False)
+    aggregated = grouped.agg(
+        code=("code", "first"),
+        description=("description", "first"),
+        unit=("unit", "first"),
+        total_price=("total_value", "sum"),
+        source_order=("source_order", "min"),
+    ).reset_index()
+
+    quantity_sum = grouped["quantity_value"].sum().rename("quantity")
+    weighted_sum = grouped["weighted_price"].sum().rename("weighted_price")
+    aggregated = aggregated.merge(quantity_sum, on="__key__", how="left")
+    aggregated = aggregated.merge(weighted_sum, on="__key__", how="left")
+
+    qty = aggregated["quantity"].replace({0: np.nan})
+    with np.errstate(divide="ignore", invalid="ignore"):
+        weighted_unit = aggregated["weighted_price"] / qty
+        fallback_unit = aggregated["total_price"] / qty
+    aggregated["unit_price"] = weighted_unit.where(~weighted_unit.isna(), fallback_unit)
+    aggregated.loc[qty.isna(), "unit_price"] = np.nan
+
+    aggregated.drop(columns=["weighted_price"], inplace=True)
+    aggregated["quantity"] = aggregated["quantity"].fillna(0.0)
+    aggregated["unit_price"] = aggregated["unit_price"].replace({np.inf: np.nan})
+    aggregated["source_order"] = aggregated["source_order"].fillna(np.arange(len(aggregated), dtype=float))
+
+    return aggregated
+
+
+def _prepare_master_tables(master: WorkbookData, sheets: Sequence[str]) -> Dict[str, pd.DataFrame]:
+    tables: Dict[str, pd.DataFrame] = {}
+    for sheet in sheets:
+        obj = master.sheets.get(sheet, {})
+        table = obj.get("table", pd.DataFrame())
+        aggregated = _aggregate_table_for_engine(table, supplier=False)
+        if aggregated.empty:
+            continue
+        keys = []
+        for idx, (base_key, order) in enumerate(zip(aggregated["__key__"], aggregated["source_order"])):
+            keys.append(_make_record_key(sheet, base_key, order, idx))
+        aggregated["record_key"] = keys
+        aggregated["sheet"] = sheet
+        tables[sheet] = aggregated
+    return tables
+
+
+def _prepare_bid_tables(bids: Dict[str, WorkbookData], sheets: Sequence[str]) -> Dict[str, Dict[str, pd.DataFrame]]:
+    tables: Dict[str, Dict[str, pd.DataFrame]] = {}
+    for supplier, workbook in bids.items():
+        per_sheet: Dict[str, pd.DataFrame] = {}
+        for sheet in sheets:
+            obj = workbook.sheets.get(sheet, {})
+            table = obj.get("table", pd.DataFrame())
+            aggregated = _aggregate_table_for_engine(table, supplier=True)
+            if aggregated.empty:
+                continue
+            keys = []
+            for idx, (base_key, order) in enumerate(zip(aggregated["__key__"], aggregated["source_order"])):
+                keys.append(_make_record_key(sheet, base_key, order, idx))
+            aggregated["record_key"] = keys
+            aggregated["sheet"] = sheet
+            per_sheet[sheet] = aggregated
+        tables[supplier] = per_sheet
+    return tables
+
+
+def _build_engine_frames(
+    master_tables: Dict[str, pd.DataFrame],
+    bid_tables: Dict[str, Dict[str, pd.DataFrame]],
+) -> Tuple[pd.DataFrame, List[pd.DataFrame], Dict[str, str], Dict[str, float]]:
+    master_columns = [
+        "record_key",
+        "code",
+        "description",
+        "unit",
+        "quantity",
+        "unit_price",
+        "total_price",
+        "sheet",
+    ]
+    master_frames: List[pd.DataFrame] = []
+    record_to_sheet: Dict[str, str] = {}
+    record_to_order: Dict[str, float] = {}
+
+    for sheet, table in master_tables.items():
+        if table.empty:
+            continue
+        for key, order in zip(table["record_key"], table["source_order"]):
+            record_to_sheet[str(key)] = sheet
+            try:
+                record_to_order[str(key)] = float(order)
+            except (TypeError, ValueError):
+                record_to_order[str(key)] = float("nan")
+        master_frames.append(table[master_columns].copy())
+
+    if master_frames:
+        master_frame = pd.concat(master_frames, ignore_index=True)
+    else:
+        master_frame = pd.DataFrame(columns=master_columns)
+
+    bid_columns = ["supplier", *master_columns]
+    bid_frames: List[pd.DataFrame] = []
+    for supplier, per_sheet in bid_tables.items():
+        frames: List[pd.DataFrame] = []
+        for table in per_sheet.values():
+            if table.empty:
+                continue
+            frames.append(table[master_columns].copy())
+        if frames:
+            combined = pd.concat(frames, ignore_index=True)
+        else:
+            combined = pd.DataFrame(columns=master_columns)
+        combined.insert(0, "supplier", supplier)
+        if combined.empty:
+            combined.loc[0] = [supplier] + [np.nan] * (len(bid_columns) - 1)
+            combined.loc[0, "record_key"] = f"{ENGINE_PLACEHOLDER_PREFIX}{supplier}"  # ensure supplier name propagation
+            combined.loc[0, "sheet"] = ""
+        bid_frames.append(combined[bid_columns])
+
+    return master_frame[master_columns], bid_frames, record_to_sheet, record_to_order
+
+
 def detect_summary_rows(df: pd.DataFrame) -> pd.Series:
     """Return boolean Series marking summary/subtotal rows.
 
@@ -1339,124 +1552,168 @@ def mapping_ui(
             st.markdown("**Normalizovaná tabulka (náhled):**")
             show_df(table.head(50))
     return changed_any
-def compare(master: WorkbookData, bids: Dict[str, WorkbookData], join_mode: str = "auto") -> Dict[str, pd.DataFrame]:
-    """
-    join_mode: "auto" (Item ID if detekováno, jinak code+description), nebo "code+description".
-    """
-    results = {}
+def compare(
+    master: WorkbookData,
+    bids: Dict[str, WorkbookData],
+    join_mode: str = "auto",
+) -> Tuple[Dict[str, pd.DataFrame], ComparisonResult]:
+    """Compare master workbook with supplier bids per sheet using the engine modules."""
+
+    del join_mode  # maintained for backwards compatibility, engine handles matching
+
+    results: Dict[str, pd.DataFrame] = {}
     sheets = list(master.sheets.keys())
-    for sheet in sheets:
-        mobj = master.sheets.get(sheet, {})
-        mtab = mobj.get("table", pd.DataFrame())
-        if mtab is None or mtab.empty:
-            continue
-        if "is_summary" in mtab.columns:
-            mtab = mtab[~mtab["is_summary"].fillna(False).astype(bool)]
-        mtab = mtab[mtab["description"].astype(str).str.strip() != ""]
-        base = mtab[["__key__", "code", "description", "unit", "quantity", "total_price"]].copy()
-        base["quantity"] = pd.to_numeric(base["quantity"], errors="coerce").fillna(0)
-        base["total_price"] = pd.to_numeric(base["total_price"], errors="coerce").fillna(0)
-        base_grouped = base.groupby("__key__", sort=False, as_index=False).agg(
-            {
-                "code": "first",
-                "description": "first",
-                "unit": "first",
-                "quantity": "sum",
-                "total_price": "sum",
-            }
+
+    master_tables = _prepare_master_tables(master, sheets)
+    if not master_tables:
+        empty_result = ComparisonResult(
+            items=pd.DataFrame(),
+            summary=pd.DataFrame(),
+            unmatched=pd.DataFrame(),
+            metadata={},
         )
-        master_total_sum = base_grouped["total_price"].sum()
-        base_grouped.rename(columns={"total_price": "Master total"}, inplace=True)
-        comp = base_grouped.copy()
+        return results, empty_result
 
-        for sup_name, wb in bids.items():
-            tobj = wb.sheets.get(sheet, {})
-            ttab = tobj.get("table", pd.DataFrame())
-            if ttab is None or ttab.empty:
-                comp[f"{sup_name} quantity"] = np.nan
-                comp[f"{sup_name} unit_price"] = np.nan
-                comp[f"{sup_name} total"] = np.nan
-                continue
-            if "is_summary" in ttab.columns:
-                ttab = ttab[~ttab["is_summary"].fillna(False).astype(bool)]
-            ttab = ttab[ttab["description"].astype(str).str.strip() != ""]
-            # join by __key__ (manual mapping already built in normalized table)
-            sup_qty_col = "quantity_supplier" if "quantity_supplier" in ttab.columns else "quantity"
-            cols = [
+    bid_tables = _prepare_bid_tables(bids, sheets)
+    master_frame, bid_frames, record_to_sheet, record_to_order = _build_engine_frames(
+        master_tables, bid_tables
+    )
+
+    if master_frame.empty or not bid_frames:
+        empty_result = ComparisonResult(
+            items=pd.DataFrame(),
+            summary=pd.DataFrame(),
+            unmatched=pd.DataFrame(),
+            metadata={},
+        )
+        return results, empty_result
+
+    comparison_config = ComparisonConfig(
+        key_columns=["record_key"],
+        numeric_columns=["quantity", "total_price"],
+    )
+
+    search_provider = TfidfSearchProvider()
+
+    engine_result = engine_compare_bids(
+        master_frame,
+        bid_frames,
+        comparison_config,
+        search_provider=search_provider,
+        search_fields=["description"],
+        search_top_k=5,
+        search_metadata_fields=["code", "description", "sheet"],
+    )
+
+    items = engine_result.items.copy()
+    if not items.empty:
+        placeholder_mask = items["record_key"].astype(str).str.startswith(ENGINE_PLACEHOLDER_PREFIX)
+        items = items.loc[~placeholder_mask].copy()
+        items["sheet"] = items["record_key"].map(record_to_sheet)
+        items["row_order"] = items["record_key"].map(record_to_order)
+        items = items[items["sheet"].notna()].copy()
+
+    unmatched = engine_result.unmatched.copy()
+    if not unmatched.empty and "record_key" in unmatched.columns:
+        unmatched = unmatched[
+            ~unmatched["record_key"].astype(str).str.startswith(ENGINE_PLACEHOLDER_PREFIX)
+        ].copy()
+
+    filtered_engine_result = ComparisonResult(
+        items=items,
+        summary=engine_result.summary.copy(),
+        unmatched=unmatched,
+        metadata=engine_result.metadata,
+    )
+
+    supplier_names = list(bids.keys())
+
+    for sheet, master_table in master_tables.items():
+        if master_table.empty:
+            continue
+
+        base = master_table[
+            [
+                "record_key",
                 "__key__",
-                sup_qty_col,
-                "unit_price_material",
-                "unit_price_install",
+                "code",
+                "description",
+                "unit",
+                "quantity",
                 "total_price",
+                "source_order",
             ]
-            existing_cols = [c for c in cols if c in ttab.columns]
-            tt = ttab[existing_cols].copy()
-            tt[sup_qty_col] = pd.to_numeric(tt[sup_qty_col], errors="coerce")
-            tt["total_price"] = pd.to_numeric(tt["total_price"], errors="coerce").fillna(0)
-            price_cols = [c for c in ["unit_price_material", "unit_price_install"] if c in tt.columns]
-            if price_cols:
-                for col in price_cols:
-                    tt[col] = pd.to_numeric(tt[col], errors="coerce")
-                tt["unit_price_combined"] = tt[price_cols].sum(axis=1, min_count=1)
+        ].copy()
+        base.rename(columns={"total_price": "Master total"}, inplace=True)
+        base["quantity"] = pd.to_numeric(base["quantity"], errors="coerce").fillna(0.0)
+        base.sort_values("source_order", inplace=True)
+
+        sheet_items = items[items["sheet"] == sheet] if not items.empty else pd.DataFrame()
+
+        for supplier in supplier_names:
+            sup_items = sheet_items[sheet_items["supplier"] == supplier].copy()
+            if not sup_items.empty:
+                qty_sup = pd.to_numeric(sup_items.get("quantity_supplier"), errors="coerce")
+                with np.errstate(divide="ignore", invalid="ignore"):
+                    unit_price_sup = np.where(
+                        qty_sup != 0,
+                        sup_items.get("total_price_supplier", np.nan) / qty_sup,
+                        np.nan,
+                    )
+                sup_items["unit_price_supplier"] = unit_price_sup
+                sup_df = sup_items[
+                    [
+                        "record_key",
+                        "quantity_supplier",
+                        "unit_price_supplier",
+                        "total_price_supplier",
+                        "quantity_difference",
+                    ]
+                ].copy()
             else:
-                tt["unit_price_combined"] = np.nan
-            first_price = (
-                tt.groupby("__key__", sort=False)["unit_price_combined"].first().reset_index(name="first_unit_price")
-            )
-            def _sum_with_min_count(series: pd.Series) -> float:
-                return series.sum(min_count=1)
+                sup_df = pd.DataFrame(
+                    {
+                        "record_key": pd.Series(dtype=object),
+                        "quantity_supplier": pd.Series(dtype=float),
+                        "unit_price_supplier": pd.Series(dtype=float),
+                        "total_price_supplier": pd.Series(dtype=float),
+                        "quantity_difference": pd.Series(dtype=float),
+                    }
+                )
 
-            tt_grouped = tt.groupby("__key__", sort=False, as_index=False).agg(
-                {
-                    sup_qty_col: _sum_with_min_count,
-                    "total_price": "sum",
-                }
-            )
-            tt_grouped = tt_grouped.merge(first_price, on="__key__", how="left")
-            qty = tt_grouped[sup_qty_col]
-            with np.errstate(divide="ignore", invalid="ignore"):
-                qty_for_division = qty.where(qty != 0)
-                tt_grouped["unit_price_combined"] = tt_grouped["total_price"] / qty_for_division
-            mask = qty_for_division.isna()
-            tt_grouped.loc[mask, "unit_price_combined"] = tt_grouped.loc[mask, "first_unit_price"]
-            tt_grouped.drop(columns=["first_unit_price"], inplace=True)
-            comp = comp.merge(
-                tt_grouped[["__key__", sup_qty_col, "unit_price_combined", "total_price"]],
-                on="__key__",
-                how="left",
-            )
-            comp.rename(columns={
-                sup_qty_col: f"{sup_name} quantity",
-                "unit_price_combined": f"{sup_name} unit_price",
-                "total_price": f"{sup_name} total",
-            }, inplace=True)
-            comp[f"{sup_name} Δ qty"] = comp[f"{sup_name} quantity"] - comp["quantity"]
+            rename_map = {
+                "quantity_supplier": f"{supplier} quantity",
+                "unit_price_supplier": f"{supplier} unit_price",
+                "total_price_supplier": f"{supplier} total",
+                "quantity_difference": f"{supplier} Δ qty",
+            }
+            sup_df = sup_df.rename(columns=rename_map)
+            base = base.merge(sup_df, on="record_key", how="left")
 
-        total_cols = [c for c in comp.columns if c.endswith(" total") and c != "Master total"]
+        total_cols = [c for c in base.columns if c.endswith(" total") and c != "Master total"]
         if total_cols:
-            comp["LOWEST total"] = comp[total_cols].min(axis=1, skipna=True)
-            highest_total = comp[total_cols].max(axis=1, skipna=True)
-            comp["MIDRANGE total"] = (comp["LOWEST total"] + highest_total) / 2
-            for c in total_cols:
-                comp[f"{c} Δ vs LOWEST"] = comp[c] - comp["LOWEST total"]
+            base["LOWEST total"] = base[total_cols].min(axis=1, skipna=True)
+            highest_total = base[total_cols].max(axis=1, skipna=True)
+            base["MIDRANGE total"] = (base["LOWEST total"] + highest_total) / 2
+            for col in total_cols:
+                base[f"{col} Δ vs LOWEST"] = base[col] - base["LOWEST total"]
 
-            def _valid_supplier_totals(row: pd.Series) -> Dict[str, Any]:
-                values = {}
+            def _valid_totals(row: pd.Series) -> Dict[str, Any]:
+                values: Dict[str, Any] = {}
                 for col in total_cols:
-                    value = row[col]
+                    value = row.get(col)
                     if pd.notna(value):
                         values[col.replace(" total", "")] = value
                 return values
 
-            # Which supplier is the lowest per row?
-            def lowest_supplier(row: pd.Series) -> Optional[str]:
-                values = _valid_supplier_totals(row)
+            def _lowest_supplier(row: pd.Series) -> Optional[str]:
+                values = _valid_totals(row)
                 if not values:
                     return None
                 return min(values, key=values.get)
 
-            def supplier_range(row: pd.Series) -> Optional[str]:
-                values = _valid_supplier_totals(row)
+            def _supplier_range(row: pd.Series) -> Optional[str]:
+                values = _valid_totals(row)
                 if not values:
                     return None
                 lowest = min(values, key=values.get)
@@ -1465,12 +1722,15 @@ def compare(master: WorkbookData, bids: Dict[str, WorkbookData], join_mode: str 
                     return lowest
                 return f"{lowest} – {highest}"
 
-            comp["LOWEST supplier"] = comp.apply(lowest_supplier, axis=1)
-            comp["MIDRANGE supplier range"] = comp.apply(supplier_range, axis=1)
+            base["LOWEST supplier"] = base.apply(_lowest_supplier, axis=1)
+            base["MIDRANGE supplier range"] = base.apply(_supplier_range, axis=1)
 
-        comp.attrs["master_total_sum"] = master_total_sum
-        results[sheet] = comp
-    return results
+        base.attrs["master_total_sum"] = float(base["Master total"].sum(skipna=True))
+        base.drop(columns=["record_key"], inplace=True)
+        base.reset_index(drop=True, inplace=True)
+        results[sheet] = base
+
+    return results, filtered_engine_result
 
 def summarize(results: Dict[str, pd.DataFrame]) -> pd.DataFrame:
     rows = []
@@ -2376,8 +2636,9 @@ with tab_data:
 
 # Pre-compute comparison results for reuse in tabs (after mapping)
 compare_results: Dict[str, pd.DataFrame] = {}
+comparison_engine_result: Optional[ComparisonResult] = None
 if bids_dict:
-    raw_compare_results = compare(master_wb, bids_dict, join_mode="auto")
+    raw_compare_results, comparison_engine_result = compare(master_wb, bids_dict, join_mode="auto")
     compare_results = {
         sheet: rename_comparison_columns(df, display_names) for sheet, df in raw_compare_results.items()
     }
@@ -3450,6 +3711,46 @@ with tab_qa:
                         st.write("n/a")
                     else:
                         st.write(format_number(diff))
+
+        if comparison_engine_result is not None and not comparison_engine_result.unmatched.empty:
+            st.markdown("### 🔍 Nepřiřazené položky (AI doporučení)")
+            unmatched = comparison_engine_result.unmatched.copy()
+            unmatched["supplier_display"] = unmatched["supplier"].map(display_names).fillna(unmatched["supplier"])
+
+            def _format_suggestions(raw: Any) -> str:
+                if not raw:
+                    return ""
+                formatted: List[str] = []
+                for suggestion in list(raw)[:3]:
+                    code = suggestion.get("code") if isinstance(suggestion, dict) else None
+                    score = suggestion.get("score") if isinstance(suggestion, dict) else None
+                    description = suggestion.get("description") if isinstance(suggestion, dict) else None
+                    if code and score is not None:
+                        try:
+                            formatted.append(f"{code} ({float(score):.2f})")
+                        except (TypeError, ValueError):
+                            formatted.append(f"{code}")
+                    elif code:
+                        formatted.append(str(code))
+                    elif description:
+                        formatted.append(str(description))
+                return "; ".join(formatted)
+
+            for supplier, group in unmatched.groupby("supplier"):
+                alias = display_names.get(supplier, supplier)
+                st.markdown(f"**{alias}**")
+                display = group.copy()
+                display.rename(
+                    columns={
+                        "code": "Navržený kód",
+                        "description_supplier": "Popis dodavatele",
+                        "total_price_supplier": "Cena dodavatele",
+                    },
+                    inplace=True,
+                )
+                display["Cena dodavatele"] = pd.to_numeric(display["Cena dodavatele"], errors="coerce")
+                display["AI doporučení"] = display["suggestions"].apply(_format_suggestions)
+                show_df(display[["Navržený kód", "Popis dodavatele", "Cena dodavatele", "AI doporučení"]].head(50))
 
 st.markdown("---")
 st.caption("© 2025 BoQ Bid Studio — MVP. Doporučení: používat jednotné Item ID pro precizní párování.")
