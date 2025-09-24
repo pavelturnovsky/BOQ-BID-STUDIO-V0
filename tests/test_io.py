@@ -4,8 +4,13 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from bidstudio.config import ColumnMapping
-from bidstudio.io import CANONICAL_COLUMNS, coerce_numeric, load_master_dataset
+from bidstudio.config import BidConfig, ColumnMapping
+from bidstudio.io import (
+    CANONICAL_COLUMNS,
+    coerce_numeric,
+    load_bid_dataset,
+    load_master_dataset,
+)
 
 
 def test_load_master_dataset_autodetects_czech_headers(tmp_path):
@@ -40,6 +45,41 @@ def test_load_master_dataset_autodetects_czech_headers(tmp_path):
     assert frame.loc[0, "quantity"] == pytest.approx(1234.5)
     assert frame.loc[1, "total_price"] == pytest.approx(678.90)
     assert np.isnan(frame.loc[0, "unit_price"])
+
+
+def test_load_dataset_generates_surrogate_keys_with_dataset_prefix(tmp_path):
+    data = pd.DataFrame(
+        {
+            "ItemCode": ["001", None],
+            "Description": ["Položka A", "Položka B"],
+            "Unit": ["ks", "m2"],
+            "Quantity": [1, 2],
+            "UnitPrice": [10, 20],
+            "TotalPrice": [10, 40],
+        }
+    )
+
+    master_path = tmp_path / "master.csv"
+    bid_path = tmp_path / "bid.csv"
+    data.to_csv(master_path, index=False)
+    data.to_csv(bid_path, index=False)
+
+    mapping = ColumnMapping(
+        code="ItemCode",
+        description="Description",
+        unit="Unit",
+        quantity="Quantity",
+        unit_price="UnitPrice",
+        total_price="TotalPrice",
+    )
+
+    master_frame = load_master_dataset(master_path, mapping, key_columns=["code"])
+    assert master_frame.loc[0, "record_key"] == "001"
+    assert master_frame.loc[1, "record_key"].startswith("__master_row_")
+
+    bid_config = BidConfig(name="Dodavatel Č.1", path=bid_path)
+    bid_frame = load_bid_dataset(bid_config, mapping, key_columns=["code"])
+    assert bid_frame.loc[1, "record_key"].startswith("__bid_Dodavatel")
 
 
 def test_coerce_numeric_strips_currencies_and_separators():
