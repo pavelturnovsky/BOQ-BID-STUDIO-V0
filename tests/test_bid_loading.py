@@ -188,6 +188,51 @@ def test_apply_master_mapping_aligns_by_header_name() -> None:
     assert np.isclose(df["Bid total"].iloc[0], 120)
 
 
+def test_apply_master_mapping_uses_master_header_row_fallback() -> None:
+    master_header_row = 65
+    header = ["code", "description", "unit", "quantity", "total price"]
+    master_wb = WorkbookData(name="Master")
+    master_wb.sheets["Sheet1"] = {
+        "raw": None,
+        "mapping": {
+            "code": 0,
+            "description": 1,
+            "unit": 2,
+            "quantity": 3,
+            "total_price": 4,
+        },
+        "header_row": master_header_row,
+        "table": pd.DataFrame(),
+        "header_names": header,
+    }
+
+    filler_rows = [[f"intro {i}", "", "", "", ""] for i in range(master_header_row)]
+    supplier_rows = filler_rows + [header, ["A", "Item", "m", "2", "120"]]
+    supplier_raw = pd.DataFrame(supplier_rows)
+
+    supplier_wb = WorkbookData(name="Bid")
+    supplier_wb.sheets["Sheet1"] = {
+        "raw": supplier_raw,
+        "mapping": {},
+        "header_row": -1,
+        "table": pd.DataFrame(),
+        "header_names": [],
+    }
+
+    apply_master_mapping(master_wb, supplier_wb)
+
+    sheet = supplier_wb.sheets["Sheet1"]
+    assert sheet["header_row"] == master_header_row
+    mapping = sheet["mapping"]
+    assert mapping["code"] == 0
+    assert mapping["description"] == 1
+    assert mapping["quantity"] == 3
+    table = sheet["table"]
+    assert not table.empty
+    assert table.loc[0, "code"] == "A"
+    assert np.isclose(table.loc[0, "total_price"], 120)
+
+
 def test_coerce_numeric_european_formats() -> None:
     s = pd.Series(["1 234,56", "1 234", "1234", "1.234,5", "-"])
     res = module.coerce_numeric(s)

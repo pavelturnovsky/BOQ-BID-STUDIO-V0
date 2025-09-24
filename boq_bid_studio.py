@@ -1100,18 +1100,32 @@ def apply_master_mapping(master: WorkbookData, target: WorkbookData) -> None:
     """Copy mapping and align it with target workbook headers by column name."""
 
     def _normalize_header_row(
-        raw_df: pd.DataFrame, desired_names: List[str], fallback_row: int
+        raw_df: pd.DataFrame,
+        desired_names: List[str],
+        fallback_row: int,
+        master_header_row: int,
     ) -> Tuple[int, List[str]]:
         if not isinstance(raw_df, pd.DataFrame) or raw_df.empty:
             return -1, []
 
         max_probe = min(len(raw_df), 50)
+        probe_indices: List[int] = list(range(max_probe))
+        probe_set = set(probe_indices)
+
+        for candidate in (fallback_row, master_header_row):
+            if not isinstance(candidate, (int, np.integer)):
+                continue
+            idx = int(candidate)
+            if 0 <= idx < len(raw_df) and idx not in probe_set:
+                probe_indices.append(idx)
+                probe_set.add(idx)
+
         normalized_rows: Dict[int, List[str]] = {}
         best_row = -1
         best_score = -1
         desired = [name for name in desired_names if name]
 
-        for idx in range(max_probe):
+        for idx in probe_indices:
             row_values = [normalize_col(x) for x in raw_df.iloc[idx].astype(str).tolist()]
             normalized_rows[idx] = row_values
             if desired:
@@ -1123,9 +1137,11 @@ def apply_master_mapping(master: WorkbookData, target: WorkbookData) -> None:
                 best_score = score
 
         if best_row < 0 or best_score <= 0:
-            candidate = fallback_row
-            if isinstance(candidate, (int, np.integer)) and 0 <= int(candidate) < len(raw_df):
-                best_row = int(candidate)
+            fallback_candidates = [fallback_row, master_header_row, 0]
+            for candidate in fallback_candidates:
+                if isinstance(candidate, (int, np.integer)) and 0 <= int(candidate) < len(raw_df):
+                    best_row = int(candidate)
+                    break
             else:
                 best_row = 0
 
@@ -1167,7 +1183,10 @@ def apply_master_mapping(master: WorkbookData, target: WorkbookData) -> None:
 
         existing_header_row = target_sheet.get("header_row", -1)
         target_header_row, header = _normalize_header_row(
-            raw, list(key_to_master_col.values()), existing_header_row
+            raw,
+            list(key_to_master_col.values()),
+            existing_header_row,
+            master_header_row,
         )
         body = raw.iloc[target_header_row + 1 :].reset_index(drop=True)
         body.columns = header
