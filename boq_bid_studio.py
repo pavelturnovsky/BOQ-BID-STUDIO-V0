@@ -16,7 +16,8 @@ import plotly.express as px
 import streamlit as st
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4, landscape
-from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.lib.enums import TA_CENTER, TA_LEFT
+from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
 from reportlab.lib.units import mm
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
@@ -149,6 +150,15 @@ RECAP_CATEGORY_CONFIG = [
 
 PERCENT_DIFF_SUFFIX = "_pct_diff"
 PERCENT_DIFF_LABEL = " — ODCHYLKA VS MASTER (%)"
+
+
+def is_master_column(column_name: str) -> bool:
+    """Return True if the provided column represents Master totals."""
+
+    normalized = str(column_name or "").strip()
+    if normalized.endswith(" total"):
+        normalized = normalized[: -len(" total")]
+    return normalized.casefold() == "master"
 
 
 def ensure_exchange_rate_state(default: float = DEFAULT_EXCHANGE_RATE) -> None:
@@ -542,24 +552,27 @@ def format_timestamp(timestamp: Optional[float]) -> str:
     return dt.strftime("%d.%m.%Y %H:%M")
 
 
-def format_percent_label(value: Any) -> str:
+def format_currency_label(value: Any, currency: str) -> str:
     if pd.isna(value):
         return "–"
     try:
         numeric = float(value)
     except (TypeError, ValueError):
         return str(value)
-    text = f"{numeric:+.2f} %"
-    return text.replace(".", ",")
+    text = f"{numeric:,.2f}".replace(",", "\u00A0").replace(".", ",")
+    return f"{text} {currency}".strip()
 
 
-def build_recap_chart_data(value_cols: List[str], net_series: pd.Series) -> pd.DataFrame:
+def build_recap_chart_data(
+    value_cols: List[str],
+    net_series: pd.Series,
+    currency_label: str = "CZK",
+) -> pd.DataFrame:
     if not value_cols:
         return pd.DataFrame(
             columns=[
                 "Dodavatel",
                 "Cena po odečtech",
-                "Odchylka vs Master (%)",
                 "Popisek",
             ]
         )
@@ -571,28 +584,13 @@ def build_recap_chart_data(value_cols: List[str], net_series: pd.Series) -> pd.D
             "Cena po odečtech": [net_series.get(col) for col in value_cols],
         }
     )
-    master_mask = chart_df["Dodavatel"].astype(str).str.casefold() == "master"
-    master_val: Optional[float] = None
-    if master_mask.any():
-        master_values = pd.to_numeric(
-            chart_df.loc[master_mask, "Cena po odečtech"], errors="coerce"
-        ).dropna()
-        if not master_values.empty:
-            master_val = float(master_values.iloc[0])
-    deltas: List[float] = []
-    for supplier, value in zip(chart_df["Dodavatel"], chart_df["Cena po odečtech"]):
-        supplier_cf = str(supplier).casefold()
-        if supplier_cf == "master":
-            deltas.append(0.0 if pd.notna(value) else np.nan)
-            continue
-        if master_val is None or pd.isna(value) or math.isclose(
-            master_val, 0.0, rel_tol=1e-9, abs_tol=1e-9
-        ):
-            deltas.append(np.nan)
-            continue
-        deltas.append(((float(value) - master_val) / master_val) * 100.0)
-    chart_df["Odchylka vs Master (%)"] = deltas
-    chart_df["Popisek"] = chart_df["Odchylka vs Master (%)"].apply(format_percent_label)
+    chart_df["Cena po odečtech"] = pd.to_numeric(
+        chart_df["Cena po odečtech"], errors="coerce"
+    )
+    chart_df["Popisek"] = [
+        format_currency_label(value, currency_label)
+        for value in chart_df["Cena po odečtech"]
+    ]
     return chart_df
 
 
@@ -647,11 +645,30 @@ def generate_recap_pdf(
     styles["Heading3"].fontName = bold_font
     story: List[Any] = [Paragraph(title, styles["Title"]), Spacer(1, 6)]
 
+    table_header_style = ParagraphStyle(
+        "RecapTableHeader",
+        parent=styles.get("Heading4", styles["Heading2"]),
+        fontName=bold_font,
+        fontSize=8,
+        leading=10,
+        alignment=TA_CENTER,
+    )
+    table_cell_style = ParagraphStyle(
+        "RecapTableCell",
+        parent=styles["BodyText"],
+        fontName=base_font,
+        fontSize=8,
+        leading=10,
+        alignment=TA_LEFT,
+    )
+
     table_style = TableStyle(
         [
             ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#f0f0f0")),
             ("TEXTCOLOR", (0, 0), (-1, 0), colors.black),
             ("ALIGN", (0, 0), (-1, 0), "CENTER"),
+            ("ALIGN", (0, 1), (-1, -1), "LEFT"),
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
             ("FONTNAME", (0, 0), (-1, 0), bold_font),
             ("FONTNAME", (0, 1), (-1, -1), base_font),
             ("FONTSIZE", (0, 0), (-1, -1), 8),
@@ -662,12 +679,39 @@ def generate_recap_pdf(
     )
 
     def append_table(title_text: str, df: pd.DataFrame) -> None:
-        table_data = dataframe_to_table_data(df)
-        if not table_data:
+        raw_data = dataframe_to_table_data(df)
+        if not raw_data:
             return
         story.append(Paragraph(title_text, styles["Heading2"]))
         story.append(Spacer(1, 4))
-        table = Table(table_data, repeatRows=1)
+        column_count = len(raw_data[0]) if raw_data else 0
+        if column_count == 0:
+            return
+        column_lengths = [1] * column_count
+        for row in raw_data:
+            for idx, cell in enumerate(row):
+                text = str(cell)
+                column_lengths[idx] = max(column_lengths[idx], len(text))
+        total_length = sum(column_lengths) or column_count
+        available_width = doc.width
+        scaled_widths = [
+            (length / total_length) * available_width for length in column_lengths
+        ]
+        min_width = 35.0
+        col_widths = [max(min_width, width) for width in scaled_widths]
+        total_width = sum(col_widths)
+        if total_width > available_width and total_width > 0:
+            scale = available_width / total_width
+            col_widths = [width * scale for width in col_widths]
+        formatted_rows: List[List[Any]] = []
+        for row_idx, row in enumerate(raw_data):
+            formatted_row: List[Any] = []
+            for cell in row:
+                text = str(cell)
+                style = table_header_style if row_idx == 0 else table_cell_style
+                formatted_row.append(Paragraph(text, style))
+            formatted_rows.append(formatted_row)
+        table = Table(formatted_rows, repeatRows=1, colWidths=col_widths)
         table.setStyle(table_style)
         story.append(table)
         story.append(Spacer(1, 8))
@@ -684,7 +728,7 @@ def generate_recap_pdf(
         except Exception:
             image_bytes = None
         if image_bytes:
-            story.append(Paragraph("Graf odchylek vs Master", styles["Heading2"]))
+            story.append(Paragraph("Graf ceny po odečtech", styles["Heading2"]))
             story.append(Spacer(1, 4))
             chart_image = RLImage(io.BytesIO(image_bytes))
             chart_image.drawHeight = 90 * mm
@@ -2707,11 +2751,12 @@ with tab_rekap:
                     if "Master total" in value_cols and "Master total" in main_detail.columns:
                         master_reference = main_detail["Master total"]
                         for col in value_cols:
-                            if col in main_detail.columns:
-                                pct_col = f"{col}{PERCENT_DIFF_SUFFIX}"
-                                main_detail[pct_col] = compute_percent_difference(
-                                    main_detail[col], master_reference
-                                )
+                            if is_master_column(col) or col not in main_detail.columns:
+                                continue
+                            pct_col = f"{col}{PERCENT_DIFF_SUFFIX}"
+                            main_detail[pct_col] = compute_percent_difference(
+                                main_detail[col], master_reference
+                            )
                     main_detail_display_base = rename_value_columns_for_display(
                         main_detail.copy(), f" — CELKEM {base_currency}"
                     )
@@ -2813,11 +2858,11 @@ with tab_rekap:
                 percent_values = percent_row_map.get(label)
                 for col in value_cols:
                     row[col] = working_values.get(col, np.nan)
+                    if is_master_column(col):
+                        continue
                     pct_col = f"{col}{PERCENT_DIFF_SUFFIX}"
                     if percent_values is not None:
                         row[pct_col] = percent_values.get(col, np.nan)
-                    else:
-                        row[pct_col] = np.nan
                 summary_records.append(row)
             summary_base = pd.DataFrame(summary_records)
             if not summary_base.empty:
@@ -2836,12 +2881,83 @@ with tab_rekap:
                     summary_converted.copy(), ""
                 )
                 show_df(summary_display_converted)
+
+                coordination_labels = [
+                    "Koodinační přirážka Nominovaného subdodavatele",
+                    "Koordinační přirážka Přímého dodavatele investora",
+                    "Koordninační přirážka Nominovaného dodavatele standardů/koncových prvků",
+                    "Doba výstavby",
+                ]
+                display_aliases = {str(alias) for alias in display_names.values()}
+                supplier_aliases: List[str] = []
+                for col in value_cols:
+                    if is_master_column(col):
+                        continue
+                    base_name = col[:-len(" total")] if col.endswith(" total") else col
+                    if base_name in display_aliases and base_name not in supplier_aliases:
+                        supplier_aliases.append(base_name)
+                if not supplier_aliases:
+                    for col in value_cols:
+                        if is_master_column(col):
+                            continue
+                        base_name = col[:-len(" total")] if col.endswith(" total") else col
+                        cleaned = str(base_name).strip()
+                        if cleaned and cleaned not in supplier_aliases:
+                            supplier_aliases.append(cleaned)
+                if supplier_aliases:
+                    st.markdown("**Koordinační přirážky a další údaje:**")
+                    storage_key = make_widget_key("recap", "coordination_table_state")
+                    editor_key = make_widget_key("recap", "coordination_table_editor")
+                    base_records: List[Dict[str, Any]] = []
+                    for row_label in coordination_labels:
+                        record: Dict[str, Any] = {"Položka": row_label}
+                        for alias in supplier_aliases:
+                            record[alias] = ""
+                        base_records.append(record)
+                    default_df = pd.DataFrame(base_records)
+                    stored_records = st.session_state.get(storage_key)
+                    if isinstance(stored_records, list):
+                        try:
+                            stored_df = pd.DataFrame(stored_records)
+                        except Exception:
+                            stored_df = pd.DataFrame()
+                        if not stored_df.empty and "Položka" in stored_df.columns:
+                            stored_df = stored_df.set_index("Položka")
+                            stored_df = stored_df.reindex(coordination_labels)
+                            stored_df = stored_df.reindex(columns=supplier_aliases, fill_value="")
+                            stored_df = stored_df.fillna("")
+                            stored_df.index.name = "Položka"
+                            default_df = stored_df.reset_index()
+                    column_config: Dict[str, Any] = {
+                        "Položka": st.column_config.TextColumn("Položka", disabled=True)
+                    }
+                    for alias in supplier_aliases:
+                        column_config[alias] = st.column_config.TextColumn(alias)
+                    coordination_editor = st.data_editor(
+                        default_df,
+                        hide_index=True,
+                        column_config=column_config,
+                        num_rows="fixed",
+                        key=editor_key,
+                    )
+                    if isinstance(coordination_editor, pd.DataFrame):
+                        st.session_state[storage_key] = (
+                            coordination_editor.fillna("").to_dict("records")
+                        )
+                else:
+                    st.info(
+                        "Pro zadání koordinačních přirážek je potřeba mít načtené nabídky dodavatelů."
+                    )
             else:
                 st.info("Souhrnná tabulka nedokázala zpracovat žádná čísla.")
 
             net_chart_series = net_sum.reindex(value_cols) if value_cols else pd.Series(dtype=float)
             if not net_chart_series.dropna().empty:
-                chart_df = build_recap_chart_data(value_cols, net_chart_series)
+                chart_df = build_recap_chart_data(
+                    value_cols,
+                    net_chart_series,
+                    currency_label=base_currency or "CZK",
+                )
                 if not chart_df.empty:
                     try:
                         fig_recap = px.bar(
@@ -2857,8 +2973,8 @@ with tab_rekap:
                             textposition="outside",
                             texttemplate="%{text}",
                             hovertemplate=(
-                                "<b>%{x}</b><br>Cena po odečtech: %{y:,.2f} "
-                                f"{base_currency}<br>Odchylka vs Master: %{text}<extra></extra>"
+                                "<b>%{x}</b><br>"
+                                "Cena po odečtech: %{text}<extra></extra>"
                             ),
                         )
                         fig_recap.update_layout(yaxis_title=f"{base_currency}", showlegend=False)
