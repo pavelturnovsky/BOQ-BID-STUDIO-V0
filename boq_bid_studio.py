@@ -3826,15 +3826,22 @@ with tab_qa:
                 alias = display_names.get(supplier, supplier)
                 st.markdown(f"**{alias}**")
                 display = group.copy()
-                display.rename(
-                    columns={
-                        "code": "Navržený kód",
-                        "description_supplier": "Popis dodavatele",
-                        "total_price_supplier": "Cena dodavatele",
-                    },
-                    inplace=True,
-                )
-                display["Cena dodavatele"] = pd.to_numeric(display["Cena dodavatele"], errors="coerce")
+                rename_map = {"code": "Navržený kód", "total_price_supplier": "Cena dodavatele"}
+                if "description_supplier" in display.columns:
+                    rename_map["description_supplier"] = "Popis dodavatele"
+                elif "description" in display.columns:
+                    rename_map["description"] = "Popis dodavatele"
+                display.rename(columns=rename_map, inplace=True)
+                if "Navržený kód" not in display.columns:
+                    display["Navržený kód"] = ""
+                if "Popis dodavatele" not in display.columns:
+                    display["Popis dodavatele"] = ""
+                if "Cena dodavatele" in display.columns:
+                    display["Cena dodavatele"] = pd.to_numeric(
+                        display["Cena dodavatele"], errors="coerce"
+                    )
+                else:
+                    display["Cena dodavatele"] = np.nan
                 display["AI doporučení"] = display["suggestions"].apply(_format_suggestions)
                 show_df(display[["Navržený kód", "Popis dodavatele", "Cena dodavatele", "AI doporučení"]].head(50))
 
