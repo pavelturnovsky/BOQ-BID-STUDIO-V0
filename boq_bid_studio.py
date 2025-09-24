@@ -19,6 +19,7 @@ from bidstudio.comparison import (
     ComparisonResult,
     compare_bids as engine_compare_bids,
 )
+from bidstudio.io import normalise_dataset_label
 from bidstudio.search import TfidfSearchProvider
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4, landscape
@@ -948,21 +949,26 @@ def coerce_numeric(s: pd.Series) -> pd.Series:
     return pd.to_numeric(cleaned, errors="coerce")
 
 
-def _make_record_key(sheet: str, base_key: Any, order: Any, index: int) -> str:
+def _make_record_key(
+    sheet: str, base_key: Any, order: Any, index: int, *, dataset: str
+) -> str:
     """Create a stable record key combining sheet and canonical key."""
 
     candidate = str(base_key if base_key is not None else "").strip()
     if candidate:
         return f"{sheet}||{candidate}"
 
+    prefix = normalise_dataset_label(dataset)
+    sheet_label = re.sub(r"[^0-9A-Za-z]+", "_", str(sheet or "")).strip("_") or "sheet"
+
     if order is not None and not pd.isna(order):
         try:
             order_int = int(float(order))
         except (TypeError, ValueError):
             order_int = index
-        return f"{sheet}||order_{order_int}"
+        return f"__{prefix}_{sheet_label}_order_{order_int}"
 
-    return f"{sheet}||row_{index}"
+    return f"__{prefix}_{sheet_label}_row_{index}"
 
 
 def _aggregate_table_for_engine(table: pd.DataFrame, *, supplier: bool = False) -> pd.DataFrame:
@@ -1072,7 +1078,9 @@ def _prepare_master_tables(master: WorkbookData, sheets: Sequence[str]) -> Dict[
             continue
         keys = []
         for idx, (base_key, order) in enumerate(zip(aggregated["__key__"], aggregated["source_order"])):
-            keys.append(_make_record_key(sheet, base_key, order, idx))
+            keys.append(
+                _make_record_key(sheet, base_key, order, idx, dataset="master")
+            )
         aggregated["record_key"] = keys
         aggregated["sheet"] = sheet
         tables[sheet] = aggregated
@@ -1091,7 +1099,15 @@ def _prepare_bid_tables(bids: Dict[str, WorkbookData], sheets: Sequence[str]) ->
                 continue
             keys = []
             for idx, (base_key, order) in enumerate(zip(aggregated["__key__"], aggregated["source_order"])):
-                keys.append(_make_record_key(sheet, base_key, order, idx))
+                keys.append(
+                    _make_record_key(
+                        sheet,
+                        base_key,
+                        order,
+                        idx,
+                        dataset=f"bid:{supplier}",
+                    )
+                )
             aggregated["record_key"] = keys
             aggregated["sheet"] = sheet
             per_sheet[sheet] = aggregated

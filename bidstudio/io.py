@@ -68,6 +68,14 @@ HEADER_HINTS: Dict[str, Sequence[str]] = {
 REQUIRED_AUTODETECT_KEYS: Sequence[str] = ("code", "description")
 
 
+def normalise_dataset_label(source: str) -> str:
+    """Return a filesystem-safe identifier for dataset-specific placeholders."""
+
+    text = "" if source is None else str(source)
+    cleaned = re.sub(r"[^0-9A-Za-z]+", "_", text).strip("_")
+    return cleaned or "dataset"
+
+
 def load_master_dataset(
     path: Path,
     columns: ColumnMapping,
@@ -383,6 +391,11 @@ def _ensure_key_columns(
     key_values: List[pd.Series] = []
     for column in key_columns:
         series = frame[column].astype("string").str.strip()
+codex/fix-mapping-between-master-and-supplier-tables-03k78b
+        null_like = series.str.lower().isin({"nan", "none", "nat"})
+        series = series.mask(null_like, pd.NA)
+
+main
         series = series.replace("", pd.NA)
         key_values.append(series.astype(object))
 
@@ -407,7 +420,11 @@ def _ensure_key_columns(
     key_series = key_series.astype(object)
 
     if key_series.isna().any():
+codex/fix-mapping-between-master-and-supplier-tables-03k78b
+        prefix = normalise_dataset_label(source)
+
         prefix = re.sub(r"[^0-9A-Za-z]+", "_", source).strip("_") or "dataset"
+main
         missing_mask = key_series.isna()
         fallback = [
             f"__{prefix}_row_{idx}"
@@ -425,4 +442,5 @@ def _empty_frame() -> pd.DataFrame:
 __all__ = [
     "load_master_dataset",
     "load_bid_dataset",
+    "normalise_dataset_label",
 ]
