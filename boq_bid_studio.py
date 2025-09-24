@@ -8,19 +8,12 @@ import time
 import unicodedata
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 import plotly.express as px
 import streamlit as st
-from bidstudio.comparison import (
-    ComparisonConfig,
-    ComparisonResult,
-    compare_bids as engine_compare_bids,
-)
-from bidstudio.io import normalise_dataset_label
-from bidstudio.search import TfidfSearchProvider
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4, landscape
 from reportlab.lib.styles import getSampleStyleSheet
@@ -156,8 +149,6 @@ RECAP_CATEGORY_CONFIG = [
 
 PERCENT_DIFF_SUFFIX = "_pct_diff"
 PERCENT_DIFF_LABEL = " — ODCHYLKA VS MASTER (%)"
-
-ENGINE_PLACEHOLDER_PREFIX = "__engine_placeholder__::"
 
 
 def ensure_exchange_rate_state(default: float = DEFAULT_EXCHANGE_RATE) -> None:
@@ -346,95 +337,6 @@ def compute_percent_difference(values: pd.Series, reference: Any) -> pd.Series:
         result.loc[zero_mask & zero_values.fillna(np.nan).eq(0)] = 0.0
 
     return result
-
-
-def ensure_percent_columns(
-    df: pd.DataFrame,
-    value_columns: Sequence[str],
-    reference_col: str = "Master total",
-) -> pd.DataFrame:
-    """Add percentage comparison columns relative to ``reference_col``.
-
-    The function augments ``df`` in place and also returns it for convenience.
-    Existing percentage columns are preserved to avoid recomputation when the
-    helper is called repeatedly on the same DataFrame.
-    """
-
-    if df is None or df.empty:
-        return df
-
-    if reference_col not in df.columns:
-        return df
-
-    existing_value_cols = [col for col in value_columns if col in df.columns]
-    if not existing_value_cols:
-        return df
-
-    reference_series = pd.to_numeric(df[reference_col], errors="coerce")
-    for col in existing_value_cols:
-        if col == reference_col:
-            continue
-        pct_col = f"{col}{PERCENT_DIFF_SUFFIX}"
-        if pct_col in df.columns:
-            continue
-        col_values = pd.to_numeric(df[col], errors="coerce")
-        df[pct_col] = compute_percent_difference(col_values, reference_series)
-
-    return df
-
-
-def interleave_percent_columns(
-    df: pd.DataFrame, value_columns: Sequence[str]
-) -> pd.DataFrame:
-    """Ensure percentage columns follow their corresponding value columns."""
-
-    if df is None or df.empty:
-        return df
-
-    value_set = set(value_columns)
-    desired_order: List[str] = []
-    for col in df.columns:
-        desired_order.append(col)
-        if col in value_set:
-            pct_col = f"{col}{PERCENT_DIFF_SUFFIX}"
-            if pct_col in df.columns:
-                desired_order.append(pct_col)
-
-    ordered: List[str] = []
-    for col in desired_order:
-        if col in df.columns and col not in ordered:
-            ordered.append(col)
-
-    for col in df.columns:
-        if col not in ordered:
-            ordered.append(col)
-
-    return df.loc[:, ordered]
-
-
-def drop_percent_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """Return a copy of ``df`` without percentage comparison columns."""
-
-    if df is None or df.empty:
-        return df
-    cols = [col for col in df.columns if not str(col).endswith(PERCENT_DIFF_SUFFIX)]
-    return df.loc[:, cols]
-
-
-def prepare_recap_table_for_display(
-    df: pd.DataFrame,
-    value_columns: Sequence[str],
-    suffix: str,
-    reference_col: str = "Master total",
-) -> pd.DataFrame:
-    """Return a display-ready table with percentage comparisons interleaved."""
-
-    if df is None or df.empty:
-        return df
-    working = df.copy()
-    ensure_percent_columns(working, value_columns, reference_col=reference_col)
-    working = interleave_percent_columns(working, value_columns)
-    return rename_value_columns_for_display(working, suffix)
 
 
 def ensure_unique_aliases(
@@ -640,14 +542,24 @@ def format_timestamp(timestamp: Optional[float]) -> str:
     return dt.strftime("%d.%m.%Y %H:%M")
 
 
-def build_recap_chart_data(
-    value_cols: List[str], net_series: pd.Series, currency: str
-) -> pd.DataFrame:
+def format_percent_label(value: Any) -> str:
+    if pd.isna(value):
+        return "–"
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return str(value)
+    text = f"{numeric:+.2f} %"
+    return text.replace(".", ",")
+
+
+def build_recap_chart_data(value_cols: List[str], net_series: pd.Series) -> pd.DataFrame:
     if not value_cols:
         return pd.DataFrame(
             columns=[
                 "Dodavatel",
                 "Cena po odečtech",
+                "Odchylka vs Master (%)",
                 "Popisek",
             ]
         )
@@ -659,16 +571,28 @@ def build_recap_chart_data(
             "Cena po odečtech": [net_series.get(col) for col in value_cols],
         }
     )
-    chart_df["Cena po odečtech"] = pd.to_numeric(
-        chart_df["Cena po odečtech"], errors="coerce"
-    )
-
-    def _format_label(value: Any) -> str:
-        if pd.isna(value):
-            return ""
-        return f"{format_number(value)} {currency}".strip()
-
-    chart_df["Popisek"] = chart_df["Cena po odečtech"].apply(_format_label)
+    master_mask = chart_df["Dodavatel"].astype(str).str.casefold() == "master"
+    master_val: Optional[float] = None
+    if master_mask.any():
+        master_values = pd.to_numeric(
+            chart_df.loc[master_mask, "Cena po odečtech"], errors="coerce"
+        ).dropna()
+        if not master_values.empty:
+            master_val = float(master_values.iloc[0])
+    deltas: List[float] = []
+    for supplier, value in zip(chart_df["Dodavatel"], chart_df["Cena po odečtech"]):
+        supplier_cf = str(supplier).casefold()
+        if supplier_cf == "master":
+            deltas.append(0.0 if pd.notna(value) else np.nan)
+            continue
+        if master_val is None or pd.isna(value) or math.isclose(
+            master_val, 0.0, rel_tol=1e-9, abs_tol=1e-9
+        ):
+            deltas.append(np.nan)
+            continue
+        deltas.append(((float(value) - master_val) / master_val) * 100.0)
+    chart_df["Odchylka vs Master (%)"] = deltas
+    chart_df["Popisek"] = chart_df["Odchylka vs Master (%)"].apply(format_percent_label)
     return chart_df
 
 
@@ -713,7 +637,6 @@ def generate_recap_pdf(
         topMargin=15 * mm,
         bottomMargin=15 * mm,
     )
-    available_width = doc.width
     styles = getSampleStyleSheet()
     for style_name in ("Normal", "BodyText", "Title", "Heading1", "Heading2", "Heading3"):
         if style_name in styles:
@@ -744,13 +667,7 @@ def generate_recap_pdf(
             return
         story.append(Paragraph(title_text, styles["Heading2"]))
         story.append(Spacer(1, 4))
-        num_columns = len(table_data[0]) if table_data else 0
-        col_widths = (
-            [available_width / num_columns for _ in range(num_columns)]
-            if num_columns
-            else None
-        )
-        table = Table(table_data, repeatRows=1, colWidths=col_widths)
+        table = Table(table_data, repeatRows=1)
         table.setStyle(table_style)
         story.append(table)
         story.append(Spacer(1, 8))
@@ -767,7 +684,7 @@ def generate_recap_pdf(
         except Exception:
             image_bytes = None
         if image_bytes:
-            story.append(Paragraph("Graf cen po odečtech", styles["Heading2"]))
+            story.append(Paragraph("Graf odchylek vs Master", styles["Heading2"]))
             story.append(Spacer(1, 4))
             chart_image = RLImage(io.BytesIO(image_bytes))
             chart_image.drawHeight = 90 * mm
@@ -797,7 +714,6 @@ def generate_tables_pdf(title: str, tables: List[Tuple[str, pd.DataFrame]]) -> b
         topMargin=15 * mm,
         bottomMargin=15 * mm,
     )
-    available_width = doc.width
     styles = getSampleStyleSheet()
     for style_name in ("Normal", "BodyText", "Title", "Heading1", "Heading2", "Heading3"):
         if style_name in styles:
@@ -829,13 +745,7 @@ def generate_tables_pdf(title: str, tables: List[Tuple[str, pd.DataFrame]]) -> b
             continue
         story.append(Paragraph(table_title, styles["Heading2"]))
         story.append(Spacer(1, 4))
-        num_columns = len(table_data[0]) if table_data else 0
-        col_widths = (
-            [available_width / num_columns for _ in range(num_columns)]
-            if num_columns
-            else None
-        )
-        table = Table(table_data, repeatRows=1, colWidths=col_widths)
+        table = Table(table_data, repeatRows=1)
         table.setStyle(table_style)
         story.append(table)
         story.append(Spacer(1, 8))
@@ -947,228 +857,6 @@ def coerce_numeric(s: pd.Series) -> pd.Series:
     cleaned = cleaned.str.replace(",", ".", regex=False)
     cleaned = cleaned.str.replace(r"[.,]$", "", regex=True)
     return pd.to_numeric(cleaned, errors="coerce")
-
-
-def _make_record_key(
-    sheet: str, base_key: Any, order: Any, index: int, *, dataset: str
-) -> str:
-    """Create a stable record key combining sheet and canonical key."""
-
-    candidate = str(base_key if base_key is not None else "").strip()
-    if candidate:
-        return f"{sheet}||{candidate}"
-
-    prefix = normalise_dataset_label(dataset)
-    sheet_label = re.sub(r"[^0-9A-Za-z]+", "_", str(sheet or "")).strip("_") or "sheet"
-
-    if order is not None and not pd.isna(order):
-        try:
-            order_int = int(float(order))
-        except (TypeError, ValueError):
-            order_int = index
-        return f"__{prefix}_{sheet_label}_order_{order_int}"
-
-    return f"__{prefix}_{sheet_label}_row_{index}"
-
-
-def _aggregate_table_for_engine(table: pd.DataFrame, *, supplier: bool = False) -> pd.DataFrame:
-    """Return normalized rows ready for the comparison engine."""
-
-    empty = pd.DataFrame(
-        columns=[
-            "__key__",
-            "code",
-            "description",
-            "unit",
-            "total_price",
-            "source_order",
-            "quantity",
-            "unit_price",
-        ]
-    )
-
-    if not isinstance(table, pd.DataFrame) or table.empty:
-        return empty
-
-    working = table.copy()
-    if "is_summary" in working.columns:
-        working = working[~working["is_summary"].fillna(False).astype(bool)]
-    if working.empty:
-        return empty
-
-    desc_series = working.get("description")
-    if desc_series is None:
-        return empty
-    working = working[desc_series.fillna("").astype(str).str.strip() != ""]
-    if working.empty:
-        return empty
-
-    working["__key__"] = working["__key__"].fillna("").astype(str)
-    working["code"] = working.get("code", pd.Series(index=working.index, dtype=object)).fillna("").astype(str)
-    working["description"] = desc_series.fillna("").astype(str)
-    working["unit"] = working.get("unit", pd.Series(index=working.index, dtype=object)).fillna("").astype(str)
-
-    quantity_column = "quantity_supplier" if supplier and "quantity_supplier" in working.columns else "quantity"
-    working["quantity_value"] = coerce_numeric(working.get(quantity_column, 0)).fillna(0.0)
-    working["total_value"] = coerce_numeric(working.get("total_price", 0)).fillna(0.0)
-
-    price_parts: List[pd.Series] = []
-    for price_col in ("unit_price_material", "unit_price_install"):
-        if price_col in working.columns:
-            price_parts.append(coerce_numeric(working[price_col]))
-    if price_parts:
-        price_sum = sum(price_parts)
-        working["unit_price_value"] = price_sum
-    else:
-        working["unit_price_value"] = np.nan
-
-    qty_nonzero = working["quantity_value"].replace({0: np.nan})
-    with np.errstate(divide="ignore", invalid="ignore"):
-        computed_unit = working["total_value"] / qty_nonzero
-    working["unit_price_value"] = working["unit_price_value"].where(
-        working["unit_price_value"].notna(),
-        computed_unit,
-    )
-
-    if "__row_order__" in working.columns:
-        working["source_order"] = pd.to_numeric(working["__row_order__"], errors="coerce")
-    else:
-        working["source_order"] = np.arange(len(working), dtype=float)
-
-    working["weighted_price"] = working["unit_price_value"] * working["quantity_value"]
-
-    grouped = working.groupby("__key__", sort=False)
-    aggregated = grouped.agg(
-        code=("code", "first"),
-        description=("description", "first"),
-        unit=("unit", "first"),
-        total_price=("total_value", "sum"),
-        source_order=("source_order", "min"),
-    ).reset_index()
-
-    quantity_sum = grouped["quantity_value"].sum().rename("quantity")
-    weighted_sum = grouped["weighted_price"].sum().rename("weighted_price")
-    aggregated = aggregated.merge(quantity_sum, on="__key__", how="left")
-    aggregated = aggregated.merge(weighted_sum, on="__key__", how="left")
-
-    qty = aggregated["quantity"].replace({0: np.nan})
-    with np.errstate(divide="ignore", invalid="ignore"):
-        weighted_unit = aggregated["weighted_price"] / qty
-        fallback_unit = aggregated["total_price"] / qty
-    aggregated["unit_price"] = weighted_unit.where(~weighted_unit.isna(), fallback_unit)
-    aggregated.loc[qty.isna(), "unit_price"] = np.nan
-
-    aggregated.drop(columns=["weighted_price"], inplace=True)
-    aggregated["quantity"] = aggregated["quantity"].fillna(0.0)
-    aggregated["unit_price"] = aggregated["unit_price"].replace({np.inf: np.nan})
-    if aggregated["source_order"].isna().any():
-        filler = pd.Series(np.arange(len(aggregated), dtype=float), index=aggregated.index)
-        aggregated["source_order"] = aggregated["source_order"].combine_first(filler)
-
-    return aggregated
-
-
-def _prepare_master_tables(master: WorkbookData, sheets: Sequence[str]) -> Dict[str, pd.DataFrame]:
-    tables: Dict[str, pd.DataFrame] = {}
-    for sheet in sheets:
-        obj = master.sheets.get(sheet, {})
-        table = obj.get("table", pd.DataFrame())
-        aggregated = _aggregate_table_for_engine(table, supplier=False)
-        if aggregated.empty:
-            continue
-        keys = []
-        for idx, (base_key, order) in enumerate(zip(aggregated["__key__"], aggregated["source_order"])):
-            keys.append(
-                _make_record_key(sheet, base_key, order, idx, dataset="master")
-            )
-        aggregated["record_key"] = keys
-        aggregated["sheet"] = sheet
-        tables[sheet] = aggregated
-    return tables
-
-
-def _prepare_bid_tables(bids: Dict[str, WorkbookData], sheets: Sequence[str]) -> Dict[str, Dict[str, pd.DataFrame]]:
-    tables: Dict[str, Dict[str, pd.DataFrame]] = {}
-    for supplier, workbook in bids.items():
-        per_sheet: Dict[str, pd.DataFrame] = {}
-        for sheet in sheets:
-            obj = workbook.sheets.get(sheet, {})
-            table = obj.get("table", pd.DataFrame())
-            aggregated = _aggregate_table_for_engine(table, supplier=True)
-            if aggregated.empty:
-                continue
-            keys = []
-            for idx, (base_key, order) in enumerate(zip(aggregated["__key__"], aggregated["source_order"])):
-                keys.append(
-                    _make_record_key(
-                        sheet,
-                        base_key,
-                        order,
-                        idx,
-                        dataset=f"bid:{supplier}",
-                    )
-                )
-            aggregated["record_key"] = keys
-            aggregated["sheet"] = sheet
-            per_sheet[sheet] = aggregated
-        tables[supplier] = per_sheet
-    return tables
-
-
-def _build_engine_frames(
-    master_tables: Dict[str, pd.DataFrame],
-    bid_tables: Dict[str, Dict[str, pd.DataFrame]],
-) -> Tuple[pd.DataFrame, List[pd.DataFrame], Dict[str, str], Dict[str, float]]:
-    master_columns = [
-        "record_key",
-        "code",
-        "description",
-        "unit",
-        "quantity",
-        "unit_price",
-        "total_price",
-        "sheet",
-    ]
-    master_frames: List[pd.DataFrame] = []
-    record_to_sheet: Dict[str, str] = {}
-    record_to_order: Dict[str, float] = {}
-
-    for sheet, table in master_tables.items():
-        if table.empty:
-            continue
-        for key, order in zip(table["record_key"], table["source_order"]):
-            record_to_sheet[str(key)] = sheet
-            try:
-                record_to_order[str(key)] = float(order)
-            except (TypeError, ValueError):
-                record_to_order[str(key)] = float("nan")
-        master_frames.append(table[master_columns].copy())
-
-    if master_frames:
-        master_frame = pd.concat(master_frames, ignore_index=True)
-    else:
-        master_frame = pd.DataFrame(columns=master_columns)
-
-    bid_columns = ["supplier", *master_columns]
-    bid_frames: List[pd.DataFrame] = []
-    for supplier, per_sheet in bid_tables.items():
-        frames: List[pd.DataFrame] = []
-        for table in per_sheet.values():
-            if table.empty:
-                continue
-            frames.append(table[master_columns].copy())
-        if frames:
-            combined = pd.concat(frames, ignore_index=True)
-        else:
-            combined = pd.DataFrame(columns=master_columns)
-        combined.insert(0, "supplier", supplier)
-        if combined.empty:
-            combined.loc[0] = [supplier] + [np.nan] * (len(bid_columns) - 1)
-            combined.loc[0, "record_key"] = f"{ENGINE_PLACEHOLDER_PREFIX}{supplier}"  # ensure supplier name propagation
-            combined.loc[0, "sheet"] = ""
-        bid_frames.append(combined[bid_columns])
-
-    return master_frame[master_columns], bid_frames, record_to_sheet, record_to_order
 
 
 def detect_summary_rows(df: pd.DataFrame) -> pd.Series:
@@ -1366,106 +1054,27 @@ def read_workbook(upload, limit_sheets: Optional[List[str]] = None) -> WorkbookD
 
 def apply_master_mapping(master: WorkbookData, target: WorkbookData) -> None:
     """Copy mapping and header row from master workbook into target workbook."""
-
-    def _coerce_index(value: Any) -> int:
-        if isinstance(value, (int, np.integer)):
-            return int(value)
-        if isinstance(value, (float, np.floating)):
-            if math.isnan(float(value)):
-                return -1
-            return int(value)
-        if isinstance(value, str):
-            stripped = value.strip()
-            if not stripped:
-                return -1
-            try:
-                return int(float(stripped))
-            except ValueError:
-                return -1
-        return -1
-
-    def _infer_header_row(raw_df: pd.DataFrame, preferred: int, expected: Sequence[str]) -> int:
-        if 0 <= preferred < len(raw_df):
-            return preferred
-        expected_set = {name for name in expected if name}
-        if not expected_set:
-            return max(0, min(len(raw_df) - 1, preferred)) if len(raw_df) else 0
-        search_limit = min(len(raw_df), 15)
-        best_row = 0
-        best_score = -1
-        for idx in range(search_limit):
-            try:
-                row_values = [
-                    normalize_col(x)
-                    for x in raw_df.iloc[idx].astype(str).tolist()
-                ]
-            except Exception:
-                continue
-            score = sum(1 for name in expected_set if name in row_values)
-            if score > best_score:
-                best_row = idx
-                best_score = score
-                if score == len(expected_set):
-                    break
-        return best_row
-
     for sheet, mobj in master.sheets.items():
         if sheet not in target.sheets:
             continue
         raw = target.sheets[sheet].get("raw")
         mapping = mobj.get("mapping", {})
         header_row = mobj.get("header_row", -1)
-        if not isinstance(raw, pd.DataFrame) or not mapping:
+        if not isinstance(raw, pd.DataFrame) or not mapping or header_row < 0:
             continue
-
-        master_header_names = [normalize_col(x) for x in mobj.get("header_names", [])]
-        if not master_header_names:
-            master_raw = mobj.get("raw")
-            if isinstance(master_raw, pd.DataFrame) and header_row >= 0 and header_row < len(master_raw):
-                master_header_names = [
-                    normalize_col(x) for x in master_raw.iloc[header_row].astype(str).tolist()
-                ]
-
-        preferred_row = _coerce_index(header_row)
-        if preferred_row < 0 and master_header_names:
-            # try to locate the most similar row in target
-            preferred_row = _infer_header_row(raw, 0, master_header_names)
-        elif preferred_row < 0:
-            preferred_row = 0
-
         try:
-            header_candidates = [normalize_col(x) for x in raw.iloc[preferred_row].astype(str).tolist()]
-        except Exception:
-            continue
-
-        header_lookup = {name: idx for idx, name in enumerate(header_candidates) if name}
-
-        remapped: Dict[str, int] = {}
-        for key, original in mapping.items():
-            idx_int = _coerce_index(original)
-            mapped_idx = -1
-            if 0 <= idx_int < len(master_header_names):
-                candidate_name = master_header_names[idx_int]
-                mapped_idx = header_lookup.get(candidate_name, -1)
-            if mapped_idx == -1 and 0 <= idx_int < len(header_candidates):
-                mapped_idx = idx_int
-            remapped[key] = mapped_idx
-
-        try:
-            body = raw.iloc[preferred_row + 1 :].reset_index(drop=True)
-            body.columns = header_candidates
-            table = build_normalized_table(body, remapped)
-        except Exception:
-            continue
-
-        target.sheets[sheet].update(
-            {
-                "mapping": remapped,
-                "header_row": preferred_row,
+            header = [normalize_col(x) for x in raw.iloc[header_row].astype(str).tolist()]
+            body = raw.iloc[header_row+1:].reset_index(drop=True)
+            body.columns = header
+            table = build_normalized_table(body, mapping)
+            target.sheets[sheet].update({
+                "mapping": mapping,
+                "header_row": header_row,
                 "table": table,
-                "header_names": header_candidates,
-            }
-        )
+                "header_names": header,
+            })
+        except Exception:
+            continue
 
 def mapping_ui(
     section_title: str,
@@ -1730,168 +1339,124 @@ def mapping_ui(
             st.markdown("**Normalizovaná tabulka (náhled):**")
             show_df(table.head(50))
     return changed_any
-def compare(
-    master: WorkbookData,
-    bids: Dict[str, WorkbookData],
-    join_mode: str = "auto",
-) -> Tuple[Dict[str, pd.DataFrame], ComparisonResult]:
-    """Compare master workbook with supplier bids per sheet using the engine modules."""
-
-    del join_mode  # maintained for backwards compatibility, engine handles matching
-
-    results: Dict[str, pd.DataFrame] = {}
+def compare(master: WorkbookData, bids: Dict[str, WorkbookData], join_mode: str = "auto") -> Dict[str, pd.DataFrame]:
+    """
+    join_mode: "auto" (Item ID if detekováno, jinak code+description), nebo "code+description".
+    """
+    results = {}
     sheets = list(master.sheets.keys())
-
-    master_tables = _prepare_master_tables(master, sheets)
-    if not master_tables:
-        empty_result = ComparisonResult(
-            items=pd.DataFrame(),
-            summary=pd.DataFrame(),
-            unmatched=pd.DataFrame(),
-            metadata={},
-        )
-        return results, empty_result
-
-    bid_tables = _prepare_bid_tables(bids, sheets)
-    master_frame, bid_frames, record_to_sheet, record_to_order = _build_engine_frames(
-        master_tables, bid_tables
-    )
-
-    if master_frame.empty or not bid_frames:
-        empty_result = ComparisonResult(
-            items=pd.DataFrame(),
-            summary=pd.DataFrame(),
-            unmatched=pd.DataFrame(),
-            metadata={},
-        )
-        return results, empty_result
-
-    comparison_config = ComparisonConfig(
-        key_columns=["record_key"],
-        numeric_columns=["quantity", "total_price"],
-    )
-
-    search_provider = TfidfSearchProvider()
-
-    engine_result = engine_compare_bids(
-        master_frame,
-        bid_frames,
-        comparison_config,
-        search_provider=search_provider,
-        search_fields=["description"],
-        search_top_k=5,
-        search_metadata_fields=["code", "description", "sheet"],
-    )
-
-    items = engine_result.items.copy()
-    if not items.empty:
-        placeholder_mask = items["record_key"].astype(str).str.startswith(ENGINE_PLACEHOLDER_PREFIX)
-        items = items.loc[~placeholder_mask].copy()
-        items["sheet"] = items["record_key"].map(record_to_sheet)
-        items["row_order"] = items["record_key"].map(record_to_order)
-        items = items[items["sheet"].notna()].copy()
-
-    unmatched = engine_result.unmatched.copy()
-    if not unmatched.empty and "record_key" in unmatched.columns:
-        unmatched = unmatched[
-            ~unmatched["record_key"].astype(str).str.startswith(ENGINE_PLACEHOLDER_PREFIX)
-        ].copy()
-
-    filtered_engine_result = ComparisonResult(
-        items=items,
-        summary=engine_result.summary.copy(),
-        unmatched=unmatched,
-        metadata=engine_result.metadata,
-    )
-
-    supplier_names = list(bids.keys())
-
-    for sheet, master_table in master_tables.items():
-        if master_table.empty:
+    for sheet in sheets:
+        mobj = master.sheets.get(sheet, {})
+        mtab = mobj.get("table", pd.DataFrame())
+        if mtab is None or mtab.empty:
             continue
-
-        base = master_table[
-            [
-                "record_key",
-                "__key__",
-                "code",
-                "description",
-                "unit",
-                "quantity",
-                "total_price",
-                "source_order",
-            ]
-        ].copy()
-        base.rename(columns={"total_price": "Master total"}, inplace=True)
-        base["quantity"] = pd.to_numeric(base["quantity"], errors="coerce").fillna(0.0)
-        base.sort_values("source_order", inplace=True)
-
-        sheet_items = items[items["sheet"] == sheet] if not items.empty else pd.DataFrame()
-
-        for supplier in supplier_names:
-            sup_items = sheet_items[sheet_items["supplier"] == supplier].copy()
-            if not sup_items.empty:
-                qty_sup = pd.to_numeric(sup_items.get("quantity_supplier"), errors="coerce")
-                with np.errstate(divide="ignore", invalid="ignore"):
-                    unit_price_sup = np.where(
-                        qty_sup != 0,
-                        sup_items.get("total_price_supplier", np.nan) / qty_sup,
-                        np.nan,
-                    )
-                sup_items["unit_price_supplier"] = unit_price_sup
-                sup_df = sup_items[
-                    [
-                        "record_key",
-                        "quantity_supplier",
-                        "unit_price_supplier",
-                        "total_price_supplier",
-                        "quantity_difference",
-                    ]
-                ].copy()
-            else:
-                sup_df = pd.DataFrame(
-                    {
-                        "record_key": pd.Series(dtype=object),
-                        "quantity_supplier": pd.Series(dtype=float),
-                        "unit_price_supplier": pd.Series(dtype=float),
-                        "total_price_supplier": pd.Series(dtype=float),
-                        "quantity_difference": pd.Series(dtype=float),
-                    }
-                )
-
-            rename_map = {
-                "quantity_supplier": f"{supplier} quantity",
-                "unit_price_supplier": f"{supplier} unit_price",
-                "total_price_supplier": f"{supplier} total",
-                "quantity_difference": f"{supplier} Δ qty",
+        if "is_summary" in mtab.columns:
+            mtab = mtab[~mtab["is_summary"].fillna(False).astype(bool)]
+        mtab = mtab[mtab["description"].astype(str).str.strip() != ""]
+        base = mtab[["__key__", "code", "description", "unit", "quantity", "total_price"]].copy()
+        base["quantity"] = pd.to_numeric(base["quantity"], errors="coerce").fillna(0)
+        base["total_price"] = pd.to_numeric(base["total_price"], errors="coerce").fillna(0)
+        base_grouped = base.groupby("__key__", sort=False, as_index=False).agg(
+            {
+                "code": "first",
+                "description": "first",
+                "unit": "first",
+                "quantity": "sum",
+                "total_price": "sum",
             }
-            sup_df = sup_df.rename(columns=rename_map)
-            base = base.merge(sup_df, on="record_key", how="left")
+        )
+        master_total_sum = base_grouped["total_price"].sum()
+        base_grouped.rename(columns={"total_price": "Master total"}, inplace=True)
+        comp = base_grouped.copy()
 
-        total_cols = [c for c in base.columns if c.endswith(" total") and c != "Master total"]
+        for sup_name, wb in bids.items():
+            tobj = wb.sheets.get(sheet, {})
+            ttab = tobj.get("table", pd.DataFrame())
+            if ttab is None or ttab.empty:
+                comp[f"{sup_name} quantity"] = np.nan
+                comp[f"{sup_name} unit_price"] = np.nan
+                comp[f"{sup_name} total"] = np.nan
+                continue
+            if "is_summary" in ttab.columns:
+                ttab = ttab[~ttab["is_summary"].fillna(False).astype(bool)]
+            ttab = ttab[ttab["description"].astype(str).str.strip() != ""]
+            # join by __key__ (manual mapping already built in normalized table)
+            sup_qty_col = "quantity_supplier" if "quantity_supplier" in ttab.columns else "quantity"
+            cols = [
+                "__key__",
+                sup_qty_col,
+                "unit_price_material",
+                "unit_price_install",
+                "total_price",
+            ]
+            existing_cols = [c for c in cols if c in ttab.columns]
+            tt = ttab[existing_cols].copy()
+            tt[sup_qty_col] = pd.to_numeric(tt[sup_qty_col], errors="coerce")
+            tt["total_price"] = pd.to_numeric(tt["total_price"], errors="coerce").fillna(0)
+            price_cols = [c for c in ["unit_price_material", "unit_price_install"] if c in tt.columns]
+            if price_cols:
+                for col in price_cols:
+                    tt[col] = pd.to_numeric(tt[col], errors="coerce")
+                tt["unit_price_combined"] = tt[price_cols].sum(axis=1, min_count=1)
+            else:
+                tt["unit_price_combined"] = np.nan
+            first_price = (
+                tt.groupby("__key__", sort=False)["unit_price_combined"].first().reset_index(name="first_unit_price")
+            )
+            def _sum_with_min_count(series: pd.Series) -> float:
+                return series.sum(min_count=1)
+
+            tt_grouped = tt.groupby("__key__", sort=False, as_index=False).agg(
+                {
+                    sup_qty_col: _sum_with_min_count,
+                    "total_price": "sum",
+                }
+            )
+            tt_grouped = tt_grouped.merge(first_price, on="__key__", how="left")
+            qty = tt_grouped[sup_qty_col]
+            with np.errstate(divide="ignore", invalid="ignore"):
+                qty_for_division = qty.where(qty != 0)
+                tt_grouped["unit_price_combined"] = tt_grouped["total_price"] / qty_for_division
+            mask = qty_for_division.isna()
+            tt_grouped.loc[mask, "unit_price_combined"] = tt_grouped.loc[mask, "first_unit_price"]
+            tt_grouped.drop(columns=["first_unit_price"], inplace=True)
+            comp = comp.merge(
+                tt_grouped[["__key__", sup_qty_col, "unit_price_combined", "total_price"]],
+                on="__key__",
+                how="left",
+            )
+            comp.rename(columns={
+                sup_qty_col: f"{sup_name} quantity",
+                "unit_price_combined": f"{sup_name} unit_price",
+                "total_price": f"{sup_name} total",
+            }, inplace=True)
+            comp[f"{sup_name} Δ qty"] = comp[f"{sup_name} quantity"] - comp["quantity"]
+
+        total_cols = [c for c in comp.columns if c.endswith(" total") and c != "Master total"]
         if total_cols:
-            base["LOWEST total"] = base[total_cols].min(axis=1, skipna=True)
-            highest_total = base[total_cols].max(axis=1, skipna=True)
-            base["MIDRANGE total"] = (base["LOWEST total"] + highest_total) / 2
-            for col in total_cols:
-                base[f"{col} Δ vs LOWEST"] = base[col] - base["LOWEST total"]
+            comp["LOWEST total"] = comp[total_cols].min(axis=1, skipna=True)
+            highest_total = comp[total_cols].max(axis=1, skipna=True)
+            comp["MIDRANGE total"] = (comp["LOWEST total"] + highest_total) / 2
+            for c in total_cols:
+                comp[f"{c} Δ vs LOWEST"] = comp[c] - comp["LOWEST total"]
 
-            def _valid_totals(row: pd.Series) -> Dict[str, Any]:
-                values: Dict[str, Any] = {}
+            def _valid_supplier_totals(row: pd.Series) -> Dict[str, Any]:
+                values = {}
                 for col in total_cols:
-                    value = row.get(col)
+                    value = row[col]
                     if pd.notna(value):
                         values[col.replace(" total", "")] = value
                 return values
 
-            def _lowest_supplier(row: pd.Series) -> Optional[str]:
-                values = _valid_totals(row)
+            # Which supplier is the lowest per row?
+            def lowest_supplier(row: pd.Series) -> Optional[str]:
+                values = _valid_supplier_totals(row)
                 if not values:
                     return None
                 return min(values, key=values.get)
 
-            def _supplier_range(row: pd.Series) -> Optional[str]:
-                values = _valid_totals(row)
+            def supplier_range(row: pd.Series) -> Optional[str]:
+                values = _valid_supplier_totals(row)
                 if not values:
                     return None
                 lowest = min(values, key=values.get)
@@ -1900,15 +1465,12 @@ def compare(
                     return lowest
                 return f"{lowest} – {highest}"
 
-            base["LOWEST supplier"] = base.apply(_lowest_supplier, axis=1)
-            base["MIDRANGE supplier range"] = base.apply(_supplier_range, axis=1)
+            comp["LOWEST supplier"] = comp.apply(lowest_supplier, axis=1)
+            comp["MIDRANGE supplier range"] = comp.apply(supplier_range, axis=1)
 
-        base.attrs["master_total_sum"] = float(base["Master total"].sum(skipna=True))
-        base.drop(columns=["record_key"], inplace=True)
-        base.reset_index(drop=True, inplace=True)
-        results[sheet] = base
-
-    return results, filtered_engine_result
+        comp.attrs["master_total_sum"] = master_total_sum
+        results[sheet] = comp
+    return results
 
 def summarize(results: Dict[str, pd.DataFrame]) -> pd.DataFrame:
     rows = []
@@ -1917,10 +1479,7 @@ def summarize(results: Dict[str, pd.DataFrame]) -> pd.DataFrame:
             continue
         total_cols = [c for c in df.columns if c.endswith(" total")]
         df = df[df["description"].astype(str).str.strip() != ""]
-        sums: Dict[str, float] = {}
-        for col in total_cols:
-            numeric = pd.to_numeric(df[col], errors="coerce") if col in df else pd.Series(dtype=float)
-            sums[col] = float(numeric.sum(skipna=True)) if not numeric.empty else 0.0
+        sums = {c: df[c].dropna().sum() for c in total_cols}
         row = {"sheet": sheet}
         row.update(sums)
         rows.append(row)
@@ -2817,9 +2376,8 @@ with tab_data:
 
 # Pre-compute comparison results for reuse in tabs (after mapping)
 compare_results: Dict[str, pd.DataFrame] = {}
-comparison_engine_result: Optional[ComparisonResult] = None
 if bids_dict:
-    raw_compare_results, comparison_engine_result = compare(master_wb, bids_dict, join_mode="auto")
+    raw_compare_results = compare(master_wb, bids_dict, join_mode="auto")
     compare_results = {
         sheet: rename_comparison_columns(df, display_names) for sheet, df in raw_compare_results.items()
     }
@@ -3146,10 +2704,16 @@ with tab_rekap:
                     for col in value_cols:
                         if col in main_detail.columns:
                             main_detail[col] = pd.to_numeric(main_detail[col], errors="coerce")
-                    main_detail_display_base = prepare_recap_table_for_display(
-                        main_detail,
-                        value_cols,
-                        f" — CELKEM {base_currency}",
+                    if "Master total" in value_cols and "Master total" in main_detail.columns:
+                        master_reference = main_detail["Master total"]
+                        for col in value_cols:
+                            if col in main_detail.columns:
+                                pct_col = f"{col}{PERCENT_DIFF_SUFFIX}"
+                                main_detail[pct_col] = compute_percent_difference(
+                                    main_detail[col], master_reference
+                                )
+                    main_detail_display_base = rename_value_columns_for_display(
+                        main_detail.copy(), f" — CELKEM {base_currency}"
                     )
                     show_df(main_detail_display_base)
                     converted_main = main_detail.copy()
@@ -3160,10 +2724,8 @@ with tab_rekap:
                                 * conversion_factor
                             )
                     st.markdown(f"**Rekapitulace v {target_currency}:**")
-                    main_detail_display_converted = prepare_recap_table_for_display(
-                        converted_main,
-                        value_cols,
-                        f" — CELKEM {target_currency}",
+                    main_detail_display_converted = rename_value_columns_for_display(
+                        converted_main, f" — CELKEM {target_currency}"
                     )
                     show_df(main_detail_display_converted)
                 else:
@@ -3210,6 +2772,22 @@ with tab_rekap:
                 if pd.notna(base_val) and base_val != 0:
                     ratio_sum[col] = (indirect_val / base_val) * 100 if pd.notna(indirect_val) else np.nan
 
+            percent_row_map: Dict[str, pd.Series] = {}
+            if value_cols and "Master total" in value_cols:
+                reference_index = pd.Index(value_cols)
+                plus_reference = pd.Series(
+                    plus_sum.get("Master total"), index=reference_index, dtype=float
+                )
+                net_reference = pd.Series(
+                    net_sum.get("Master total"), index=reference_index, dtype=float
+                )
+                percent_row_map["Součet kladných položek rekapitulace"] = compute_percent_difference(
+                    plus_sum.reindex(value_cols), plus_reference
+                )
+                percent_row_map["Cena po odečtech"] = compute_percent_difference(
+                    net_sum.reindex(value_cols), net_reference
+                )
+
             if deduction_tokens:
                 formatted_tokens = ", ".join(
                     f"{token}." if str(token).isdigit() else str(token)
@@ -3232,16 +2810,18 @@ with tab_rekap:
                     working_values = values.reindex(value_cols)
                 else:
                     working_values = pd.Series(np.nan, index=value_cols, dtype=float)
+                percent_values = percent_row_map.get(label)
                 for col in value_cols:
                     row[col] = working_values.get(col, np.nan)
+                    pct_col = f"{col}{PERCENT_DIFF_SUFFIX}"
+                    if percent_values is not None:
+                        row[pct_col] = percent_values.get(col, np.nan)
+                    else:
+                        row[pct_col] = np.nan
                 summary_records.append(row)
             summary_base = pd.DataFrame(summary_records)
             if not summary_base.empty:
-                summary_display = prepare_recap_table_for_display(
-                    summary_base,
-                    value_cols,
-                    "",
-                )
+                summary_display = rename_value_columns_for_display(summary_base.copy(), "")
                 show_df(summary_display)
                 summary_converted = summary_base.copy()
                 currency_mask = summary_converted["Jednotka"].str.upper() == "CZK"
@@ -3252,77 +2832,16 @@ with tab_rekap:
                     )
                 summary_converted.loc[currency_mask, "Jednotka"] = target_currency
                 st.markdown(f"**Souhrn v {target_currency}:**")
-                summary_display_converted = prepare_recap_table_for_display(
-                    summary_converted,
-                    value_cols,
-                    "",
+                summary_display_converted = rename_value_columns_for_display(
+                    summary_converted.copy(), ""
                 )
                 show_df(summary_display_converted)
             else:
                 st.info("Souhrnná tabulka nedokázala zpracovat žádná čísla.")
 
-            expected_supplier_totals = {
-                f"{alias} total" for alias in display_names.values()
-            }
-            supplier_columns = [
-                col.replace(" total", "")
-                for col in value_cols
-                if col in expected_supplier_totals
-            ]
-            coordination_rows = [
-                "Koordinační přirážka Nominovaného subdodavatele",
-                "Koordinační přirážka Přímého dodavatele investora",
-                "Koordinační přirážka Nominovaného dodavatele standardů/koncových prvků",
-                "Doba výstavby",
-            ]
-            coordination_state_key = make_widget_key("recap", "coordination_table_state")
-            coordination_editor_key = make_widget_key("recap", "coordination_table_editor")
-            if supplier_columns:
-                st.markdown("### Koordinační přirážky a další údaje")
-                stored_table = st.session_state.get(coordination_state_key)
-                if isinstance(stored_table, pd.DataFrame):
-                    stored_df = stored_table.copy()
-                elif isinstance(stored_table, dict):
-                    stored_df = pd.DataFrame(stored_table)
-                else:
-                    stored_df = pd.DataFrame()
-
-                base_table = pd.DataFrame(index=coordination_rows, columns=supplier_columns)
-                if not base_table.empty:
-                    base_table.loc[:, :] = ""
-
-                if not stored_df.empty:
-                    if "Ukazatel" in stored_df.columns:
-                        stored_df = stored_df.set_index("Ukazatel")
-                    stored_df = stored_df.reindex(coordination_rows)
-                    for col in supplier_columns:
-                        if col in stored_df.columns:
-                            base_table[col] = stored_df[col].fillna("")
-
-                working_table = base_table.reset_index().rename(
-                    columns={"index": "Ukazatel"}
-                )
-                working_table = working_table.fillna("")
-                column_config: Dict[str, Any] = {
-                    "Ukazatel": st.column_config.TextColumn("Ukazatel", disabled=True)
-                }
-                for col in supplier_columns:
-                    column_config[col] = st.column_config.TextColumn(col)
-                edited_table = st.data_editor(
-                    working_table,
-                    hide_index=True,
-                    key=coordination_editor_key,
-                    column_config=column_config,
-                    use_container_width=True,
-                )
-                if isinstance(edited_table, pd.DataFrame):
-                    st.session_state[coordination_state_key] = edited_table.fillna("")
-                else:
-                    st.session_state[coordination_state_key] = pd.DataFrame(edited_table).fillna("")
-
             net_chart_series = net_sum.reindex(value_cols) if value_cols else pd.Series(dtype=float)
             if not net_chart_series.dropna().empty:
-                chart_df = build_recap_chart_data(value_cols, net_chart_series, base_currency)
+                chart_df = build_recap_chart_data(value_cols, net_chart_series)
                 if not chart_df.empty:
                     try:
                         fig_recap = px.bar(
@@ -3339,7 +2858,7 @@ with tab_rekap:
                             texttemplate="%{text}",
                             hovertemplate=(
                                 "<b>%{x}</b><br>Cena po odečtech: %{y:,.2f} "
-                                f"{base_currency}<extra></extra>"
+                                f"{base_currency}<br>Odchylka vs Master: %{text}<extra></extra>"
                             ),
                         )
                         fig_recap.update_layout(yaxis_title=f"{base_currency}", showlegend=False)
@@ -3474,10 +2993,8 @@ with tab_rekap:
                                     )
                             st.markdown("**Vybrané položky:**")
                             show_df(
-                                prepare_recap_table_for_display(
-                                    detail_display,
-                                    value_cols,
-                                    f" — CELKEM {base_currency}",
+                                rename_value_columns_for_display(
+                                    detail_display, f" — CELKEM {base_currency}"
                                 )
                             )
                             totals = sum_for_mask(stored_mask)
@@ -3496,10 +3013,8 @@ with tab_rekap:
                                     )
                             st.markdown("**Součet vybraných položek:**")
                             show_df(
-                                prepare_recap_table_for_display(
-                                    summary_df,
-                                    value_cols,
-                                    f" — CELKEM {base_currency}",
+                                rename_value_columns_for_display(
+                                    summary_df, f" — CELKEM {base_currency}"
                                 )
                             )
                         else:
@@ -3553,13 +3068,7 @@ with tab_rekap:
                         sum_row.update({col: sum_values.get(col, np.nan) for col in value_cols})
                         sum_df = pd.DataFrame([sum_row])
                         st.markdown("**Součet vybrané podsekce:**")
-                        show_df(
-                            prepare_recap_table_for_display(
-                                sum_df,
-                                value_cols,
-                                "",
-                            )
-                        )
+                        show_df(rename_value_columns_for_display(sum_df, ""))
 
                         detail_selection = working_sections.loc[
                             selection_mask, ["code", "description"] + value_cols
@@ -3574,10 +3083,8 @@ with tab_rekap:
                                 )
                         st.markdown("**Detail položek v rámci vybraného kódu:**")
                         show_df(
-                            prepare_recap_table_for_display(
-                                detail_selection,
-                                value_cols,
-                                f" — CELKEM {base_currency}",
+                            rename_value_columns_for_display(
+                                detail_selection, f" — CELKEM {base_currency}"
                             )
                         )
                     else:
@@ -3603,13 +3110,7 @@ with tab_rekap:
                     ve_rows.append(row)
             if ve_rows:
                 ve_df = pd.DataFrame(ve_rows)
-                show_df(
-                    prepare_recap_table_for_display(
-                        ve_df,
-                        value_cols,
-                        "",
-                    )
-                )
+                show_df(rename_value_columns_for_display(ve_df, ""))
             else:
                 st.info("V datech se nenachází žádné položky Value Engineering.")
 
@@ -3647,8 +3148,7 @@ with tab_rekap:
                     }
                     row.update({col: sums.get(col, np.nan) for col in value_cols})
                     rows.append(row)
-                table = pd.DataFrame(rows)
-                return table
+                return pd.DataFrame(rows)
 
             fixed_tables: List[Tuple[str, List[Dict[str, Any]]]] = [
                 (
@@ -3749,11 +3249,7 @@ with tab_rekap:
             for title, items in fixed_tables:
                 st.markdown(f"### {title}")
                 table_df = aggregate_fixed_table(items)
-                display_df = prepare_recap_table_for_display(
-                    table_df,
-                    value_cols,
-                    "",
-                )
+                display_df = rename_value_columns_for_display(table_df.copy(), "")
                 show_df(display_df)
                 if not display_df.empty:
                     pdf_tables.append((title, display_df.copy()))
@@ -3954,53 +3450,6 @@ with tab_qa:
                         st.write("n/a")
                     else:
                         st.write(format_number(diff))
-
-        if comparison_engine_result is not None and not comparison_engine_result.unmatched.empty:
-            st.markdown("### 🔍 Nepřiřazené položky (AI doporučení)")
-            unmatched = comparison_engine_result.unmatched.copy()
-            unmatched["supplier_display"] = unmatched["supplier"].map(display_names).fillna(unmatched["supplier"])
-
-            def _format_suggestions(raw: Any) -> str:
-                if not raw:
-                    return ""
-                formatted: List[str] = []
-                for suggestion in list(raw)[:3]:
-                    code = suggestion.get("code") if isinstance(suggestion, dict) else None
-                    score = suggestion.get("score") if isinstance(suggestion, dict) else None
-                    description = suggestion.get("description") if isinstance(suggestion, dict) else None
-                    if code and score is not None:
-                        try:
-                            formatted.append(f"{code} ({float(score):.2f})")
-                        except (TypeError, ValueError):
-                            formatted.append(f"{code}")
-                    elif code:
-                        formatted.append(str(code))
-                    elif description:
-                        formatted.append(str(description))
-                return "; ".join(formatted)
-
-            for supplier, group in unmatched.groupby("supplier"):
-                alias = display_names.get(supplier, supplier)
-                st.markdown(f"**{alias}**")
-                display = group.copy()
-                rename_map = {"code": "Navržený kód", "total_price_supplier": "Cena dodavatele"}
-                if "description_supplier" in display.columns:
-                    rename_map["description_supplier"] = "Popis dodavatele"
-                elif "description" in display.columns:
-                    rename_map["description"] = "Popis dodavatele"
-                display.rename(columns=rename_map, inplace=True)
-                if "Navržený kód" not in display.columns:
-                    display["Navržený kód"] = ""
-                if "Popis dodavatele" not in display.columns:
-                    display["Popis dodavatele"] = ""
-                if "Cena dodavatele" in display.columns:
-                    display["Cena dodavatele"] = pd.to_numeric(
-                        display["Cena dodavatele"], errors="coerce"
-                    )
-                else:
-                    display["Cena dodavatele"] = np.nan
-                display["AI doporučení"] = display["suggestions"].apply(_format_suggestions)
-                show_df(display[["Navržený kód", "Popis dodavatele", "Cena dodavatele", "AI doporučení"]].head(50))
 
 st.markdown("---")
 st.caption("© 2025 BoQ Bid Studio — MVP. Doporučení: používat jednotné Item ID pro precizní párování.")
