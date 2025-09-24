@@ -974,7 +974,9 @@ def _aggregate_table_for_engine(table: pd.DataFrame, *, supplier: bool = False) 
     aggregated.drop(columns=["weighted_price"], inplace=True)
     aggregated["quantity"] = aggregated["quantity"].fillna(0.0)
     aggregated["unit_price"] = aggregated["unit_price"].replace({np.inf: np.nan})
-    aggregated["source_order"] = aggregated["source_order"].fillna(np.arange(len(aggregated), dtype=float))
+    if aggregated["source_order"].isna().any():
+        filler = pd.Series(np.arange(len(aggregated), dtype=float), index=aggregated.index)
+        aggregated["source_order"] = aggregated["source_order"].combine_first(filler)
 
     return aggregated
 
