@@ -150,6 +150,7 @@ RECAP_CATEGORY_CONFIG = [
 
 PERCENT_DIFF_SUFFIX = "_pct_diff"
 PERCENT_DIFF_LABEL = " — ODCHYLKA VS MASTER (%)"
+UNMAPPED_ROW_LABEL = "Nemapované položky"
 
 
 def is_master_column(column_name: str) -> bool:
@@ -258,6 +259,40 @@ def normalize_text(value: Any) -> str:
     normalized = unicodedata.normalize("NFKD", text)
     without_diacritics = "".join(ch for ch in normalized if not unicodedata.combining(ch))
     return without_diacritics.lower()
+
+
+def normalize_identifier(values: Any) -> pd.Series:
+    """Return normalized textual identifiers for row-level matching."""
+
+    series = values if isinstance(values, pd.Series) else pd.Series(values)
+    if series.empty:
+        return series.astype(str)
+
+    def _normalize(value: Any) -> str:
+        if pd.isna(value):
+            return ""
+        if isinstance(value, (int, np.integer)):
+            return str(int(value))
+        if isinstance(value, (float, np.floating)):
+            float_val = float(value)
+            if math.isfinite(float_val) and float_val.is_integer():
+                return str(int(float_val))
+            return str(float_val).strip()
+        text = str(value).strip()
+        if not text:
+            return ""
+        lowered = text.lower()
+        if lowered in {"nan", "none", "null"}:
+            return ""
+        if re.fullmatch(r"-?\d+\.0+", text):
+            try:
+                return str(int(float(text)))
+            except ValueError:
+                pass
+        return text
+
+    normalized = series.map(_normalize)
+    return normalized.astype(str)
 
 
 def extract_code_token(value: Any) -> str:
@@ -952,6 +987,7 @@ def build_normalized_table(df: pd.DataFrame, mapping: Dict[str, int]) -> pd.Data
     out = pd.DataFrame({
         "code": pick("code", ""),
         "description": pick("description", ""),
+        "item_id": normalize_identifier(pick("item_id", "")),
         "unit": pick("unit", ""),
         "quantity": coerce_numeric(pick("quantity", 0)).fillna(0.0),
         "quantity_supplier": coerce_numeric(pick("quantity_supplier", np.nan)),
@@ -999,6 +1035,12 @@ def build_normalized_table(df: pd.DataFrame, mapping: Dict[str, int]) -> pd.Data
 
     # Filter out rows without description entirely
     out = out[desc_str.str.strip() != ""].copy()
+    if "item_id" in out.columns:
+        item_ids = normalize_identifier(out["item_id"])
+        out["item_id"] = item_ids
+        item_mask = item_ids.str.strip() != ""
+    else:
+        item_mask = pd.Series(False, index=out.index)
     desc_str = out["description"].fillna("").astype(str)
     numeric_cols = out.select_dtypes(include=[np.number]).columns
     summary_col = out["is_summary"].fillna(False).astype(bool)
@@ -1007,6 +1049,10 @@ def build_normalized_table(df: pd.DataFrame, mapping: Dict[str, int]) -> pd.Data
     out["__key__"] = (
         out["code"].astype(str).str.strip() + " | " + desc_str.str.strip()
     ).str.strip(" |")
+    if "item_id" in out.columns:
+        out.loc[item_mask, "__key__"] = out.loc[item_mask, "item_id"]
+        if out["item_id"].str.strip().eq("").all():
+            out.drop(columns=["item_id"], inplace=True)
 
     # Preserve explicit ordering from mapping for later aggregations
     out["__row_order__"] = np.arange(len(out))
@@ -1015,6 +1061,7 @@ def build_normalized_table(df: pd.DataFrame, mapping: Dict[str, int]) -> pd.Data
     col_order = [
         "code",
         "description",
+        "item_id",
         "unit",
         "quantity",
         "quantity_supplier",
@@ -1314,6 +1361,7 @@ def mapping_ui(
                 return idx_int
 
             mapping = {key: sanitize_index(val) for key, val in stored_mapping.items()}
+            mapping.setdefault("item_id", -1)
             prev_mapping = mapping.copy()
 
             # Select boxes for mapping
@@ -1386,6 +1434,7 @@ def mapping_ui(
                     "unit_price_install": -1,
                     "total_price": total_idx,
                     "summary_total": summ_idx,
+                    "item_id": -1,
                 }
             else:
                 c1, c2, c3, c4 = st.columns(4)
@@ -1421,7 +1470,7 @@ def mapping_ui(
                         index=clamp(pick_default("quantity")),
                         key=make_widget_key("map", section_key, sheet_key, "quantity"),
                     )
-                c5, c6, c7, c8, c9 = st.columns(5)
+                c5, c6, c7 = st.columns(3)
                 with c5:
                     qty_sup_idx = st.selectbox(
                         "Sloupec: quantity_supplier",
@@ -1446,6 +1495,7 @@ def mapping_ui(
                         index=clamp(pick_default("unit_price_install")),
                         key=make_widget_key("map", section_key, sheet_key, "unit_price_install"),
                     )
+                c8, c9, c10 = st.columns(3)
                 with c8:
                     total_idx = st.selectbox(
                         "Sloupec: total_price",
@@ -1462,6 +1512,14 @@ def mapping_ui(
                         index=clamp(pick_default("summary_total")),
                         key=make_widget_key("map", section_key, sheet_key, "summary_total"),
                     )
+                with c10:
+                    item_idx = st.selectbox(
+                        "Sloupec: item_id",
+                        cols,
+                        format_func=lambda i: header_names[i] if i < len(header_names) else "",
+                        index=clamp(pick_default("item_id")),
+                        key=make_widget_key("map", section_key, sheet_key, "item_id"),
+                    )
 
                 ui_mapping = {
                     "code": code_idx,
@@ -1473,6 +1531,7 @@ def mapping_ui(
                     "unit_price_install": upi_idx,
                     "total_price": total_idx,
                     "summary_total": summ_idx,
+                    "item_id": item_idx,
                 }
             if isinstance(raw, pd.DataFrame):
                 body = raw.iloc[header_row+1:].reset_index(drop=True)
@@ -1505,22 +1564,34 @@ def compare(master: WorkbookData, bids: Dict[str, WorkbookData], join_mode: str 
         if "is_summary" in mtab.columns:
             mtab = mtab[~mtab["is_summary"].fillna(False).astype(bool)]
         mtab = mtab[mtab["description"].astype(str).str.strip() != ""]
-        base = mtab[["__key__", "code", "description", "unit", "quantity", "total_price"]].copy()
-        base["quantity"] = pd.to_numeric(base["quantity"], errors="coerce").fillna(0)
-        base["total_price"] = pd.to_numeric(base["total_price"], errors="coerce").fillna(0)
-        base_grouped = base.groupby("__key__", sort=False, as_index=False).agg(
-            {
-                "code": "first",
-                "description": "first",
-                "unit": "first",
-                "quantity": "sum",
-                "total_price": "sum",
-            }
-        )
+        base_cols = ["__key__", "code", "description", "unit", "quantity", "total_price"]
+        if "item_id" in mtab.columns:
+            base_cols.insert(1, "item_id")
+        existing_base_cols = [col for col in base_cols if col in mtab.columns]
+        base = mtab[existing_base_cols].copy()
+        if "quantity" in base.columns:
+            base["quantity"] = pd.to_numeric(base["quantity"], errors="coerce").fillna(0)
+        else:
+            base["quantity"] = 0
+        if "total_price" in base.columns:
+            base["total_price"] = pd.to_numeric(base["total_price"], errors="coerce").fillna(0)
+        else:
+            base["total_price"] = 0
+        agg_mapping = {
+            "code": "first",
+            "description": "first",
+            "unit": "first",
+            "quantity": "sum",
+            "total_price": "sum",
+        }
+        if "item_id" in base.columns:
+            agg_mapping["item_id"] = "first"
+        base_grouped = base.groupby("__key__", sort=False, as_index=False).agg(agg_mapping)
         master_total_sum = base_grouped["total_price"].sum()
         base_grouped.rename(columns={"total_price": "Master total"}, inplace=True)
         comp = base_grouped.copy()
 
+        supplier_totals: Dict[str, float] = {}
         for sup_name, wb in bids.items():
             tobj = wb.sheets.get(sheet, {})
             ttab = tobj.get("table", pd.DataFrame())
@@ -1541,6 +1612,8 @@ def compare(master: WorkbookData, bids: Dict[str, WorkbookData], join_mode: str 
                 "unit_price_install",
                 "total_price",
             ]
+            if "item_id" in ttab.columns:
+                cols.append("item_id")
             existing_cols = [c for c in cols if c in ttab.columns]
             tt = ttab[existing_cols].copy()
             tt[sup_qty_col] = pd.to_numeric(tt[sup_qty_col], errors="coerce")
@@ -1552,6 +1625,7 @@ def compare(master: WorkbookData, bids: Dict[str, WorkbookData], join_mode: str 
                 tt["unit_price_combined"] = tt[price_cols].sum(axis=1, min_count=1)
             else:
                 tt["unit_price_combined"] = np.nan
+            supplier_totals[sup_name] = float(tt["total_price"].sum())
             first_price = (
                 tt.groupby("__key__", sort=False)["unit_price_combined"].first().reset_index(name="first_unit_price")
             )
@@ -1583,6 +1657,34 @@ def compare(master: WorkbookData, bids: Dict[str, WorkbookData], join_mode: str 
                 "total_price": f"{sup_name} total",
             }, inplace=True)
             comp[f"{sup_name} Δ qty"] = comp[f"{sup_name} quantity"] - comp["quantity"]
+
+        for sup_name, total_sum in supplier_totals.items():
+            col = f"{sup_name} total"
+            if col not in comp.columns:
+                continue
+            mapped_series = pd.to_numeric(comp[col], errors="coerce")
+            mapped_sum = mapped_series.sum(min_count=1)
+            mapped_sum = float(mapped_sum) if pd.notna(mapped_sum) else 0.0
+            diff = float(total_sum - mapped_sum)
+            if math.isclose(diff, 0.0, rel_tol=1e-9, abs_tol=1e-6):
+                continue
+            extra_row: Dict[str, Any] = {c: np.nan for c in comp.columns}
+            extra_row["__key__"] = f"__UNMAPPED__::{sup_name}"
+            if "code" in extra_row:
+                extra_row["code"] = ""
+            if "description" in extra_row:
+                extra_row["description"] = f"{UNMAPPED_ROW_LABEL} ({sup_name})"
+            if "unit" in extra_row:
+                extra_row["unit"] = ""
+            if "quantity" in extra_row:
+                extra_row["quantity"] = np.nan
+            if "item_id" in extra_row:
+                extra_row["item_id"] = ""
+            extra_row[col] = diff
+            comp = pd.concat([comp, pd.DataFrame([extra_row])], ignore_index=True)
+
+        if supplier_totals:
+            comp.attrs.setdefault("supplier_totals", {}).update(supplier_totals)
 
         total_cols = [c for c in comp.columns if c.endswith(" total") and c != "Master total"]
         if total_cols:
@@ -1650,6 +1752,11 @@ def rename_comparison_columns(df: pd.DataFrame, mapping: Dict[str, str]) -> pd.D
         rename_map[f"{raw} Δ qty"] = f"{alias} Δ qty"
         rename_map[f"{raw} Δ vs LOWEST"] = f"{alias} Δ vs LOWEST"
     renamed = df.rename(columns=rename_map).copy()
+    if "supplier_totals" in df.attrs:
+        renamed_totals = {
+            mapping.get(raw, raw): total for raw, total in df.attrs.get("supplier_totals", {}).items()
+        }
+        renamed.attrs["supplier_totals"] = renamed_totals
     if "LOWEST supplier" in renamed.columns or "MIDRANGE supplier range" in renamed.columns:
 
         def _map_supplier_name(value: Any) -> Any:
@@ -1687,6 +1794,21 @@ def rename_comparison_columns(df: pd.DataFrame, mapping: Dict[str, str]) -> pd.D
             renamed["MIDRANGE supplier range"] = renamed["MIDRANGE supplier range"].apply(
                 _map_supplier_range
             )
+    if "description" in renamed.columns:
+
+        def _replace_unmapped_description(value: Any) -> Any:
+            if not isinstance(value, str) or UNMAPPED_ROW_LABEL not in value:
+                return value
+            updated = value
+            for raw, alias in mapping.items():
+                updated = re.sub(
+                    rf"\({re.escape(raw)}\)",
+                    f"({alias})",
+                    updated,
+                )
+            return updated
+
+        renamed["description"] = renamed["description"].apply(_replace_unmapped_description)
     return renamed
 
 
@@ -1775,6 +1897,10 @@ def overview_comparison(
     if "__row_order__" not in mtab.columns:
         mtab["__row_order__"] = np.arange(len(mtab))
     mtab["total_for_sum"] = mtab["total_price"].fillna(0)
+    if "item_id" in mtab.columns:
+        master_item_ids = normalize_identifier(mtab["item_id"])
+    else:
+        master_item_ids = pd.Series(["" for _ in range(len(mtab))], index=mtab.index, dtype=object)
 
     master_key_df = pd.DataFrame(
         {
@@ -1790,8 +1916,31 @@ def overview_comparison(
     mtab["__line_id__"] = (
         master_key_df.groupby(["__code_key__", "__desc_key__"], sort=False).cumcount()
     )
+    fallback_join = (
+        master_key_df["__code_key__"].astype(str).str.strip()
+        + "||"
+        + master_key_df["__desc_key__"].astype(str).str.strip()
+        + "||"
+        + mtab["__line_id__"].astype(str)
+    )
+    master_join_key = master_item_ids.astype(str).str.strip()
+    master_join_key = master_join_key.where(master_join_key != "", fallback_join)
 
-    df = mtab[["code", "description", "__row_order__", "__line_id__", "total_for_sum"]].copy()
+    base_columns = ["code", "description", "item_id", "__row_order__", "__line_id__", "total_for_sum"]
+    base_existing = [col for col in base_columns if col in mtab.columns or col == "item_id"]
+    df = mtab[[col for col in base_existing if col in mtab.columns]].copy()
+    if "item_id" not in df.columns:
+        df["item_id"] = master_item_ids.values
+    else:
+        df["item_id"] = master_item_ids.values
+    if df["item_id"].astype(str).str.strip().eq("").all():
+        df.drop(columns=["item_id"], inplace=True)
+    df["__join_key__"] = master_join_key.values
+    ordered_cols = ["code", "description"]
+    if "item_id" in df.columns:
+        ordered_cols.append("item_id")
+    ordered_cols.extend(["__row_order__", "__line_id__", "total_for_sum", "__join_key__"])
+    df = df[ordered_cols]
     df.rename(columns={"total_for_sum": "Master total"}, inplace=True)
 
     for sup_name, wb in bids.items():
@@ -1808,6 +1957,10 @@ def overview_comparison(
                 ttab = ttab[~ttab["is_summary"].fillna(False).astype(bool)]
             ttab = ttab.copy()
             ttab["total_for_sum"] = ttab["total_price"].fillna(0)
+            if "item_id" in ttab.columns:
+                supplier_item_ids = normalize_identifier(ttab["item_id"])
+            else:
+                supplier_item_ids = pd.Series(["" for _ in range(len(ttab))], index=ttab.index, dtype=object)
             supplier_key_df = pd.DataFrame(
                 {
                     "__code_key__": ttab.get("code", pd.Series(index=ttab.index, dtype=object))
@@ -1822,12 +1975,26 @@ def overview_comparison(
             ttab["__line_id__"] = (
                 supplier_key_df.groupby(["__code_key__", "__desc_key__"], sort=False).cumcount()
             )
-            tdf = ttab[["code", "description", "__line_id__", "total_for_sum"]].copy()
+            fallback_join = (
+                supplier_key_df["__code_key__"].astype(str).str.strip()
+                + "||"
+                + supplier_key_df["__desc_key__"].astype(str).str.strip()
+                + "||"
+                + ttab["__line_id__"].astype(str)
+            )
+            supplier_join_key = supplier_item_ids.astype(str).str.strip()
+            supplier_join_key = supplier_join_key.where(supplier_join_key != "", fallback_join)
+            ttab["__join_key__"] = supplier_join_key.values
+            tdf = ttab[["__join_key__", "total_for_sum"]].copy()
             tdf.rename(columns={"total_for_sum": f"{sup_name} total"}, inplace=True)
-            df = df.merge(tdf, on=["code", "description", "__line_id__"], how="left")
+            df = df.merge(tdf, on="__join_key__", how="left")
 
     total_cols = [c for c in df.columns if c.endswith(" total")]
-    view_cols = ["code", "description", "__row_order__", "__line_id__"] + total_cols
+    base_view_cols = ["code", "description"]
+    if "item_id" in df.columns:
+        base_view_cols.append("item_id")
+    base_view_cols.extend(["__row_order__", "__line_id__"])
+    view_cols = base_view_cols + total_cols
     view = df[view_cols].copy()
     view["code"] = view["code"].fillna("").astype(str)
     view["description"] = view["description"].fillna("").astype(str)
