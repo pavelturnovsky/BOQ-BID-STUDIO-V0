@@ -295,6 +295,24 @@ def test_calc_total_no_fallback_to_total_price() -> None:
     assert out["total_price"].sum() == 50
 
 
+def test_build_normalized_table_item_id_overrides_key() -> None:
+    df = pd.DataFrame(
+        {
+            "item id": ["ROW-1", ""],
+            "code": ["1", "2"],
+            "description": ["first", "second"],
+            "total price": ["10", "20"],
+        }
+    )
+    mapping = {"item_id": 0, "code": 1, "description": 2, "total_price": 3}
+    out = module.build_normalized_table(df, mapping)
+    assert "item_id" in out.columns
+    assert out.loc[0, "item_id"] == "ROW-1"
+    assert out.loc[0, "__key__"] == "ROW-1"
+    # fallback to code | description when item_id missing
+    assert out.loc[1, "__key__"] == "2 | second"
+
+
 def test_summary_keyword_requires_structural_hint() -> None:
     df = pd.DataFrame(
         {
@@ -531,3 +549,96 @@ def test_overview_comparison_missing_and_indirect_total() -> None:
     mtot = indirect_total.set_index("supplier").loc["Master", "total"]
     btot = indirect_total.set_index("supplier").loc["B", "total"]
     assert mtot == 5 and btot == 7
+
+
+def test_compare_prefers_item_id_when_joining() -> None:
+    master_table = module.build_normalized_table(
+        pd.DataFrame(
+            {
+                "item id": ["A1", "B2"],
+                "code": ["M-1", "M-2"],
+                "description": ["Master A", "Master B"],
+                "total price": ["100", "200"],
+            }
+        ),
+        {"item_id": 0, "code": 1, "description": 2, "total_price": 3},
+    )
+    supplier_table = module.build_normalized_table(
+        pd.DataFrame(
+            {
+                "item id": ["A1", "B2"],
+                "code": ["S-100", "S-200"],
+                "description": ["Supplier A", "Supplier B"],
+                "total price": ["110", "210"],
+            }
+        ),
+        {"item_id": 0, "code": 1, "description": 2, "total_price": 3},
+    )
+    master = WorkbookData(name="Master", sheets={"Sheet": {"table": master_table}})
+    supplier = WorkbookData(name="Sup", sheets={"Sheet": {"table": supplier_table}})
+    results = module.compare(master, {"Supplier": supplier})
+    df = results["Sheet"]
+    assert np.isclose(df.loc[df["code"] == "M-1", "Supplier total"].iloc[0], 110)
+    assert np.isclose(df.loc[df["code"] == "M-2", "Supplier total"].iloc[0], 210)
+
+
+def test_compare_adds_unmapped_supplier_rows() -> None:
+    master_table = module.build_normalized_table(
+        pd.DataFrame(
+            {
+                "code": ["1"],
+                "description": ["Master"],
+                "total price": ["120"],
+            }
+        ),
+        {"code": 0, "description": 1, "total_price": 2},
+    )
+    supplier_table = module.build_normalized_table(
+        pd.DataFrame(
+            {
+                "code": ["X", "Y"],
+                "description": ["Match", "Extra"],
+                "total price": ["130", "10"],
+            }
+        ),
+        {"code": 0, "description": 1, "total_price": 2},
+    )
+    master = WorkbookData(name="Master", sheets={"Sheet": {"table": master_table}})
+    supplier = WorkbookData(name="Sup", sheets={"Sheet": {"table": supplier_table}})
+    results = module.compare(master, {"Supplier": supplier})
+    df = results["Sheet"]
+    unmatched = df[df["description"].astype(str).str.contains(module.UNMAPPED_ROW_LABEL)]
+    assert unmatched.shape[0] == 1
+    total_series = pd.to_numeric(df["Supplier total"], errors="coerce")
+    assert np.isclose(total_series.sum(), 140)
+    assert np.isclose(df.attrs.get("supplier_totals", {}).get("Supplier", 0), 140)
+
+
+def test_overview_comparison_uses_item_id_for_join() -> None:
+    master_table = module.build_normalized_table(
+        pd.DataFrame(
+            {
+                "item id": ["X1"],
+                "code": ["1"],
+                "description": ["Master item"],
+                "total price": ["50"],
+            }
+        ),
+        {"item_id": 0, "code": 1, "description": 2, "total_price": 3},
+    )
+    supplier_table = module.build_normalized_table(
+        pd.DataFrame(
+            {
+                "item id": ["X1"],
+                "code": ["99"],
+                "description": ["Supplier item"],
+                "total price": ["55"],
+            }
+        ),
+        {"item_id": 0, "code": 1, "description": 2, "total_price": 3},
+    )
+    master = WorkbookData(name="Master", sheets={"Sheet": {"table": master_table}})
+    supplier = WorkbookData(name="Sup", sheets={"Sheet": {"table": supplier_table}})
+    sections, _, _, _, _ = module.overview_comparison(master, {"Supplier": supplier}, "Sheet")
+    assert not sections.empty
+    assert np.isclose(sections.loc[0, "Supplier total"], 55)
