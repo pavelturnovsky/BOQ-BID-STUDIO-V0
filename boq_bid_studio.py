@@ -56,15 +56,17 @@ HEADER_HINTS = {
     "quantity": ["quantity", "qty", "množství", "mnozstvi", "q"],
     # optional extras commonly seen
     "item_id": [
+        "celková cena",
+        "celkova cena",
         "item id",
         "itemid",
         "id položky",
         "id polozky",
-        "kod",
-        "kód",
         "číslo položky",
         "cislo polozky",
         "regex:^id$",
+        "kod",
+        "kód",
     ],
     # extended optional columns for richer comparisons
     "quantity_supplier": [
@@ -327,24 +329,6 @@ def natural_sort_key(value: str) -> Tuple[Any, ...]:
     return tuple(key)
 
 
-def rename_value_columns_for_display(df: pd.DataFrame, suffix: str) -> pd.DataFrame:
-    """Rename columns ending with " total" to include a human friendly suffix.
-
-    Columns produced for percentage comparisons are also converted into a human
-    readable label so that tables clearly indicate the percentage difference
-    versus Master.
-    """
-
-    rename_map: Dict[str, str] = {}
-    for col in df.columns:
-        if col.endswith(" total") and not col.startswith("__present__"):
-            rename_map[col] = f"{col.replace(' total', '')}{suffix}"
-        elif col.endswith(PERCENT_DIFF_SUFFIX):
-            base = col[: -len(PERCENT_DIFF_SUFFIX)].replace(" total", "")
-            rename_map[col] = f"{base}{PERCENT_DIFF_LABEL}"
-    return df.rename(columns=rename_map)
-
-
 def compute_percent_difference(values: pd.Series, reference: Any) -> pd.Series:
     """Return percentage difference of ``values`` relative to ``reference``.
 
@@ -382,6 +366,84 @@ def compute_percent_difference(values: pd.Series, reference: Any) -> pd.Series:
         result.loc[zero_mask & zero_values.fillna(np.nan).eq(0)] = 0.0
 
     return result
+
+
+def add_percent_difference_columns(
+    df: pd.DataFrame, reference_column: str = "Master total"
+) -> pd.DataFrame:
+    """Return a copy with percent differences adjacent to value columns."""
+
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return df
+
+    working = df.copy()
+    if reference_column not in working.columns:
+        return working
+
+    reference_series = pd.to_numeric(working[reference_column], errors="coerce")
+    value_columns = [
+        col
+        for col in list(working.columns)
+        if col.endswith(" total")
+        and not col.startswith("__present__")
+        and col != reference_column
+    ]
+
+    for col in value_columns:
+        pct_col = f"{col}{PERCENT_DIFF_SUFFIX}"
+        if pct_col in working.columns:
+            continue
+        pct_values = compute_percent_difference(working[col], reference_series)
+        insert_at = working.columns.get_loc(col) + 1
+        working.insert(insert_at, pct_col, pct_values)
+
+    return working
+
+
+def rename_value_columns_for_display(df: pd.DataFrame, suffix: str) -> pd.DataFrame:
+    """Rename numeric value columns for display, including percent deltas."""
+
+    if not isinstance(df, pd.DataFrame):
+        return df
+
+    prepared = add_percent_difference_columns(df)
+    rename_map: Dict[str, str] = {}
+    for col in prepared.columns:
+        if col.endswith(" total") and not col.startswith("__present__"):
+            rename_map[col] = f"{col.replace(' total', '')}{suffix}"
+        elif col.endswith(PERCENT_DIFF_SUFFIX):
+            base = col[: -len(PERCENT_DIFF_SUFFIX)]
+            label = base.replace(" total", "")
+            if suffix:
+                label = f"{label}{suffix}"
+            rename_map[col] = f"{label}{PERCENT_DIFF_LABEL}"
+    return prepared.rename(columns=rename_map)
+
+
+def compute_display_column_widths(
+    df: pd.DataFrame, min_width: int = 90, max_width: int = 420
+) -> Dict[str, int]:
+    """Return pixel widths for columns based on the longest textual value."""
+
+    widths: Dict[str, int] = {}
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return widths
+
+    for col in df.columns:
+        series = df[col]
+        try:
+            as_text = series.astype(str).replace("nan", "")
+        except Exception:
+            as_text = series
+        if hasattr(as_text, "map"):
+            max_length = as_text.map(lambda x: len(str(x))).max()
+        else:
+            max_length = len(str(as_text))
+        header_length = len(str(col))
+        effective_len = max(int(max_length or 0), header_length)
+        width_px = max(min_width, min(max_width, (effective_len + 1) * 9))
+        widths[col] = int(width_px)
+    return widths
 
 
 def ensure_unique_aliases(
@@ -888,25 +950,32 @@ def try_autodetect_mapping(df: pd.DataFrame) -> Tuple[Dict[str, int], int, pd.Da
             regex_terms = patterns.get("regex", [])
             contains_terms = patterns.get("contains", [])
 
-            exact_mask = pd.Series(False, index=row.index)
+            matched_idx: Optional[int] = None
             for term in exact_terms:
-                exact_mask = exact_mask | (row == term)
-            if exact_mask.any():
-                mapping[key] = exact_mask.idxmax()
+                term_mask = row == term
+                if term_mask.any():
+                    matched_idx = term_mask.idxmax()
+                    break
+            if matched_idx is not None:
+                mapping[key] = matched_idx
                 continue
 
-            regex_mask = pd.Series(False, index=row.index)
             for pattern in regex_terms:
-                regex_mask = regex_mask | row.str.contains(pattern, regex=True, na=False)
-            if regex_mask.any():
-                mapping[key] = regex_mask.idxmax()
+                regex_mask = row.str.contains(pattern, regex=True, na=False)
+                if regex_mask.any():
+                    matched_idx = regex_mask.idxmax()
+                    break
+            if matched_idx is not None:
+                mapping[key] = matched_idx
                 continue
 
-            contains_mask = pd.Series(False, index=row.index)
             for pattern in contains_terms:
-                contains_mask = contains_mask | row.str.contains(pattern, regex=True, na=False)
-            if contains_mask.any():
-                mapping[key] = contains_mask.idxmax()
+                contains_mask = row.str.contains(pattern, regex=True, na=False)
+                if contains_mask.any():
+                    matched_idx = contains_mask.idxmax()
+                    break
+            if matched_idx is not None:
+                mapping[key] = matched_idx
         return mapping
 
     mappings = sample.apply(detect_row, axis=1)
@@ -1133,6 +1202,14 @@ def show_df(df: pd.DataFrame) -> None:
         presence_display[display_col] = series.reindex(df_to_show.index).fillna(False)
 
     numeric_cols = df_to_show.select_dtypes(include=[np.number]).columns
+    column_widths = compute_display_column_widths(df_to_show)
+    column_config = {
+        col: st.column_config.Column(width=width)
+        for col, width in column_widths.items()
+    }
+    display_kwargs = {"use_container_width": True}
+    if column_config:
+        display_kwargs["column_config"] = column_config
 
     def _apply_presence_styles(data: pd.DataFrame, presence_info: Dict[str, pd.Series]) -> pd.DataFrame:
         styles = pd.DataFrame("", index=data.index, columns=data.columns)
@@ -1173,7 +1250,7 @@ def show_df(df: pd.DataFrame) -> None:
 
     needs_styler = bool(len(numeric_cols)) or bool(presence_display)
     if not needs_styler:
-        st.dataframe(df_to_show)
+        st.dataframe(df_to_show, **display_kwargs)
         return
 
     styler = df_to_show.style
@@ -1183,7 +1260,24 @@ def show_df(df: pd.DataFrame) -> None:
         styler = styler.apply(
             lambda data: _apply_presence_styles(data, presence_display), axis=None
         )
-    st.dataframe(styler)
+    header_styles: List[Dict[str, str]] = []
+    for idx, col in enumerate(df_to_show.columns):
+        width = column_widths.get(col)
+        if not width:
+            continue
+        styler = styler.set_properties(
+            subset=pd.IndexSlice[:, col],
+            **{"min-width": f"{width}px", "max-width": f"{width}px"},
+        )
+        header_styles.append(
+            {
+                "selector": f"th.col_heading.level0.col{idx}",
+                "props": f"min-width: {width}px; max-width: {width}px;",
+            }
+        )
+    if header_styles:
+        styler = styler.set_table_styles(header_styles, overwrite=False)
+    st.dataframe(styler, **display_kwargs)
 
 @st.cache_data
 def read_workbook(upload, limit_sheets: Optional[List[str]] = None) -> WorkbookData:
@@ -3193,15 +3287,6 @@ with tab_rekap:
                     for col in value_cols:
                         if col in main_detail.columns:
                             main_detail[col] = pd.to_numeric(main_detail[col], errors="coerce")
-                    if "Master total" in value_cols and "Master total" in main_detail.columns:
-                        master_reference = main_detail["Master total"]
-                        for col in value_cols:
-                            if is_master_column(col) or col not in main_detail.columns:
-                                continue
-                            pct_col = f"{col}{PERCENT_DIFF_SUFFIX}"
-                            main_detail[pct_col] = compute_percent_difference(
-                                main_detail[col], master_reference
-                            )
                     main_detail_display_base = rename_value_columns_for_display(
                         main_detail.copy(), f" — CELKEM {base_currency}"
                     )
@@ -3262,22 +3347,6 @@ with tab_rekap:
                 if pd.notna(base_val) and base_val != 0:
                     ratio_sum[col] = (indirect_val / base_val) * 100 if pd.notna(indirect_val) else np.nan
 
-            percent_row_map: Dict[str, pd.Series] = {}
-            if value_cols and "Master total" in value_cols:
-                reference_index = pd.Index(value_cols)
-                plus_reference = pd.Series(
-                    plus_sum.get("Master total"), index=reference_index, dtype=float
-                )
-                net_reference = pd.Series(
-                    net_sum.get("Master total"), index=reference_index, dtype=float
-                )
-                percent_row_map["Součet kladných položek rekapitulace"] = compute_percent_difference(
-                    plus_sum.reindex(value_cols), plus_reference
-                )
-                percent_row_map["Cena po odečtech"] = compute_percent_difference(
-                    net_sum.reindex(value_cols), net_reference
-                )
-
             if deduction_tokens:
                 formatted_tokens = ", ".join(
                     f"{token}." if str(token).isdigit() else str(token)
@@ -3300,14 +3369,8 @@ with tab_rekap:
                     working_values = values.reindex(value_cols)
                 else:
                     working_values = pd.Series(np.nan, index=value_cols, dtype=float)
-                percent_values = percent_row_map.get(label)
                 for col in value_cols:
                     row[col] = working_values.get(col, np.nan)
-                    if is_master_column(col):
-                        continue
-                    pct_col = f"{col}{PERCENT_DIFF_SUFFIX}"
-                    if percent_values is not None:
-                        row[pct_col] = percent_values.get(col, np.nan)
                 summary_records.append(row)
             summary_base = pd.DataFrame(summary_records)
             if not summary_base.empty:
