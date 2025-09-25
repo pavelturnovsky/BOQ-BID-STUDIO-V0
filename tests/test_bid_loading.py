@@ -5,6 +5,7 @@ import types
 from pathlib import Path
 import pandas as pd
 import numpy as np
+import pytest
 
 # Ensure project root on path for imports
 ROOT = Path(__file__).resolve().parent.parent
@@ -77,6 +78,31 @@ def test_autodetect_summary_total() -> None:
     ])
     mapping, hdr, body = module.try_autodetect_mapping(df)
     assert mapping["summary_total"] == 2
+
+
+def test_autodetect_item_id_from_celkovacena() -> None:
+    df = pd.DataFrame([
+        ["kód", "celková cena", "popis"],
+        ["1", "ROW-1", "item"],
+    ])
+    mapping, _, _ = module.try_autodetect_mapping(df)
+    assert mapping["item_id"] == 1
+
+
+def test_rename_value_columns_adds_percent_diff() -> None:
+    df = pd.DataFrame(
+        {
+            "Položka": ["A"],
+            "Master total": [100.0],
+            "Dodavatel total": [120.0],
+        }
+    )
+    renamed = module.rename_value_columns_for_display(df, " — CELKEM CZK")
+    assert "Dodavatel — CELKEM CZK" in renamed.columns
+    diff_col = "Dodavatel — CELKEM CZK" + module.PERCENT_DIFF_LABEL
+    assert diff_col in renamed.columns
+    value = renamed.loc[0, diff_col]
+    assert pytest.approx(value, rel=1e-5) == 20.0
 
 def test_multiple_bid_loading() -> None:
     master_df = pd.DataFrame({
