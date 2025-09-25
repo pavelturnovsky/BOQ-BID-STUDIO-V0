@@ -407,6 +407,24 @@ def rename_value_columns_for_display(df: pd.DataFrame, suffix: str) -> pd.DataFr
         return df
 
     prepared = add_percent_difference_columns(df)
+    raw_comparison_meta: Dict[str, Dict[str, Any]] = {}
+    if "Master total" in prepared.columns:
+        reference_series = pd.to_numeric(prepared["Master total"], errors="coerce")
+        value_columns = [
+            col
+            for col in prepared.columns
+            if col.endswith(" total")
+            and not col.startswith("__present__")
+            and col != "Master total"
+        ]
+        for col in value_columns:
+            pct_col = f"{col}{PERCENT_DIFF_SUFFIX}"
+            pct_series = compute_percent_difference(prepared[col], reference_series)
+            raw_comparison_meta[col] = {
+                "pct_values": pct_series,
+                "pct_column": pct_col if pct_col in prepared.columns else None,
+            }
+
     rename_map: Dict[str, str] = {}
     for col in prepared.columns:
         if col.endswith(" total") and not col.startswith("__present__"):
@@ -417,7 +435,26 @@ def rename_value_columns_for_display(df: pd.DataFrame, suffix: str) -> pd.DataFr
             if suffix:
                 label = f"{label}{suffix}"
             rename_map[col] = f"{label}{PERCENT_DIFF_LABEL}"
-    return prepared.rename(columns=rename_map)
+
+    result = prepared.rename(columns=rename_map)
+
+    if raw_comparison_meta:
+        comparison_display: Dict[str, Dict[str, Any]] = {}
+        for raw_col, meta in raw_comparison_meta.items():
+            display_col = rename_map.get(raw_col, raw_col)
+            pct_col_raw = meta.get("pct_column")
+            pct_col_display = rename_map.get(pct_col_raw, pct_col_raw) if pct_col_raw else None
+            pct_values = meta.get("pct_values")
+            if isinstance(pct_values, pd.Series):
+                comparison_display[display_col] = {
+                    "pct_values": pct_values,
+                    "pct_column": pct_col_display,
+                }
+        master_display = rename_map.get("Master total", "Master total")
+        result.attrs["comparison_master"] = master_display
+        result.attrs["comparison_info"] = comparison_display
+
+    return result
 
 
 def compute_display_column_widths(
@@ -918,7 +955,7 @@ def make_widget_key(*parts: Any) -> str:
 def try_autodetect_mapping(df: pd.DataFrame) -> Tuple[Dict[str, int], int, pd.DataFrame]:
     """Autodetect header mapping using a sampled, vectorized search."""
     # probe size grows with the dataframe but is capped to keep things fast
-    nprobe = min(len(df), max(10, min(50, len(df) // 100)))
+    nprobe = min(len(df), 200)
     sample = df.head(nprobe).astype(str).applymap(normalize_col)
 
     hint_patterns: Dict[str, Dict[str, List[str]]] = {}
@@ -1180,6 +1217,11 @@ def show_df(df: pd.DataFrame) -> None:
     if not isinstance(df, pd.DataFrame):
         st.dataframe(df)
         return
+
+    attrs = getattr(df, "attrs", {}) if hasattr(df, "attrs") else {}
+    comparison_info = attrs.get("comparison_info", {})
+    comparison_master = attrs.get("comparison_master")
+
     df_to_show = df.copy()
 
     helper_cols = [col for col in df_to_show.columns if str(col).startswith("__present__")]
@@ -1215,6 +1257,8 @@ def show_df(df: pd.DataFrame) -> None:
         styles = pd.DataFrame("", index=data.index, columns=data.columns)
         master_col = None
         for col in presence_info.keys():
+            if col not in styles.columns:
+                continue
             if col.lower() == "master total" or col.endswith("Master total"):
                 master_col = col
                 break
@@ -1226,6 +1270,8 @@ def show_df(df: pd.DataFrame) -> None:
         any_supplier_present = pd.Series(False, index=data.index, dtype=bool)
 
         for col in supplier_cols:
+            if col not in styles.columns:
+                continue
             col_presence = presence_info[col].reindex(data.index).fillna(False)
             any_supplier_present |= col_presence
             added_mask = col_presence & ~master_presence
@@ -1233,11 +1279,13 @@ def show_df(df: pd.DataFrame) -> None:
             styles.loc[added_mask, col] = "background-color: #d4edda"
             styles.loc[removed_mask, col] = "background-color: #f8d7da"
 
-        if master_col in data.columns:
+        if master_col in data.columns and master_col in styles.columns:
             supplier_any = any_supplier_present.reindex(data.index).fillna(False)
             if supplier_cols:
                 all_supplier_present = pd.Series(True, index=data.index, dtype=bool)
                 for col in supplier_cols:
+                    if col not in data.columns:
+                        continue
                     col_presence = presence_info[col].reindex(data.index).fillna(False)
                     all_supplier_present &= col_presence
             else:
@@ -1246,6 +1294,59 @@ def show_df(df: pd.DataFrame) -> None:
             master_removed_mask = ~master_presence & supplier_any
             styles.loc[master_added_mask, master_col] = "background-color: #d4edda"
             styles.loc[master_removed_mask, master_col] = "background-color: #f8d7da"
+        return styles
+
+    def _blend_color(base: Tuple[int, int, int], intensity: float) -> str:
+        r = int(round(255 + (base[0] - 255) * intensity))
+        g = int(round(255 + (base[1] - 255) * intensity))
+        b = int(round(255 + (base[2] - 255) * intensity))
+        r = max(0, min(255, r))
+        g = max(0, min(255, g))
+        b = max(0, min(255, b))
+        return f"#{r:02x}{g:02x}{b:02x}"
+
+    def _color_for_percent(value: Any) -> str:
+        if pd.isna(value):
+            return ""
+        try:
+            pct = float(value)
+        except (TypeError, ValueError):
+            return ""
+        if pct == 0:
+            return ""
+        capped = max(-200.0, min(200.0, pct))
+        intensity = min(abs(capped) / 100.0, 1.0)
+        if intensity <= 0:
+            return ""
+        base = (220, 53, 69) if pct > 0 else (40, 167, 69)
+        return f"background-color: {_blend_color(base, intensity)}"
+
+    def _apply_price_delta_styles(
+        data: pd.DataFrame,
+        info: Dict[str, Dict[str, Any]],
+        master_col: Optional[str],
+    ) -> pd.DataFrame:
+        if not info:
+            return pd.DataFrame("", index=data.index, columns=data.columns)
+
+        styles = pd.DataFrame("", index=data.index, columns=data.columns)
+        for display_col, meta in info.items():
+            if display_col not in styles.columns:
+                continue
+            pct_series = meta.get("pct_values")
+            if isinstance(pct_series, pd.Series):
+                working_pct = pct_series.reindex(data.index)
+            else:
+                working_pct = pd.Series(np.nan, index=data.index)
+            styles.loc[data.index, display_col] = working_pct.apply(_color_for_percent).values
+
+            pct_col = meta.get("pct_column")
+            if pct_col and pct_col in styles.columns:
+                styles.loc[data.index, pct_col] = working_pct.apply(_color_for_percent).values
+
+        if master_col and master_col in styles.columns:
+            styles.loc[:, master_col] = ""
+
         return styles
 
     needs_styler = bool(len(numeric_cols)) or bool(presence_display)
@@ -1259,6 +1360,11 @@ def show_df(df: pd.DataFrame) -> None:
     if presence_display:
         styler = styler.apply(
             lambda data: _apply_presence_styles(data, presence_display), axis=None
+        )
+    if comparison_info:
+        styler = styler.apply(
+            lambda data: _apply_price_delta_styles(data, comparison_info, comparison_master),
+            axis=None,
         )
     header_styles: List[Dict[str, str]] = []
     for idx, col in enumerate(df_to_show.columns):
@@ -1313,7 +1419,7 @@ def apply_master_mapping(master: WorkbookData, target: WorkbookData) -> None:
         if not isinstance(raw_df, pd.DataFrame) or raw_df.empty:
             return -1, []
 
-        max_probe = min(len(raw_df), 50)
+        max_probe = min(len(raw_df), 250)
         probe_indices: List[int] = list(range(max_probe))
         probe_set = set(probe_indices)
 
@@ -3959,13 +4065,22 @@ with tab_rekap:
                 show_df(missing_df)
             if not indirect_df.empty:
                 st.markdown(f"### Vedlejší rozpočtové náklady ({base_currency})")
-                show_df(indirect_df)
+                indirect_detail_display = rename_value_columns_for_display(
+                    indirect_df.copy(), f" — {base_currency}"
+                )
+                show_df(indirect_detail_display)
                 if not indirect_total.empty:
                     st.markdown(f"**Součet vedlejších nákladů ({base_currency}):**")
-                    show_df(indirect_total)
+                    show_df(
+                        rename_value_columns_for_display(
+                            indirect_total.copy(), f" — {base_currency}"
+                        )
+                    )
             if not added_df.empty:
                 st.markdown(f"### Náklady přidané dodavatelem ({base_currency})")
-                show_df(added_df)
+                show_df(
+                    rename_value_columns_for_display(added_df.copy(), f" — {base_currency}")
+                )
 
 with tab_dashboard:
     if not bids_dict:
