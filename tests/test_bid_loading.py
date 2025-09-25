@@ -642,3 +642,45 @@ def test_overview_comparison_uses_item_id_for_join() -> None:
     sections, _, _, _, _ = module.overview_comparison(master, {"Supplier": supplier}, "Sheet")
     assert not sections.empty
     assert np.isclose(sections.loc[0, "Supplier total"], 55)
+
+
+def test_overview_comparison_marks_added_and_removed_rows() -> None:
+    master_table = module.build_normalized_table(
+        pd.DataFrame(
+            {
+                "code": ["A", "B"],
+                "description": ["Aligned", "Master only"],
+                "total price": ["100", "40"],
+            }
+        ),
+        {"code": 0, "description": 1, "total_price": 2},
+    )
+    supplier_table = module.build_normalized_table(
+        pd.DataFrame(
+            {
+                "code": ["A", "C"],
+                "description": ["Aligned", "Supplier only"],
+                "total price": ["105", "30"],
+            }
+        ),
+        {"code": 0, "description": 1, "total_price": 2},
+    )
+    master = WorkbookData(name="Master", sheets={"Sheet": {"table": master_table}})
+    supplier = WorkbookData(name="Sup", sheets={"Sheet": {"table": supplier_table}})
+
+    sections, _, _, _, _ = module.overview_comparison(master, {"Supplier": supplier}, "Sheet")
+
+    assert set(sections["code"]) == {"A", "B", "C"}
+
+    status_map = sections.set_index("code")["__row_status__"].to_dict()
+    assert status_map["B"] == "master_only"
+    assert status_map["C"] == "supplier_only"
+
+    master_presence = sections.set_index("code")["__present__Master total"]
+    supplier_presence = sections.set_index("code")["__present__Supplier total"]
+
+    assert bool(master_presence["B"]) is True and bool(supplier_presence["B"]) is False
+    assert bool(master_presence["C"]) is False and bool(supplier_presence["C"]) is True
+
+    supplier_total = sections.set_index("code")["Supplier total"]
+    assert np.isclose(supplier_total["C"], 30.0)

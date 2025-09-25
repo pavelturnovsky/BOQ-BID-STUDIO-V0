@@ -337,7 +337,7 @@ def rename_value_columns_for_display(df: pd.DataFrame, suffix: str) -> pd.DataFr
 
     rename_map: Dict[str, str] = {}
     for col in df.columns:
-        if col.endswith(" total"):
+        if col.endswith(" total") and not col.startswith("__present__"):
             rename_map[col] = f"{col.replace(' total', '')}{suffix}"
         elif col.endswith(PERCENT_DIFF_SUFFIX):
             base = col[: -len(PERCENT_DIFF_SUFFIX)].replace(" total", "")
@@ -1112,14 +1112,78 @@ def show_df(df: pd.DataFrame) -> None:
         st.dataframe(df)
         return
     df_to_show = df.copy()
-    df_to_show.columns = make_unique_columns(df_to_show.columns)
+
+    helper_cols = [col for col in df_to_show.columns if str(col).startswith("__present__")]
+    presence_map: Dict[str, pd.Series] = {}
+    for col in helper_cols:
+        target_col = str(col)[len("__present__") :]
+        presence_map[target_col] = df_to_show[col].astype(bool)
+    df_to_show.drop(columns=helper_cols, inplace=True, errors="ignore")
+    if "__row_status__" in df_to_show.columns:
+        df_to_show.drop(columns=["__row_status__"], inplace=True)
+
+    original_cols = list(df_to_show.columns)
+    unique_cols = make_unique_columns(original_cols)
+    rename_map = {orig: unique for orig, unique in zip(original_cols, unique_cols)}
+    df_to_show.rename(columns=rename_map, inplace=True)
+
+    presence_display: Dict[str, pd.Series] = {}
+    for orig_col, series in presence_map.items():
+        display_col = rename_map.get(orig_col, orig_col)
+        presence_display[display_col] = series.reindex(df_to_show.index).fillna(False)
+
     numeric_cols = df_to_show.select_dtypes(include=[np.number]).columns
-    if len(numeric_cols) == 0:
+
+    def _apply_presence_styles(data: pd.DataFrame, presence_info: Dict[str, pd.Series]) -> pd.DataFrame:
+        styles = pd.DataFrame("", index=data.index, columns=data.columns)
+        master_col = None
+        for col in presence_info.keys():
+            if col.lower() == "master total" or col.endswith("Master total"):
+                master_col = col
+                break
+        if master_col is None and "Master total" in presence_info:
+            master_col = "Master total"
+        master_presence = presence_info.get(master_col, pd.Series(False, index=data.index))
+        master_presence = master_presence.reindex(data.index).fillna(False)
+        supplier_cols = [col for col in presence_info.keys() if col != master_col]
+        any_supplier_present = pd.Series(False, index=data.index, dtype=bool)
+
+        for col in supplier_cols:
+            col_presence = presence_info[col].reindex(data.index).fillna(False)
+            any_supplier_present |= col_presence
+            added_mask = col_presence & ~master_presence
+            removed_mask = master_presence & ~col_presence
+            styles.loc[added_mask, col] = "background-color: #d4edda"
+            styles.loc[removed_mask, col] = "background-color: #f8d7da"
+
+        if master_col in data.columns:
+            supplier_any = any_supplier_present.reindex(data.index).fillna(False)
+            if supplier_cols:
+                all_supplier_present = pd.Series(True, index=data.index, dtype=bool)
+                for col in supplier_cols:
+                    col_presence = presence_info[col].reindex(data.index).fillna(False)
+                    all_supplier_present &= col_presence
+            else:
+                all_supplier_present = pd.Series(False, index=data.index, dtype=bool)
+            master_added_mask = master_presence & ~supplier_any
+            master_removed_mask = ~master_presence & supplier_any
+            styles.loc[master_added_mask, master_col] = "background-color: #d4edda"
+            styles.loc[master_removed_mask, master_col] = "background-color: #f8d7da"
+        return styles
+
+    needs_styler = bool(len(numeric_cols)) or bool(presence_display)
+    if not needs_styler:
         st.dataframe(df_to_show)
-    else:
-        st.dataframe(
-            df_to_show.style.format({col: format_number for col in numeric_cols})
+        return
+
+    styler = df_to_show.style
+    if len(numeric_cols):
+        styler = styler.format({col: format_number for col in numeric_cols})
+    if presence_display:
+        styler = styler.apply(
+            lambda data: _apply_presence_styles(data, presence_display), axis=None
         )
+    st.dataframe(styler)
 
 @st.cache_data
 def read_workbook(upload, limit_sheets: Optional[List[str]] = None) -> WorkbookData:
@@ -1942,6 +2006,15 @@ def overview_comparison(
     ordered_cols.extend(["__row_order__", "__line_id__", "total_for_sum", "__join_key__"])
     df = df[ordered_cols]
     df.rename(columns={"total_for_sum": "Master total"}, inplace=True)
+    df["__row_status__"] = "master"
+
+    combined_rows: Dict[str, Dict[str, Any]] = {}
+    master_join_keys = set(df["__join_key__"].dropna().astype(str)) if "__join_key__" in df.columns else set()
+    next_row_order = (
+        float(pd.to_numeric(df["__row_order__"], errors="coerce").max())
+        if "__row_order__" in df.columns and not df.empty
+        else 0.0
+    )
 
     for sup_name, wb in bids.items():
         tobj = wb.sheets.get(sheet_name, {})
@@ -1985,21 +2058,108 @@ def overview_comparison(
             supplier_join_key = supplier_item_ids.astype(str).str.strip()
             supplier_join_key = supplier_join_key.where(supplier_join_key != "", fallback_join)
             ttab["__join_key__"] = supplier_join_key.values
+            totals_grouped = (
+                ttab.groupby("__join_key__", sort=False)["total_for_sum"].sum(min_count=1)
+                if "total_for_sum" in ttab.columns
+                else pd.Series(dtype=float)
+            )
+            display_agg: Dict[str, str] = {
+                "code": "first",
+                "description": "first",
+            }
+            if "item_id" in ttab.columns:
+                display_agg["item_id"] = "first"
+            if "__row_order__" in ttab.columns:
+                display_agg["__row_order__"] = "min"
+            if "__line_id__" in ttab.columns:
+                display_agg["__line_id__"] = "first"
+            supplier_display = (
+                ttab.groupby("__join_key__", sort=False).agg(display_agg)
+                if display_agg
+                else pd.DataFrame()
+            )
             tdf = ttab[["__join_key__", "total_for_sum"]].copy()
             tdf.rename(columns={"total_for_sum": f"{sup_name} total"}, inplace=True)
             df = df.merge(tdf, on="__join_key__", how="left")
 
-    total_cols = [c for c in df.columns if c.endswith(" total")]
+            if not supplier_display.empty:
+                for key, row_info in supplier_display.iterrows():
+                    if pd.isna(key):
+                        continue
+                    key_str = str(key)
+                    if key_str in master_join_keys:
+                        continue
+                    entry = combined_rows.get(key_str)
+                    if entry is None:
+                        entry = {
+                            "__join_key__": key_str,
+                            "code": row_info.get("code", ""),
+                            "description": row_info.get("description", ""),
+                            "Master total": np.nan,
+                            "__row_status__": "supplier_only",
+                        }
+                        if "item_id" in df.columns:
+                            entry["item_id"] = row_info.get("item_id", "")
+                        if "__row_order__" in df.columns:
+                            next_row_order += 1
+                            entry["__row_order__"] = next_row_order
+                        if "__line_id__" in df.columns:
+                            entry["__line_id__"] = row_info.get("__line_id__", 0)
+                    entry[f"{sup_name} total"] = totals_grouped.get(key, np.nan)
+                    combined_rows[key_str] = entry
+
+    total_cols = [c for c in df.columns if str(c).endswith(" total")]
+    supplier_total_cols = [c for c in total_cols if c != "Master total"]
+
+    if combined_rows:
+        extra_df = pd.DataFrame.from_records(list(combined_rows.values()))
+        for col in df.columns:
+            if col not in extra_df.columns:
+                extra_df[col] = np.nan
+        extra_df = extra_df[df.columns]
+        df = pd.concat([df, extra_df], ignore_index=True, sort=False)
+
+    if "Master total" in df.columns:
+        master_presence = df["Master total"].notna()
+    else:
+        master_presence = pd.Series(False, index=df.index)
+    any_supplier_present = pd.Series(False, index=df.index, dtype=bool)
+    if supplier_total_cols:
+        all_supplier_present = pd.Series(True, index=df.index, dtype=bool)
+    else:
+        all_supplier_present = pd.Series(False, index=df.index, dtype=bool)
+
+    for col in supplier_total_cols:
+        supplier_presence = df[col].notna()
+        any_supplier_present |= supplier_presence
+        if supplier_total_cols:
+            all_supplier_present &= supplier_presence
+
+    if supplier_total_cols:
+        partial_mask = master_presence & any_supplier_present & ~all_supplier_present
+        df.loc[partial_mask, "__row_status__"] = "partial"
+        matched_mask = master_presence & all_supplier_present
+        df.loc[matched_mask, "__row_status__"] = "matched"
+
+    master_only_mask = master_presence & ~any_supplier_present
+    df.loc[master_only_mask, "__row_status__"] = "master_only"
+    supplier_only_mask = ~master_presence & any_supplier_present
+    df.loc[supplier_only_mask, "__row_status__"] = "supplier_only"
+
     base_view_cols = ["code", "description"]
     if "item_id" in df.columns:
         base_view_cols.append("item_id")
     base_view_cols.extend(["__row_order__", "__line_id__"])
-    view_cols = base_view_cols + total_cols
+    view_cols = base_view_cols + total_cols + ["__row_status__"]
     view = df[view_cols].copy()
     view["code"] = view["code"].fillna("").astype(str)
     view["description"] = view["description"].fillna("").astype(str)
     view = view[view["description"].str.strip() != ""]
     view = view.sort_values(by="__row_order__").reset_index(drop=True)
+
+    for col in total_cols:
+        present_col = f"__present__{col}"
+        view[present_col] = view[col].notna()
 
     auto_keys: List[str] = []
     for idx, row in view.iterrows():
@@ -2059,7 +2219,9 @@ def overview_comparison(
     if indirect_df.empty:
         indirect_total = pd.DataFrame()
     else:
-        sums = indirect_df[[c for c in indirect_df.columns if c.endswith(" total")]].sum()
+        sums = indirect_df[
+            [c for c in indirect_df.columns if str(c).endswith(" total") and not str(c).startswith("__present__")]
+        ].sum()
         indirect_total = sums.rename("total").to_frame().reset_index()
         indirect_total.rename(columns={"index": "supplier"}, inplace=True)
         indirect_total["supplier"] = indirect_total["supplier"].str.replace(" total", "", regex=False)
@@ -2168,7 +2330,9 @@ def prepare_grouped_sections(
     working["group_order"] = working["group_order"].fillna(working["item_order"])
     working["manual_override"] = working["manual_override"].fillna(False)
 
-    total_cols = [c for c in working.columns if c.endswith(" total")]
+    total_cols = [
+        c for c in working.columns if str(c).endswith(" total") and not str(c).startswith("__present__")
+    ]
     agg_kwargs: Dict[str, Any] = {
         "Skupina": pd.NamedAgg(column="group_label", aggfunc="first"),
         "Referencni_kod": pd.NamedAgg(column="code", aggfunc="first"),
@@ -2739,7 +2903,9 @@ with tab_compare:
         for sheet, df in results.items():
             st.subheader(f"List: {sheet}")
             # Totals per supplier for this sheet
-            total_cols = [c for c in df.columns if c.endswith(" total")]
+            total_cols = [
+                c for c in df.columns if str(c).endswith(" total") and not str(c).startswith("__present__")
+            ]
             if total_cols:
                 def total_for_column(col: str) -> float:
                     if col == "Master total" and "master_total_sum" in df.attrs:
@@ -2829,7 +2995,7 @@ with tab_summary:
 
             supplier_totals = {}
             for col in summary_df.columns:
-                if col.endswith(" total"):
+                if str(col).endswith(" total") and not str(col).startswith("__present__"):
                     supplier = col.replace(" total", "")
                     supplier_totals[supplier] = pd.to_numeric(
                         summary_df[col], errors="coerce"
@@ -2931,7 +3097,11 @@ with tab_rekap:
                 working_sections["__norm_desc__"] = working_sections["description"].map(
                     normalize_text
                 )
-            value_cols = [c for c in working_sections.columns if c.endswith(" total")]
+            value_cols = [
+                c
+                for c in working_sections.columns
+                if str(c).endswith(" total") and not str(c).startswith("__present__")
+            ]
 
             def sum_for_mask(mask: pd.Series, absolute: bool = False) -> pd.Series:
                 if value_cols and not working_sections.empty and mask.any():
