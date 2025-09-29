@@ -6,6 +6,7 @@ import re
 import json
 import time
 import unicodedata
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -153,6 +154,27 @@ RECAP_CATEGORY_CONFIG = [
 PERCENT_DIFF_SUFFIX = "_pct_diff"
 PERCENT_DIFF_LABEL = " — ODCHYLKA VS MASTER (%)"
 UNMAPPED_ROW_LABEL = "Nemapované položky"
+
+SECTION_ONTOLOGY = {
+    str(item.get("code_token", "")): item.get("fallback_label") or item.get("match_label", "")
+    for item in RECAP_CATEGORY_CONFIG
+    if item.get("code_token")
+}
+SECTION_ONTOLOGY.setdefault("", "Nezařazeno")
+
+
+@dataclass
+class ComparisonDataset:
+    sheet: str
+    analysis_df: pd.DataFrame
+    value_columns: List[str]
+    percent_columns: List[str]
+    diff_columns: List[str]
+    suppliers: List[str]
+    supplier_order: List[str]
+    section_labels: List[str]
+    master_column: Optional[str]
+    long_df: pd.DataFrame
 
 
 def is_master_column(column_name: str) -> bool:
@@ -311,6 +333,209 @@ def extract_code_token(value: Any) -> str:
     token = match.group(1) if match else text.split()[0]
     token = token.replace("-", ".").strip(".")
     return token.upper()
+
+
+def resolve_section_label(code: Any, description: Any) -> Tuple[str, str]:
+    """Return canonical section token and display label for a row."""
+
+    token = str(infer_section_group(code, description) or "").strip()
+    if not token:
+        token = extract_code_token(code) or extract_code_token(description)
+    token = (token or "").upper()
+    label = SECTION_ONTOLOGY.get(token, "")
+    if not label:
+        label = token if token else "Nezařazeno"
+    return token, label
+
+
+def build_comparison_dataset(sheet: str, df: pd.DataFrame) -> ComparisonDataset:
+    if df is None or df.empty:
+        empty = pd.DataFrame()
+        return ComparisonDataset(
+            sheet=sheet,
+            analysis_df=pd.DataFrame(),
+            value_columns=[],
+            percent_columns=[],
+            diff_columns=[],
+            suppliers=[],
+            supplier_order=[],
+            section_labels=[],
+            master_column=None,
+            long_df=empty,
+        )
+
+    analysis_df = df.copy()
+    if "__key__" not in analysis_df.columns:
+        analysis_df["__key__"] = np.arange(len(analysis_df))
+
+    section_tokens: List[str] = []
+    section_labels: List[str] = []
+    for _, row in analysis_df.iterrows():
+        token, label = resolve_section_label(row.get("code"), row.get("description"))
+        section_tokens.append(token)
+        section_labels.append(label or "Nezařazeno")
+    analysis_df["__section_token__"] = section_tokens
+    analysis_df["Oddíl"] = section_labels
+
+    search_columns = [col for col in ("code", "description", "Oddíl") if col in analysis_df.columns]
+    if search_columns:
+        search_concat = (
+            analysis_df[search_columns]
+            .fillna("")
+            .astype(str)
+            .agg(" ".join, axis=1)
+            .str.strip()
+        )
+    else:
+        search_concat = pd.Series("", index=analysis_df.index)
+    analysis_df["__search_text__"] = search_concat
+    analysis_df["__search_token__"] = analysis_df["__search_text__"].map(normalize_text)
+
+    value_columns = [
+        col
+        for col in analysis_df.columns
+        if str(col).endswith(" total") and not str(col).startswith("__present__")
+    ]
+    master_column = next((col for col in value_columns if is_master_column(col)), None)
+
+    supplier_columns = [col for col in value_columns if col != master_column]
+    suppliers = [col.replace(" total", "") for col in supplier_columns]
+    supplier_order: List[str] = []
+    if master_column:
+        supplier_order.append("Master")
+    supplier_order.extend(suppliers)
+
+    if master_column:
+        master_series = pd.to_numeric(analysis_df[master_column], errors="coerce")
+    else:
+        master_series = pd.Series(np.nan, index=analysis_df.index, dtype=float)
+
+    supplier_series: Dict[str, pd.Series] = {}
+    for col, supplier in zip(supplier_columns, suppliers):
+        supplier_series[supplier] = pd.to_numeric(analysis_df[col], errors="coerce")
+
+    diff_data: Dict[str, pd.Series] = {}
+    pct_data: Dict[str, pd.Series] = {}
+    percent_columns: List[str] = []
+    diff_columns: List[str] = []
+    for supplier, series in supplier_series.items():
+        if master_column:
+            diff_series = series - master_series
+            pct_series = compute_percent_difference(series, master_series)
+        else:
+            diff_series = pd.Series(np.nan, index=analysis_df.index, dtype=float)
+            pct_series = pd.Series(np.nan, index=analysis_df.index, dtype=float)
+        diff_data[supplier] = diff_series
+        pct_data[supplier] = pct_series
+        pct_col = f"__pct__::{supplier}"
+        diff_col = f"__diff__::{supplier}"
+        analysis_df[pct_col] = pct_series
+        analysis_df[diff_col] = diff_series
+        percent_columns.append(pct_col)
+        diff_columns.append(diff_col)
+
+    if diff_data:
+        diff_df = pd.DataFrame(diff_data)
+        analysis_df["__abs_diff_max__"] = diff_df.abs().max(axis=1)
+        analysis_df["__abs_diff_sum__"] = diff_df.abs().sum(axis=1)
+    else:
+        analysis_df["__abs_diff_max__"] = 0.0
+        analysis_df["__abs_diff_sum__"] = 0.0
+
+    if pct_data:
+        pct_df = pd.DataFrame(pct_data)
+        analysis_df["__pct_max__"] = pct_df.max(axis=1)
+        analysis_df["__pct_min__"] = pct_df.min(axis=1)
+    else:
+        analysis_df["__pct_max__"] = np.nan
+        analysis_df["__pct_min__"] = np.nan
+
+    if supplier_series:
+        supplier_matrix = pd.DataFrame(supplier_series)
+        analysis_df["__missing_any__"] = supplier_matrix.isna().any(axis=1)
+        analysis_df["__missing_all__"] = supplier_matrix.isna().all(axis=1)
+    else:
+        analysis_df["__missing_any__"] = False
+        analysis_df["__missing_all__"] = False
+
+    has_master_value = master_series.notna() & master_series.ne(0)
+    if "__missing_all__" in analysis_df.columns:
+        analysis_df["__missing_offer__"] = analysis_df["__missing_all__"] & has_master_value
+    else:
+        analysis_df["__missing_offer__"] = has_master_value
+
+    section_labels_unique = sorted(set(analysis_df["Oddíl"].dropna().tolist()), key=natural_sort_key)
+
+    long_records: List[Dict[str, Any]] = []
+    for idx in analysis_df.index:
+        row = analysis_df.loc[idx]
+        key_value = row.get("__key__", idx)
+        code_value = row.get("code", "")
+        desc_value = row.get("description", "")
+        unit_value = row.get("unit", "")
+        qty_value = row.get("quantity", np.nan)
+        section_value = row.get("Oddíl", "Nezařazeno")
+
+        if master_column:
+            master_value = master_series.loc[idx]
+            long_records.append(
+                {
+                    "__key__": key_value,
+                    "sheet": sheet,
+                    "supplier": "Master",
+                    "total": master_value,
+                    "difference_vs_master": 0.0,
+                    "pct_vs_master": 0.0,
+                    "code": code_value,
+                    "description": desc_value,
+                    "unit": unit_value,
+                    "quantity": qty_value,
+                    "section": section_value,
+                }
+            )
+        for supplier, series in supplier_series.items():
+            total_value = series.loc[idx]
+            diff_series = diff_data.get(supplier)
+            pct_series = pct_data.get(supplier)
+            diff_value = diff_series.loc[idx] if diff_series is not None else np.nan
+            pct_value = pct_series.loc[idx] if pct_series is not None else np.nan
+            long_records.append(
+                {
+                    "__key__": key_value,
+                    "sheet": sheet,
+                    "supplier": supplier,
+                    "total": total_value,
+                    "difference_vs_master": diff_value,
+                    "pct_vs_master": pct_value,
+                    "code": code_value,
+                    "description": desc_value,
+                    "unit": unit_value,
+                    "quantity": qty_value,
+                    "section": section_value,
+                }
+            )
+
+    long_df = pd.DataFrame(long_records)
+
+    return ComparisonDataset(
+        sheet=sheet,
+        analysis_df=analysis_df,
+        value_columns=value_columns,
+        percent_columns=percent_columns,
+        diff_columns=diff_columns,
+        suppliers=suppliers,
+        supplier_order=supplier_order,
+        section_labels=section_labels_unique,
+        master_column=master_column,
+        long_df=long_df,
+    )
+
+
+def build_comparison_datasets(results: Dict[str, pd.DataFrame]) -> Dict[str, ComparisonDataset]:
+    datasets: Dict[str, ComparisonDataset] = {}
+    for sheet, df in results.items():
+        datasets[sheet] = build_comparison_dataset(sheet, df)
+    return datasets
 
 
 def natural_sort_key(value: str) -> Tuple[Any, ...]:
@@ -3002,6 +3227,17 @@ if current_suppliers:
 chart_color_map = color_map.copy()
 chart_color_map.setdefault("Master", "#636EFA")
 
+default_threshold_range = st.session_state.get("compare_threshold_range", (-10.0, 10.0))
+min_threshold, max_threshold = st.sidebar.slider(
+    "Rozmezí odchylky vs Master (%)",
+    min_value=-200.0,
+    max_value=200.0,
+    value=default_threshold_range,
+    step=0.5,
+    help="Rozsah procentuální odchylky, který se považuje za přijatelný. Hodnoty mimo rozsah budou zvýrazněny.",
+)
+st.session_state["compare_threshold_range"] = (min_threshold, max_threshold)
+
 ensure_exchange_rate_state()
 
 # ------------- Tabs -------------
@@ -3065,6 +3301,10 @@ if bids_dict:
         sheet: rename_comparison_columns(df, display_names) for sheet, df in raw_compare_results.items()
     }
 
+comparison_datasets: Dict[str, ComparisonDataset] = {}
+if compare_results:
+    comparison_datasets = build_comparison_datasets(compare_results)
+
 # Pre-compute rekapitulace results to avoid repeated work in tabs (after mapping)
 recap_results: Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame] = (
     pd.DataFrame(),
@@ -3096,52 +3336,345 @@ if bids_overview_dict:
 with tab_compare:
     if not bids_dict:
         st.info("Nahraj alespoň jednu nabídku dodavatele v levém panelu.")
+    elif not comparison_datasets:
+        st.info("Nebyla nalezena data pro porovnání. Zkontroluj mapování nebo vyber jiné listy.")
     else:
-        results = compare_results
-
-        # main per-sheet tables
-        for sheet, df in results.items():
-            st.subheader(f"List: {sheet}")
-            # Totals per supplier for this sheet
-            total_cols = [
-                c for c in df.columns if str(c).endswith(" total") and not str(c).startswith("__present__")
-            ]
-            if total_cols:
-                def total_for_column(col: str) -> float:
-                    if col == "Master total" and "master_total_sum" in df.attrs:
-                        master_total = df.attrs["master_total_sum"]
-                        try:
-                            return float(master_total)
-                        except (TypeError, ValueError):
-                            pass
-                    series = pd.to_numeric(df[col], errors="coerce")
-                    return float(series.sum(skipna=True))
-
-                totals = [(col, total_for_column(col)) for col in total_cols]
-                sums_df = pd.DataFrame(totals, columns=["Součet (sloupec)", "Hodnota"])
-                st.markdown("**Součty za list:**")
-                show_df(sums_df)
-                chart_df = pd.DataFrame(
-                    {
-                        "supplier": [c.replace(" total", "") for c in total_cols],
-                        "total": [total_for_column(c) for c in total_cols],
-                    }
+        available_sheets = [
+            sheet for sheet, dataset in comparison_datasets.items() if not dataset.analysis_df.empty
+        ]
+        if not available_sheets:
+            st.info("Listy určené k porovnání jsou prázdné. Zkontroluj zdrojová data.")
+        else:
+            default_sheet = available_sheets[0]
+            selected_sheet = st.selectbox(
+                "Vyber list pro analýzu",
+                available_sheets,
+                index=available_sheets.index(default_sheet) if default_sheet in available_sheets else 0,
+                key="compare_sheet_select",
+            )
+            dataset = comparison_datasets.get(selected_sheet)
+            if dataset is None or dataset.analysis_df.empty:
+                st.warning("Vybraný list neobsahuje žádné položky k porovnání.")
+            else:
+                st.subheader(f"List: {selected_sheet}")
+                threshold_min, threshold_max = st.session_state.get(
+                    "compare_threshold_range", (-10.0, 10.0)
                 )
-                try:
-                    fig = px.bar(
-                        chart_df,
-                        x="supplier",
-                        y="total",
-                        color="supplier",
-                        color_discrete_map=chart_color_map,
-                        title=f"Součet za list: {sheet} ({currency})",
+                working = dataset.analysis_df.copy()
+
+                if dataset.percent_columns:
+                    pct_matrix = working[dataset.percent_columns]
+                    above_mask = pct_matrix.gt(threshold_max)
+                    below_mask = pct_matrix.lt(threshold_min)
+                    working["__above_threshold__"] = above_mask.any(axis=1)
+                    working["__below_threshold__"] = below_mask.any(axis=1)
+                    working["__outside_threshold__"] = working["__above_threshold__"] | working["__below_threshold__"]
+                else:
+                    working["__above_threshold__"] = False
+                    working["__below_threshold__"] = False
+                    working["__outside_threshold__"] = False
+
+                lowest_supplier_col = "LOWEST supplier" if "LOWEST supplier" in working.columns else None
+                lowest_supplier_options = []
+                if lowest_supplier_col:
+                    lowest_supplier_options = sorted(
+                        {
+                            str(val)
+                            for val in working[lowest_supplier_col].dropna().astype(str).tolist()
+                            if str(val).strip()
+                        },
+                        key=natural_sort_key,
                     )
-                    fig.update_layout(showlegend=False)
-                    st.plotly_chart(fig, use_container_width=True)
-                except Exception:
-                    st.markdown("**Součty (tabulkový přehled grafu):**")
-                    show_df(chart_df)
-            show_df(df)
+
+                filter_top = st.container()
+                with filter_top:
+                    col_search, col_section, col_lowest, col_limit = st.columns([3, 3, 2, 1])
+                    search_query = col_search.text_input(
+                        "Vyhledávání (kód, popis, oddíl)",
+                        key=f"compare_search_{selected_sheet}",
+                        placeholder="např. 3.1 dveře",
+                    )
+                    section_selection = col_section.multiselect(
+                        "Oddíly",
+                        dataset.section_labels,
+                        key=f"compare_sections_{selected_sheet}",
+                    )
+                    lowest_selection = col_lowest.multiselect(
+                        "Dodavatel s nejnižší cenou",
+                        lowest_supplier_options,
+                        key=f"compare_lowest_{selected_sheet}",
+                    )
+                    max_rows = col_limit.number_input(
+                        "Limit řádků",
+                        min_value=10,
+                        max_value=5000,
+                        value=200,
+                        step=10,
+                        key=f"compare_limit_{selected_sheet}",
+                    )
+
+                filter_bottom = st.container()
+                with filter_bottom:
+                    col_above, col_below, col_view = st.columns([1, 1, 2])
+                    show_above_only = col_above.checkbox(
+                        "Jen nad horním limitem",
+                        key=f"compare_above_only_{selected_sheet}",
+                    )
+                    show_below_only = col_below.checkbox(
+                        "Jen pod dolním limitem",
+                        key=f"compare_below_only_{selected_sheet}",
+                    )
+                    view_mode = col_view.radio(
+                        "Rychlý přehled",
+                        options=[
+                            "Vše",
+                            "Top 10 odchylek",
+                            "Položky mimo rozsah",
+                            "Položky bez nabídky",
+                        ],
+                        index=0,
+                        horizontal=True,
+                        key=f"compare_view_mode_{selected_sheet}",
+                    )
+
+                filtered = working.copy()
+                if search_query:
+                    normalized = normalize_text(search_query)
+                    tokens = [token for token in re.split(r"\s+", normalized) if token]
+                    if tokens:
+                        search_series = filtered.get("__search_token__", pd.Series("", index=filtered.index))
+                        mask = pd.Series(True, index=filtered.index, dtype=bool)
+                        for token in tokens:
+                            mask &= search_series.str.contains(re.escape(token), na=False)
+                        filtered = filtered.loc[mask]
+
+                if section_selection:
+                    filtered = filtered[filtered["Oddíl"].isin(section_selection)]
+
+                if lowest_selection and lowest_supplier_col:
+                    filtered = filtered[filtered[lowest_supplier_col].isin(lowest_selection)]
+
+                if show_above_only:
+                    filtered = filtered[filtered["__above_threshold__"]]
+                if show_below_only:
+                    filtered = filtered[filtered["__below_threshold__"]]
+
+                if view_mode == "Top 10 odchylek":
+                    filtered = filtered.sort_values("__abs_diff_max__", ascending=False)
+                    filtered = filtered.head(min(int(max_rows), 10))
+                elif view_mode == "Položky mimo rozsah":
+                    filtered = filtered[filtered["__outside_threshold__"]]
+                elif view_mode == "Položky bez nabídky":
+                    filtered = filtered[filtered["__missing_offer__"]]
+
+                if view_mode != "Top 10 odchylek":
+                    filtered = filtered.head(int(max_rows))
+
+                if "__row_order__" in filtered.columns:
+                    filtered = filtered.sort_values("__row_order__")
+
+                visible = filtered.copy()
+                visible_count = len(visible)
+
+                metrics_cols = st.columns(4)
+                outside_count = int(visible.get("__outside_threshold__", pd.Series(False, index=visible.index)).sum())
+                outside_ratio = (outside_count / visible_count * 100.0) if visible_count else 0.0
+
+                if dataset.percent_columns and not visible.empty:
+                    pct_values = (
+                        visible[dataset.percent_columns]
+                        .replace([np.inf, -np.inf], np.nan)
+                        .abs()
+                        .to_numpy()
+                        .ravel()
+                    )
+                    pct_values = pct_values[~np.isnan(pct_values)]
+                else:
+                    pct_values = np.array([], dtype=float)
+                avg_abs_pct = float(np.mean(pct_values)) if pct_values.size else 0.0
+                median_abs_pct = float(np.median(pct_values)) if pct_values.size else 0.0
+
+                financial_series = pd.to_numeric(
+                    visible.get("__abs_diff_sum__", pd.Series(0.0, index=visible.index)),
+                    errors="coerce",
+                ).fillna(0.0)
+                financial_impact = float(financial_series.sum())
+
+                missing_series = visible.get("__missing_any__", pd.Series(False, index=visible.index)).astype(bool)
+                missing_count = int(missing_series.sum())
+                missing_ratio = (missing_count / visible_count * 100.0) if visible_count else 0.0
+
+                metrics_cols[0].metric(
+                    "Položky mimo rozsah",
+                    f"{outside_count}",
+                    f"{outside_ratio:.1f}% výběru",
+                )
+                metrics_cols[1].metric(
+                    "Průměrná | medián odchylka",
+                    f"{avg_abs_pct:.2f} %",
+                    f"medián {median_abs_pct:.2f} %",
+                )
+                metrics_cols[2].metric(
+                    "Finanční dopad",
+                    f"{format_number(financial_impact)} {currency}",
+                )
+                metrics_cols[3].metric(
+                    "Neúplné položky",
+                    f"{missing_ratio:.1f} %",
+                    f"{missing_count} ks",
+                )
+
+                value_totals: List[Tuple[str, float]] = []
+                for col in dataset.value_columns:
+                    if col not in visible.columns:
+                        continue
+                    total_sum = pd.to_numeric(visible[col], errors="coerce").sum(skipna=True)
+                    value_totals.append((col.replace(" total", ""), float(total_sum)))
+                if value_totals:
+                    totals_df = pd.DataFrame(value_totals, columns=["Dodavatel", "Součet"])
+                    st.markdown("**Součty dle aktuálního filtru:**")
+                    show_df(totals_df)
+                    try:
+                        fig_totals = px.bar(
+                            totals_df,
+                            x="Dodavatel",
+                            y="Součet",
+                            color="Dodavatel",
+                            color_discrete_map=chart_color_map,
+                            title=f"Součty dle filtru — {selected_sheet} ({currency})",
+                        )
+                        fig_totals.update_layout(showlegend=False)
+                        fig_totals.update_yaxes(title=f"{currency}")
+                        st.plotly_chart(fig_totals, use_container_width=True)
+                    except Exception:
+                        pass
+
+                if visible.empty:
+                    st.info("Žádná položka neodpovídá zadaným filtrům.")
+                else:
+                    hidden_cols = [col for col in visible.columns if str(col).startswith("__")]
+                    display_base = visible.drop(columns=hidden_cols, errors="ignore")
+                    display_base = display_base.drop(columns=["__key__"], errors="ignore")
+                    display_ready = rename_value_columns_for_display(
+                        display_base.copy(), f" — {currency}"
+                    )
+                    show_df(display_ready)
+
+                    safe_sheet = re.sub(r"[^0-9A-Za-z]+", "_", selected_sheet).strip("_") or "porovnani"
+                    export_csv = display_ready.to_csv(index=False).encode("utf-8-sig")
+                    export_container = st.container()
+                    with export_container:
+                        col_csv, col_xlsx = st.columns(2)
+                        col_csv.download_button(
+                            "⬇️ Export CSV",
+                            data=export_csv,
+                            file_name=f"{safe_sheet}_filter.csv",
+                            mime="text/csv",
+                        )
+                        excel_buffer = io.BytesIO()
+                        with pd.ExcelWriter(excel_buffer, engine="openpyxl") as writer:
+                            display_ready.to_excel(writer, index=False, sheet_name="Porovnani")
+                        excel_buffer.seek(0)
+                        col_xlsx.download_button(
+                            "⬇️ Export XLSX",
+                            data=excel_buffer.getvalue(),
+                            file_name=f"{safe_sheet}_filter.xlsx",
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        )
+
+                    with st.expander("Detail položky", expanded=True):
+                        detail_map: Dict[Any, str] = {}
+                        for idx, row in visible.iterrows():
+                            code_text = str(row.get("code", "") or "").strip()
+                            desc_text = str(row.get("description", "") or "").strip()
+                            section_text = str(row.get("Oddíl", "") or "").strip()
+                            label_parts = [part for part in [code_text, desc_text] if part]
+                            label = " — ".join(label_parts) if label_parts else f"Položka {idx}"
+                            if section_text:
+                                label = f"{label} [{section_text}]"
+                            detail_map[idx] = label
+
+                        selected_index = st.selectbox(
+                            "Vyber položku",
+                            options=list(visible.index),
+                            format_func=lambda idx: detail_map.get(idx, str(idx)),
+                            key=f"compare_detail_{selected_sheet}",
+                        )
+
+                        detail_row = visible.loc[selected_index]
+                        detail_key = detail_row.get("__key__", selected_index)
+                        detail_long = dataset.long_df[dataset.long_df["__key__"] == detail_key].copy()
+
+                        info_cols = st.columns(4)
+                        info_cols[0].markdown(f"**Kód:** {detail_row.get('code', '—') or '—'}")
+                        info_cols[1].markdown(f"**Oddíl:** {detail_row.get('Oddíl', '—') or '—'}")
+                        info_cols[2].markdown(f"**Jednotka:** {detail_row.get('unit', '—') or '—'}")
+                        qty_value = detail_row.get("quantity")
+                        qty_numeric = pd.to_numeric(pd.Series([qty_value]), errors="coerce").iat[0]
+                        qty_text = format_number(float(qty_numeric)) if pd.notna(qty_numeric) else "—"
+                        info_cols[3].markdown(f"**Množství Master:** {qty_text}")
+
+                        if lowest_supplier_col:
+                            lowest_value = detail_row.get(lowest_supplier_col)
+                            if pd.notna(lowest_value):
+                                st.caption(f"Nejnižší cena: {lowest_value}")
+
+                        detail_chart_df = detail_long.copy()
+                        detail_chart_df["total"] = pd.to_numeric(
+                            detail_chart_df["total"], errors="coerce"
+                        )
+                        detail_chart_df = detail_chart_df.dropna(subset=["total"])
+                        if not detail_chart_df.empty:
+                            if dataset.supplier_order:
+                                detail_chart_df["supplier"] = pd.Categorical(
+                                    detail_chart_df["supplier"],
+                                    categories=dataset.supplier_order,
+                                    ordered=True,
+                                )
+                                detail_chart_df = detail_chart_df.sort_values("supplier")
+                            fig_detail = px.bar(
+                                detail_chart_df,
+                                x="supplier",
+                                y="total",
+                                color="supplier",
+                                color_discrete_map=chart_color_map,
+                                title=f"Cenové srovnání — {detail_map.get(selected_index, selected_sheet)}",
+                            )
+                            fig_detail.update_yaxes(title=f"Cena ({currency})")
+                            fig_detail.update_layout(xaxis_title="Dodavatel")
+                            st.plotly_chart(fig_detail, use_container_width=True)
+
+                        detail_table = detail_long.copy()
+                        detail_table["total"] = pd.to_numeric(detail_table["total"], errors="coerce")
+                        detail_table["difference_vs_master"] = pd.to_numeric(
+                            detail_table["difference_vs_master"], errors="coerce"
+                        )
+                        detail_table["pct_vs_master"] = pd.to_numeric(
+                            detail_table["pct_vs_master"], errors="coerce"
+                        )
+                        detail_display = detail_table[[
+                            "supplier",
+                            "total",
+                            "difference_vs_master",
+                            "pct_vs_master",
+                        ]].rename(
+                            columns={
+                                "supplier": "Dodavatel",
+                                "total": f"Cena ({currency})",
+                                "difference_vs_master": f"Rozdíl vs Master ({currency})",
+                                "pct_vs_master": "Odchylka (%)",
+                            }
+                        )
+                        for column in detail_display.columns:
+                            if column == "Dodavatel":
+                                continue
+                            if column == "Odchylka (%)":
+                                detail_display[column] = detail_display[column].apply(
+                                    lambda value: f"{format_number(value)} %" if pd.notna(value) else ""
+                                )
+                            else:
+                                detail_display[column] = detail_display[column].apply(format_number)
+                        st.dataframe(detail_display, use_container_width=True, hide_index=True)
 
 with tab_summary:
     if not bids_dict:
