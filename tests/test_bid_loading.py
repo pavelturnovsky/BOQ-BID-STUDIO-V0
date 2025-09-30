@@ -179,6 +179,41 @@ def test_compare_master_total_with_duplicate_supplier_rows() -> None:
     assert np.isclose(df.attrs["master_total_sum"], 100)
 
 
+def test_compare_falls_back_when_supplier_lacks_item_ids() -> None:
+    master_table = module.build_normalized_table(
+        pd.DataFrame(
+            {
+                "item id": ["ROW-1", "ROW-2"],
+                "code": ["10", "11"],
+                "description": ["Item A", "Item B"],
+                "quantity": ["1", "2"],
+                "total price": ["100", "200"],
+            }
+        ),
+        {"item_id": 0, "code": 1, "description": 2, "quantity": 3, "total_price": 4},
+    )
+    supplier_table = module.build_normalized_table(
+        pd.DataFrame(
+            {
+                "code": ["10", "11"],
+                "description": ["Item A", "Item B"],
+                "quantity": ["1", "2"],
+                "total price": ["110", "210"],
+            }
+        ),
+        {"code": 0, "description": 1, "quantity": 2, "total_price": 3},
+    )
+
+    master = WorkbookData(name="Master", sheets={"Sheet": {"table": master_table}})
+    supplier = WorkbookData(name="Sup", sheets={"Sheet": {"table": supplier_table}})
+
+    results = module.compare(master, {"Supplier": supplier})
+    df = results["Sheet"]
+
+    totals = df.set_index("code")["Supplier total"].dropna()
+    assert np.isclose(totals.loc["10"], 110.0)
+    assert np.isclose(totals.loc["11"], 210.0)
+
 def test_apply_master_mapping_aligns_by_header_name() -> None:
     master_df = pd.DataFrame(
         {

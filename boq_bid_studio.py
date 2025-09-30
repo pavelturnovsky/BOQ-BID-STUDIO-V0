@@ -2039,6 +2039,86 @@ def mapping_ui(
             st.markdown("**Normalizovaná tabulka (náhled):**")
             show_df(table.head(50))
     return changed_any
+
+
+def _build_join_lookup(df: pd.DataFrame) -> pd.DataFrame:
+    """Return normalized join helpers grouped by ``__key__``."""
+
+    if df is None or df.empty or "__key__" not in df.columns:
+        return pd.DataFrame(columns=["__item_join__", "__fallback_join__"])
+
+    df_local = df.copy()
+    code_series = (
+        df_local.get("code", pd.Series(index=df_local.index, dtype=object))
+        .fillna("")
+        .astype(str)
+        .str.strip()
+    )
+    desc_series = (
+        df_local.get("description", pd.Series(index=df_local.index, dtype=object))
+        .fillna("")
+        .astype(str)
+        .str.strip()
+    )
+
+    key_df = pd.DataFrame({"code": code_series, "description": desc_series}, index=df_local.index)
+    line_ids = key_df.groupby(["code", "description"], sort=False).cumcount()
+    fallback = code_series + "||" + desc_series + "||" + line_ids.astype(str)
+
+    if "item_id" in df_local.columns:
+        item_series = normalize_identifier(df_local["item_id"]).fillna("").astype(str).str.strip()
+    else:
+        item_series = pd.Series(["" for _ in range(len(df_local))], index=df_local.index, dtype=object)
+
+    lookup = pd.DataFrame(
+        {
+            "__key__": df_local["__key__"].astype(str),
+            "__item_join__": item_series,
+            "__fallback_join__": fallback,
+        },
+        index=df_local.index,
+    )
+
+    grouped = (
+        lookup.groupby("__key__", sort=False)[["__item_join__", "__fallback_join__"]]
+        .first()
+        .copy()
+    )
+    return grouped
+
+
+def _choose_join_columns(
+    master_lookup: pd.DataFrame, supplier_lookup: pd.DataFrame, join_mode: str
+) -> Tuple[pd.Series, pd.Series]:
+    """Return matching join key series for master and supplier tables."""
+
+    empty_master = master_lookup.empty or "__item_join__" not in master_lookup
+    empty_supplier = supplier_lookup.empty or "__item_join__" not in supplier_lookup
+
+    use_item_ids = False
+    if join_mode != "code+description" and not empty_master and not empty_supplier:
+        master_has_ids = master_lookup["__item_join__"].fillna("").astype(str).str.strip().ne("").any()
+        supplier_has_ids = (
+            supplier_lookup["__item_join__"].fillna("").astype(str).str.strip().ne("").any()
+        )
+        use_item_ids = master_has_ids and supplier_has_ids
+
+    master_col = "__item_join__" if use_item_ids else "__fallback_join__"
+    supplier_col = "__item_join__" if use_item_ids else "__fallback_join__"
+
+    master_series = (
+        master_lookup.get(master_col, pd.Series(dtype=object))
+        if not master_lookup.empty
+        else pd.Series(dtype=object)
+    )
+    supplier_series = (
+        supplier_lookup.get(supplier_col, pd.Series(dtype=object))
+        if not supplier_lookup.empty
+        else pd.Series(dtype=object)
+    )
+    return master_series, supplier_series
+
+
 def compare(master: WorkbookData, bids: Dict[str, WorkbookData], join_mode: str = "auto") -> Dict[str, pd.DataFrame]:
     """
     join_mode: "auto" (Item ID if detekováno, jinak code+description), nebo "code+description".
@@ -2076,6 +2156,7 @@ def compare(master: WorkbookData, bids: Dict[str, WorkbookData], join_mode: str 
         if "item_id" in base.columns:
             agg_mapping["item_id"] = "first"
         base_grouped = base.groupby("__key__", sort=False, as_index=False).agg(agg_mapping)
+        master_lookup = _build_join_lookup(mtab)
         master_total_sum = base_grouped["total_price"].sum()
         base_grouped.rename(columns={"total_price": "Master total"}, inplace=True)
         comp = base_grouped.copy()
@@ -2105,6 +2186,7 @@ def compare(master: WorkbookData, bids: Dict[str, WorkbookData], join_mode: str 
                 cols.append("item_id")
             existing_cols = [c for c in cols if c in ttab.columns]
             tt = ttab[existing_cols].copy()
+            supplier_lookup = _build_join_lookup(ttab)
             tt[sup_qty_col] = pd.to_numeric(tt[sup_qty_col], errors="coerce")
             tt["total_price"] = pd.to_numeric(tt["total_price"], errors="coerce").fillna(0)
             price_cols = [c for c in ["unit_price_material", "unit_price_install"] if c in tt.columns]
@@ -2135,11 +2217,18 @@ def compare(master: WorkbookData, bids: Dict[str, WorkbookData], join_mode: str 
             mask = qty_for_division.isna()
             tt_grouped.loc[mask, "unit_price_combined"] = tt_grouped.loc[mask, "first_unit_price"]
             tt_grouped.drop(columns=["first_unit_price"], inplace=True)
+            master_join_series, supplier_join_series = _choose_join_columns(
+                master_lookup, supplier_lookup, join_mode
+            )
+            comp_join_keys = comp["__key__"].astype(str).map(master_join_series)
+            tt_grouped["__join_key__"] = tt_grouped["__key__"].astype(str).map(supplier_join_series)
+            comp["__join_key__"] = comp_join_keys
             comp = comp.merge(
-                tt_grouped[["__key__", sup_qty_col, "unit_price_combined", "total_price"]],
-                on="__key__",
+                tt_grouped[["__join_key__", sup_qty_col, "unit_price_combined", "total_price"]],
+                on="__join_key__",
                 how="left",
             )
+            comp.drop(columns=["__join_key__"], inplace=True, errors="ignore")
             comp.rename(columns={
                 sup_qty_col: f"{sup_name} quantity",
                 "unit_price_combined": f"{sup_name} unit_price",
