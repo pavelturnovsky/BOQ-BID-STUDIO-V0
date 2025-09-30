@@ -4762,12 +4762,15 @@ with tab_dashboard:
                 item_abs = heat_df.abs()
                 item_deltas = item_abs.sum(axis=1).sort_values(ascending=False).head(20)
                 leading_supplier = item_abs.loc[item_deltas.index].idxmax(axis=1)
-                item_chart_df = pd.DataFrame(
-                    {
-                        "item": item_deltas.index,
-                        "value": item_deltas.values,
-                        "supplier": leading_supplier.values,
-                    }
+                item_chart_df = (
+                    pd.DataFrame(
+                        {
+                            "value": item_deltas,
+                            "supplier": leading_supplier.reindex(item_deltas.index),
+                        }
+                    )
+                    .reset_index()
+                    .rename(columns={"index": "item"})
                 )
                 try:
                     fig2 = px.bar(
