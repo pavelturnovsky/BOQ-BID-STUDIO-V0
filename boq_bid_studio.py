@@ -1442,7 +1442,12 @@ def classify_summary_type(df: pd.DataFrame, summary_mask: pd.Series) -> pd.Serie
     return summary_type
 
 @st.cache_data
-def build_normalized_table(df: pd.DataFrame, mapping: Dict[str, int]) -> pd.DataFrame:
+def build_normalized_table(
+    df: pd.DataFrame,
+    mapping: Dict[str, int],
+    *,
+    preserve_summary_totals: bool = False,
+) -> pd.DataFrame:
     cols = df.columns.tolist()
     def pick(mapped_key, default=None):
         if mapped_key in mapping:
@@ -1464,10 +1469,17 @@ def build_normalized_table(df: pd.DataFrame, mapping: Dict[str, int]) -> pd.Data
         "summary_total": coerce_numeric(pick("summary_total", np.nan)),
     })
 
-    # Detect summary rows using centralized helper
-    summary_mask = detect_summary_rows(out)
-    out["is_summary"] = summary_mask
-    out["summary_type"] = classify_summary_type(out, summary_mask)
+    # Detect summary rows using centralized helper unless the caller explicitly
+    # wants to preserve totals as-is (rekapitulace tables work with hard
+    # numbers that must not be altered).
+    if preserve_summary_totals:
+        summary_mask = pd.Series(False, index=out.index, dtype=bool)
+        out["is_summary"] = summary_mask
+        out["summary_type"] = ""
+    else:
+        summary_mask = detect_summary_rows(out)
+        out["is_summary"] = summary_mask
+        out["summary_type"] = classify_summary_type(out, summary_mask)
 
     # Compute total prices and cross-check
     out["unit_price_combined"] = out[["unit_price_material", "unit_price_install"]].sum(
@@ -1763,9 +1775,24 @@ def read_workbook(upload, limit_sheets: Optional[List[str]] = None) -> WorkbookD
                 if not mapping:
                     body = fallback.copy()
             tbl = build_normalized_table(body, mapping) if mapping else pd.DataFrame()
-            wb.sheets[s] = {"raw": raw, "mapping": mapping, "header_row": header_row, "table": tbl, "header_names": list(body.columns) if hasattr(body, "columns") else []}
+            wb.sheets[s] = {
+                "raw": raw,
+                "mapping": mapping,
+                "header_row": header_row,
+                "table": tbl,
+                "header_names": list(body.columns) if hasattr(body, "columns") else [],
+                "preserve_summary_totals": False,
+            }
         except Exception as e:
-            wb.sheets[s] = {"raw": None, "mapping": {}, "header_row": -1, "table": pd.DataFrame(), "error": str(e), "header_names": []}
+            wb.sheets[s] = {
+                "raw": None,
+                "mapping": {},
+                "header_row": -1,
+                "table": pd.DataFrame(),
+                "error": str(e),
+                "header_names": [],
+                "preserve_summary_totals": False,
+            }
     return wb
 
 def apply_master_mapping(master: WorkbookData, target: WorkbookData) -> None:
@@ -1830,6 +1857,7 @@ def apply_master_mapping(master: WorkbookData, target: WorkbookData) -> None:
         raw = target_sheet.get("raw")
         master_mapping = mobj.get("mapping", {}) or {}
         master_header_row = mobj.get("header_row", -1)
+        preserve_totals = bool(mobj.get("preserve_summary_totals"))
 
         if not isinstance(raw, pd.DataFrame) or not master_mapping:
             continue
@@ -1887,7 +1915,11 @@ def apply_master_mapping(master: WorkbookData, target: WorkbookData) -> None:
             new_mapping[key] = resolved_idx
 
         try:
-            table = build_normalized_table(body, new_mapping)
+            table = build_normalized_table(
+                body,
+                new_mapping,
+                preserve_summary_totals=preserve_totals,
+            )
         except Exception:
             continue
 
@@ -1897,6 +1929,7 @@ def apply_master_mapping(master: WorkbookData, target: WorkbookData) -> None:
                 "header_row": target_header_row,
                 "table": table,
                 "header_names": header,
+                "preserve_summary_totals": preserve_totals,
             }
         )
 
@@ -2161,13 +2194,18 @@ def mapping_ui(
             if isinstance(raw, pd.DataFrame):
                 body = raw.iloc[header_row+1:].reset_index(drop=True)
                 body.columns = [normalize_col(x) for x in raw.iloc[header_row].tolist()]
-                table = build_normalized_table(body, ui_mapping)
+                table = build_normalized_table(
+                    body,
+                    ui_mapping,
+                    preserve_summary_totals=use_minimal,
+                )
             else:
                 table = pd.DataFrame()
 
             wb.sheets[sheet]["mapping"] = ui_mapping
             wb.sheets[sheet]["header_row"] = header_row
             wb.sheets[sheet]["table"] = table
+            wb.sheets[sheet]["preserve_summary_totals"] = use_minimal
             mapping_changed = (ui_mapping != prev_mapping) or (header_row != prev_header)
             wb.sheets[sheet]["_changed"] = mapping_changed
             changed_any = changed_any or mapping_changed
@@ -2616,14 +2654,19 @@ def overview_comparison(
     """Return tables for section totals, indirect costs, added costs,
     missing items and aggregated indirect totals."""
     mobj = master.sheets.get(sheet_name, {})
+    master_preserve_totals = bool(mobj.get("preserve_summary_totals"))
     mtab = mobj.get("table", pd.DataFrame())
     if (mtab is None or mtab.empty) and isinstance(mobj.get("raw"), pd.DataFrame):
         mapping, hdr, body = try_autodetect_mapping(mobj["raw"])
         if mapping:
-            mtab = build_normalized_table(body, mapping)
+            mtab = build_normalized_table(
+                body,
+                mapping,
+                preserve_summary_totals=master_preserve_totals,
+            )
     if mtab is None or mtab.empty:
         return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
-    if "is_summary" in mtab.columns:
+    if "is_summary" in mtab.columns and not master_preserve_totals:
         mtab = mtab[~mtab["is_summary"].fillna(False).astype(bool)]
     mtab = mtab.copy()
     if "__row_order__" not in mtab.columns:
@@ -2686,15 +2729,20 @@ def overview_comparison(
 
     for sup_name, wb in bids.items():
         tobj = wb.sheets.get(sheet_name, {})
+        supplier_preserve_totals = bool(tobj.get("preserve_summary_totals"))
         ttab = tobj.get("table", pd.DataFrame())
         if (ttab is None or ttab.empty) and isinstance(tobj.get("raw"), pd.DataFrame):
             mapping, hdr, body = try_autodetect_mapping(tobj["raw"])
             if mapping:
-                ttab = build_normalized_table(body, mapping)
+                ttab = build_normalized_table(
+                    body,
+                    mapping,
+                    preserve_summary_totals=supplier_preserve_totals,
+                )
         if ttab is None or ttab.empty:
             df[f"{sup_name} total"] = np.nan
         else:
-            if "is_summary" in ttab.columns:
+            if "is_summary" in ttab.columns and not supplier_preserve_totals:
                 ttab = ttab[~ttab["is_summary"].fillna(False).astype(bool)]
             ttab = ttab.copy()
             ttab["total_for_sum"] = coerce_numeric(ttab.get("total_price", np.nan)).fillna(0)
