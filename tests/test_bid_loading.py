@@ -465,6 +465,17 @@ def test_coerce_numeric_strips_currency_and_suffix() -> None:
     assert np.isclose(res.iloc[3], 3750.0)
 
 
+def test_coerce_numeric_handles_mixed_separators() -> None:
+    s = pd.Series(["1,234.56", "-2,500.00", "3.141", "7,500", "1.234,56"])
+    res = module.coerce_numeric(s)
+    assert np.isclose(res.iloc[0], 1234.56)
+    assert np.isclose(res.iloc[1], -2500.0)
+    assert np.isclose(res.iloc[2], 3.141)
+    # trailing comma thousands should collapse into integer when no decimal separator
+    assert np.isclose(res.iloc[3], 7500.0)
+    assert np.isclose(res.iloc[4], 1234.56)
+
+
 def test_total_diff_and_summary_detection() -> None:
     df = pd.DataFrame(
         {

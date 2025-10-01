@@ -1320,11 +1320,35 @@ def coerce_numeric(s: pd.Series) -> pd.Series:
     cleaned = cleaned.str.replace(r"(?i)(czk|kč|eur|€|usd|\$|gbp|£)", "", regex=True)
     cleaned = cleaned.str.replace(r"[+-]$", "", regex=True)
     cleaned = cleaned.str.replace(r"[^0-9,\.\-+]", "", regex=True)
-    mask = cleaned.str.contains(",") & cleaned.str.contains(".")
-    cleaned = cleaned.where(~mask, cleaned.str.replace(".", "", regex=False))
-    cleaned = cleaned.str.replace(",", ".", regex=False)
-    cleaned = cleaned.str.replace(r"[.,]$", "", regex=True)
-    return pd.to_numeric(cleaned, errors="coerce")
+
+    def _normalize_number(value: str) -> str:
+        if not value:
+            return value
+        comma_pos = value.rfind(",")
+        dot_pos = value.rfind(".")
+        if comma_pos != -1 and dot_pos != -1:
+            if dot_pos > comma_pos:
+                value = value.replace(",", "")
+            else:
+                value = value.replace(".", "")
+        elif comma_pos != -1:
+            if value.count(",") > 1:
+                value = value.replace(",", "")
+            else:
+                digits_after = len(value) - comma_pos - 1
+                sign_offset = 1 if value and value[0] in "+-" else 0
+                digits_before = comma_pos - sign_offset
+                if digits_after == 3 and digits_before <= 3:
+                    value = value.replace(",", "")
+                else:
+                    value = value.replace(",", ".")
+        value = value.replace(",", ".")
+        while value.endswith(('.', ',')):
+            value = value[:-1]
+        return value
+
+    normalized = cleaned.apply(_normalize_number)
+    return pd.to_numeric(normalized, errors="coerce")
 
 
 def detect_summary_rows(df: pd.DataFrame) -> pd.Series:
