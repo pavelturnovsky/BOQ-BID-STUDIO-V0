@@ -480,8 +480,12 @@ def build_comparison_dataset(sheet: str, df: pd.DataFrame) -> ComparisonDataset:
         key_value = row.get("__key__", idx)
         code_value = row.get("code", "")
         desc_value = row.get("description", "")
-        unit_value = row.get("unit", "")
-        qty_value = row.get("quantity", np.nan)
+        unit_value_master = row.get("unit", "")
+        if pd.isna(unit_value_master):
+            unit_value_master = ""
+        if isinstance(unit_value_master, str):
+            unit_value_master = unit_value_master.strip()
+        qty_value_master = row.get("quantity", np.nan)
         section_value = row.get("Oddíl", "Nezařazeno")
 
         if master_column:
@@ -496,8 +500,8 @@ def build_comparison_dataset(sheet: str, df: pd.DataFrame) -> ComparisonDataset:
                     "pct_vs_master": 0.0,
                     "code": code_value,
                     "description": desc_value,
-                    "unit": unit_value,
-                    "quantity": qty_value,
+                    "unit": unit_value_master,
+                    "quantity": qty_value_master,
                     "section": section_value,
                 }
             )
@@ -507,6 +511,14 @@ def build_comparison_dataset(sheet: str, df: pd.DataFrame) -> ComparisonDataset:
             pct_series = pct_data.get(supplier)
             diff_value = diff_series.loc[idx] if diff_series is not None else np.nan
             pct_value = pct_series.loc[idx] if pct_series is not None else np.nan
+            supplier_unit = row.get(f"{supplier} unit", np.nan)
+            if pd.isna(supplier_unit):
+                supplier_unit = ""
+            if isinstance(supplier_unit, str):
+                supplier_unit = supplier_unit.strip()
+            if not supplier_unit:
+                supplier_unit = unit_value_master
+            supplier_qty = row.get(f"{supplier} quantity", np.nan)
             long_records.append(
                 {
                     "__key__": key_value,
@@ -517,8 +529,8 @@ def build_comparison_dataset(sheet: str, df: pd.DataFrame) -> ComparisonDataset:
                     "pct_vs_master": pct_value,
                     "code": code_value,
                     "description": desc_value,
-                    "unit": unit_value,
-                    "quantity": qty_value,
+                    "unit": supplier_unit,
+                    "quantity": supplier_qty,
                     "section": section_value,
                 }
             )
@@ -2196,6 +2208,7 @@ def compare(master: WorkbookData, bids: Dict[str, WorkbookData], join_mode: str 
                 "unit_price_material",
                 "unit_price_install",
                 "total_price",
+                "unit",
             ]
             if "item_id" in ttab.columns:
                 cols.append("item_id")
@@ -2211,6 +2224,8 @@ def compare(master: WorkbookData, bids: Dict[str, WorkbookData], join_mode: str 
                 tt["unit_price_combined"] = tt[price_cols].sum(axis=1, min_count=1)
             else:
                 tt["unit_price_combined"] = np.nan
+            if "unit" in tt.columns:
+                tt["unit"] = tt["unit"].astype(str).str.strip()
             supplier_totals[sup_name] = float(tt["total_price"].sum())
             first_price = (
                 tt.groupby("__key__", sort=False)["unit_price_combined"].first().reset_index(name="first_unit_price")
@@ -2225,6 +2240,13 @@ def compare(master: WorkbookData, bids: Dict[str, WorkbookData], join_mode: str 
                 }
             )
             tt_grouped = tt_grouped.merge(first_price, on="__key__", how="left")
+            if "unit" in tt.columns:
+                unit_source = tt[["__key__", "unit"]].copy()
+                unit_source = unit_source[unit_source["unit"].astype(str).str.strip() != ""]
+                unit_grouped = (
+                    unit_source.groupby("__key__", sort=False)["unit"].first().reset_index()
+                )
+                tt_grouped = tt_grouped.merge(unit_grouped, on="__key__", how="left")
             qty = tt_grouped[sup_qty_col]
             with np.errstate(divide="ignore", invalid="ignore"):
                 qty_for_division = qty.where(qty != 0)
@@ -2238,17 +2260,22 @@ def compare(master: WorkbookData, bids: Dict[str, WorkbookData], join_mode: str 
             comp_join_keys = comp["__key__"].astype(str).map(master_join_series)
             tt_grouped["__join_key__"] = tt_grouped["__key__"].astype(str).map(supplier_join_series)
             comp["__join_key__"] = comp_join_keys
-            comp = comp.merge(
-                tt_grouped[["__join_key__", sup_qty_col, "unit_price_combined", "total_price"]],
-                on="__join_key__",
-                how="left",
-            )
+            merge_cols = ["__join_key__", sup_qty_col, "unit_price_combined", "total_price"]
+            unit_merge_col: Optional[str] = None
+            if "unit" in tt_grouped.columns:
+                unit_merge_col = f"__{sup_name}__unit"
+                tt_grouped.rename(columns={"unit": unit_merge_col}, inplace=True)
+                merge_cols.append(unit_merge_col)
+            comp = comp.merge(tt_grouped[merge_cols], on="__join_key__", how="left")
             comp.drop(columns=["__join_key__"], inplace=True, errors="ignore")
-            comp.rename(columns={
+            rename_map = {
                 sup_qty_col: f"{sup_name} quantity",
                 "unit_price_combined": f"{sup_name} unit_price",
                 "total_price": f"{sup_name} total",
-            }, inplace=True)
+            }
+            if unit_merge_col:
+                rename_map[unit_merge_col] = f"{sup_name} unit"
+            comp.rename(columns=rename_map, inplace=True)
             comp[f"{sup_name} Δ qty"] = comp[f"{sup_name} quantity"] - comp["quantity"]
 
         for sup_name, total_sum in supplier_totals.items():
@@ -2340,6 +2367,7 @@ def rename_comparison_columns(df: pd.DataFrame, mapping: Dict[str, str]) -> pd.D
     rename_map: Dict[str, str] = {}
     for raw, alias in mapping.items():
         rename_map[f"{raw} quantity"] = f"{alias} quantity"
+        rename_map[f"{raw} unit"] = f"{alias} unit"
         rename_map[f"{raw} unit_price"] = f"{alias} unit_price"
         rename_map[f"{raw} total"] = f"{alias} total"
         rename_map[f"{raw} Δ qty"] = f"{alias} Δ qty"

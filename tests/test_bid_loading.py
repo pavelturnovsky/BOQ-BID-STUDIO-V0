@@ -179,6 +179,62 @@ def test_compare_master_total_with_duplicate_supplier_rows() -> None:
     assert np.isclose(df.attrs["master_total_sum"], 100)
 
 
+def test_compare_transfers_supplier_quantity_and_unit() -> None:
+    master_table = module.build_normalized_table(
+        pd.DataFrame(
+            {
+                "code": ["1"],
+                "description": ["Master item"],
+                "unit": ["m"],
+                "quantity": ["10"],
+                "total price": ["100"],
+            }
+        ),
+        {"code": 0, "description": 1, "unit": 2, "quantity": 3, "total_price": 4},
+    )
+    supplier_table = module.build_normalized_table(
+        pd.DataFrame(
+            {
+                "code": ["1"],
+                "description": ["Master item"],
+                "unit": ["ks"],
+                "qty supplier": ["12"],
+                "total price": ["240"],
+            }
+        ),
+        {
+            "code": 0,
+            "description": 1,
+            "unit": 2,
+            "quantity_supplier": 3,
+            "total_price": 4,
+        },
+    )
+
+    master = WorkbookData(name="Master", sheets={"Sheet": {"table": master_table}})
+    supplier = WorkbookData(name="Sup", sheets={"Sheet": {"table": supplier_table}})
+
+    results = module.compare(master, {"Supplier": supplier})
+    df = results["Sheet"]
+
+    assert np.isclose(df.loc[df.index[0], "Supplier quantity"], 12.0)
+    assert df.loc[df.index[0], "Supplier unit"] == "ks"
+
+    dataset = module.build_comparison_dataset("Sheet", df)
+    analysis_row = dataset.analysis_df.loc[dataset.analysis_df.index[0]]
+    assert np.isclose(analysis_row["Supplier quantity"], 12.0)
+    assert analysis_row["Supplier unit"] == "ks"
+
+    long_df = dataset.long_df
+    supplier_row = long_df[long_df["supplier"] == "Supplier"].iloc[0]
+    master_row = long_df[long_df["supplier"] == "Master"].iloc[0]
+
+    assert np.isclose(supplier_row["quantity"], 12.0)
+    assert supplier_row["unit"] == "ks"
+    assert np.isclose(master_row["quantity"], 10.0)
+    assert master_row["unit"] == "m"
+
+
 def test_compare_falls_back_when_supplier_lacks_item_ids() -> None:
     master_table = module.build_normalized_table(
         pd.DataFrame(
