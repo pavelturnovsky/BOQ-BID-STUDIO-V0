@@ -931,6 +931,17 @@ def format_timestamp(timestamp: Optional[float]) -> str:
     return dt.strftime("%d.%m.%Y %H:%M")
 
 
+def format_percent_label(value: Any) -> str:
+    if pd.isna(value):
+        return "–"
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return str(value)
+    text = f"{numeric:+.2f} %"
+    return text.replace(".", ",")
+
+
 def format_currency_label(value: Any, currency: str) -> str:
     if pd.isna(value):
         return "–"
@@ -966,7 +977,27 @@ def build_recap_chart_data(
     chart_df["Cena po odečtech"] = pd.to_numeric(
         chart_df["Cena po odečtech"], errors="coerce"
     )
-    chart_df["Popisek"] = [
+    master_mask = chart_df["Dodavatel"].astype(str).str.casefold() == "master"
+    master_val: Optional[float] = None
+    if master_mask.any():
+        master_values = chart_df.loc[master_mask, "Cena po odečtech"].dropna()
+        if not master_values.empty:
+            master_val = float(master_values.iloc[0])
+    deltas: List[float] = []
+    for supplier, value in zip(chart_df["Dodavatel"], chart_df["Cena po odečtech"]):
+        supplier_cf = str(supplier).casefold()
+        if supplier_cf == "master":
+            deltas.append(0.0 if pd.notna(value) else np.nan)
+            continue
+        if master_val is None or pd.isna(value) or math.isclose(
+            master_val, 0.0, rel_tol=1e-9, abs_tol=1e-9
+        ):
+            deltas.append(np.nan)
+            continue
+        deltas.append(((float(value) - master_val) / master_val) * 100.0)
+    chart_df["Odchylka vs Master (%)"] = deltas
+    chart_df["Popisek"] = chart_df["Odchylka vs Master (%)"].apply(format_percent_label)
+    chart_df["Cena (text)"] = [
         format_currency_label(value, currency_label)
         for value in chart_df["Cena po odečtech"]
     ]
@@ -4316,9 +4347,13 @@ with tab_rekap:
                             text=chart_df["Popisek"],
                             textposition="outside",
                             texttemplate="%{text}",
+                            customdata=np.column_stack(
+                                [chart_df["Cena (text)"].fillna("–")]
+                            ),
                             hovertemplate=(
                                 "<b>%{x}</b><br>"
-                                "Cena po odečtech: %{text}<extra></extra>"
+                                "Cena po odečtech: %{customdata[0]}<br>"
+                                "Odchylka vs Master: %{text}<extra></extra>"
                             ),
                         )
                         fig_recap.update_layout(yaxis_title=f"{base_currency}", showlegend=False)
