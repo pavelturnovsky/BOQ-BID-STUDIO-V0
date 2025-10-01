@@ -2257,21 +2257,37 @@ def compare(master: WorkbookData, bids: Dict[str, WorkbookData], join_mode: str 
                 ttab = ttab.loc[~summary_mask_supplier].copy()
             ttab = ttab[ttab["description"].astype(str).str.strip() != ""]
             # join by __key__ (manual mapping already built in normalized table)
-            sup_qty_col = "quantity_supplier" if "quantity_supplier" in ttab.columns else "quantity"
+            qty_candidates: List[str] = []
+            if "quantity_supplier" in ttab.columns:
+                qty_candidates.append("quantity_supplier")
+            if "quantity" in ttab.columns:
+                qty_candidates.append("quantity")
+
             cols = [
                 "__key__",
-                sup_qty_col,
                 "unit_price_material",
                 "unit_price_install",
                 "total_price",
                 "unit",
             ]
+            cols.extend(qty_candidates)
             if "item_id" in ttab.columns:
                 cols.append("item_id")
             existing_cols = [c for c in cols if c in ttab.columns]
             tt = ttab[existing_cols].copy()
             supplier_lookup = _build_join_lookup(ttab)
-            tt[sup_qty_col] = pd.to_numeric(tt[sup_qty_col], errors="coerce")
+
+            active_qty_col: Optional[str] = None
+            for qty_col in qty_candidates:
+                if qty_col in tt.columns:
+                    tt[qty_col] = pd.to_numeric(tt[qty_col], errors="coerce")
+                    if active_qty_col is None and tt[qty_col].notna().any():
+                        active_qty_col = qty_col
+            if active_qty_col is None and qty_candidates:
+                # Fallback to the first available column (even if NaN) to keep structure consistent
+                first_candidate = next((col for col in qty_candidates if col in tt.columns), None)
+                active_qty_col = first_candidate
+
             tt["total_price"] = pd.to_numeric(tt["total_price"], errors="coerce").fillna(0)
             price_cols = [c for c in ["unit_price_material", "unit_price_install"] if c in tt.columns]
             if price_cols:
@@ -2289,12 +2305,11 @@ def compare(master: WorkbookData, bids: Dict[str, WorkbookData], join_mode: str 
             def _sum_with_min_count(series: pd.Series) -> float:
                 return series.sum(min_count=1)
 
-            tt_grouped = tt.groupby("__key__", sort=False, as_index=False).agg(
-                {
-                    sup_qty_col: _sum_with_min_count,
-                    "total_price": "sum",
-                }
-            )
+            agg_spec: Dict[str, Any] = {"total_price": "sum"}
+            if active_qty_col and active_qty_col in tt.columns:
+                agg_spec[active_qty_col] = _sum_with_min_count
+
+            tt_grouped = tt.groupby("__key__", sort=False, as_index=False).agg(agg_spec)
             tt_grouped = tt_grouped.merge(first_price, on="__key__", how="left")
             if "unit" in tt.columns:
                 unit_source = tt[["__key__", "unit"]].copy()
@@ -2303,12 +2318,18 @@ def compare(master: WorkbookData, bids: Dict[str, WorkbookData], join_mode: str 
                     unit_source.groupby("__key__", sort=False)["unit"].first().reset_index()
                 )
                 tt_grouped = tt_grouped.merge(unit_grouped, on="__key__", how="left")
-            qty = tt_grouped[sup_qty_col]
-            with np.errstate(divide="ignore", invalid="ignore"):
-                qty_for_division = qty.where(qty != 0)
-                tt_grouped["unit_price_combined"] = tt_grouped["total_price"] / qty_for_division
-            mask = qty_for_division.isna()
-            tt_grouped.loc[mask, "unit_price_combined"] = tt_grouped.loc[mask, "first_unit_price"]
+            qty_for_division: Optional[pd.Series] = None
+            if active_qty_col and active_qty_col in tt_grouped.columns:
+                qty = tt_grouped[active_qty_col]
+                with np.errstate(divide="ignore", invalid="ignore"):
+                    qty_for_division = qty.where(qty != 0)
+                    tt_grouped["unit_price_combined"] = tt_grouped["total_price"] / qty_for_division
+                mask = qty_for_division.isna()
+                tt_grouped.loc[mask, "unit_price_combined"] = tt_grouped.loc[
+                    mask, "first_unit_price"
+                ]
+            else:
+                tt_grouped["unit_price_combined"] = tt_grouped.get("first_unit_price", np.nan)
             tt_grouped.drop(columns=["first_unit_price"], inplace=True)
             master_join_series, supplier_join_series = _choose_join_columns(
                 master_lookup, supplier_lookup, join_mode
@@ -2316,7 +2337,14 @@ def compare(master: WorkbookData, bids: Dict[str, WorkbookData], join_mode: str 
             comp_join_keys = comp["__key__"].astype(str).map(master_join_series)
             tt_grouped["__join_key__"] = tt_grouped["__key__"].astype(str).map(supplier_join_series)
             comp["__join_key__"] = comp_join_keys
-            merge_cols = ["__join_key__", sup_qty_col, "unit_price_combined", "total_price"]
+            qty_merge_col: Optional[str] = None
+            if active_qty_col and active_qty_col in tt_grouped.columns:
+                qty_merge_col = f"__{sup_name}__quantity"
+                tt_grouped.rename(columns={active_qty_col: qty_merge_col}, inplace=True)
+
+            merge_cols = ["__join_key__", "unit_price_combined", "total_price"]
+            if qty_merge_col:
+                merge_cols.append(qty_merge_col)
             unit_merge_col: Optional[str] = None
             if "unit" in tt_grouped.columns:
                 unit_merge_col = f"__{sup_name}__unit"
@@ -2325,14 +2353,19 @@ def compare(master: WorkbookData, bids: Dict[str, WorkbookData], join_mode: str 
             comp = comp.merge(tt_grouped[merge_cols], on="__join_key__", how="left")
             comp.drop(columns=["__join_key__"], inplace=True, errors="ignore")
             rename_map = {
-                sup_qty_col: f"{sup_name} quantity",
                 "unit_price_combined": f"{sup_name} unit_price",
                 "total_price": f"{sup_name} total",
             }
+            if qty_merge_col:
+                rename_map[qty_merge_col] = f"{sup_name} quantity"
             if unit_merge_col:
                 rename_map[unit_merge_col] = f"{sup_name} unit"
             comp.rename(columns=rename_map, inplace=True)
-            comp[f"{sup_name} Δ qty"] = comp[f"{sup_name} quantity"] - comp["quantity"]
+            qty_col = f"{sup_name} quantity"
+            if qty_col in comp.columns:
+                comp[f"{sup_name} Δ qty"] = comp[qty_col] - comp["quantity"]
+            else:
+                comp[f"{sup_name} Δ qty"] = np.nan
 
         for sup_name, total_sum in supplier_totals.items():
             col = f"{sup_name} total"
