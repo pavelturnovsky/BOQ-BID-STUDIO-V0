@@ -4816,10 +4816,10 @@ with tab_dashboard:
                 leading_supplier = item_abs.loc[item_deltas.index].idxmax(axis=1)
                 item_chart_df = (
                     item_deltas.rename("value")
+                    .rename_axis("item")
                     .to_frame()
                     .join(leading_supplier.rename("supplier"), how="left")
                     .reset_index()
-                    .rename(columns={"index": "item"})
                 )
                 try:
                     fig2 = px.bar(
