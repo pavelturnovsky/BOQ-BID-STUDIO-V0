@@ -969,14 +969,46 @@ def build_recap_chart_data(
                 "Popisek",
             ]
         )
+
+    normalized_cols = [str(col) for col in value_cols]
     if not isinstance(net_series, pd.Series):
         net_series = pd.Series(net_series)
-    chart_df = pd.DataFrame(
+    working_series = net_series.copy()
+    try:
+        working_series.index = working_series.index.astype(str)
+    except Exception:
+        working_series.index = working_series.index.map(str)
+    aligned_values = working_series.reindex(normalized_cols)
+
+    working_df = pd.DataFrame(
         {
-            "Dodavatel": [col.replace(" total", "") for col in value_cols],
-            "Cena po odečtech": [net_series.get(col) for col in value_cols],
+            "source_column": normalized_cols,
+            "Cena po odečtech": aligned_values.values,
         }
     )
+    working_df["Dodavatel"] = working_df["source_column"].str.replace(
+        " total", "", regex=False
+    )
+
+    supplier_order: List[str] = []
+    for supplier in working_df["Dodavatel"].astype(str):
+        if supplier not in supplier_order:
+            supplier_order.append(supplier)
+
+    def _first_numeric(series: pd.Series) -> float:
+        numeric = pd.to_numeric(series, errors="coerce")
+        numeric = numeric.dropna()
+        if numeric.empty:
+            return np.nan
+        return float(numeric.iloc[0])
+
+    collapsed = (
+        working_df.groupby("Dodavatel", sort=False)["Cena po odečtech"]
+        .apply(_first_numeric)
+        .reindex(supplier_order)
+    )
+
+    chart_df = collapsed.reset_index()
     chart_df["Cena po odečtech"] = pd.to_numeric(
         chart_df["Cena po odečtech"], errors="coerce"
     )
