@@ -58,6 +58,21 @@ def test_build_recap_chart_data_handles_missing_master() -> None:
     assert bid_row["Cena (text)"] == "120,00 CZK"
 
 
+def test_build_recap_chart_data_collapses_duplicate_supplier_columns() -> None:
+    value_cols = ["Master total", "Bid1 total", "Bid1 total"]
+    net_series = pd.Series({
+        "Master total": 100.0,
+        "Bid1 total": 80.0,
+    })
+
+    chart_df = build_recap_chart_data(value_cols, net_series, currency_label="CZK")
+
+    assert list(chart_df["Dodavatel"]) == ["Master", "Bid1"]
+    bid_row = chart_df.loc[chart_df["Dodavatel"] == "Bid1"].iloc[0]
+    assert bid_row["Cena po odečtech"] == pytest.approx(80.0)
+    assert bid_row["Popisek"] == "80,00 CZK"
+
+
 def test_generate_recap_pdf_embeds_unicode_font() -> None:
     main_df = pd.DataFrame(
         {"č": ["1"], "Položka": ["Žluťoučký kůň"], "Master total": [123.0]}
