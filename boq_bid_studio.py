@@ -1314,7 +1314,9 @@ def detect_summary_rows(df: pd.DataFrame) -> pd.Series:
         r"sou[cč]et|souhrn|subtotal|total|celkem)"
     )
 
-    # Rows with explicit numeric data in summary_total are always summaries.
+    # Rows with explicit numeric data in summary_total are treated as summaries
+    # only if the value is meaningfully non-zero to avoid flagging regular rows
+    # that use ``0`` as a placeholder.
     summary_total_raw = df.get("summary_total")
     if summary_total_raw is None:
         summary_total_mask = pd.Series(False, index=index)
@@ -1323,7 +1325,8 @@ def detect_summary_rows(df: pd.DataFrame) -> pd.Series:
         has_value = summary_total_raw.notna()
         if summary_total_raw.dtype == object:
             has_value = has_value | summary_total_raw.astype(str).str.strip().ne("")
-        summary_total_mask = has_value & summary_total_numeric.notna()
+        non_zero = summary_total_numeric.notna() & summary_total_numeric.abs().gt(1e-9)
+        summary_total_mask = has_value & non_zero
 
     code_blank = df.get("code", "").astype(str).str.strip() == ""
     qty_zero = coerce_numeric(df.get("quantity", 0)).fillna(0) == 0
@@ -1358,7 +1361,8 @@ def is_summary_like_row(df: pd.DataFrame) -> pd.Series:
         has_value = summary_total_raw.notna()
         if summary_total_raw.dtype == object:
             has_value = has_value | summary_total_raw.astype(str).str.strip().ne("")
-        mask = mask | (has_value & summary_total_numeric.notna())
+        non_zero = summary_total_numeric.notna() & summary_total_numeric.abs().gt(1e-9)
+        mask = mask | (has_value & non_zero)
 
     desc = df.get("description", pd.Series("", index=index, dtype="object")).fillna("").astype(str)
     pattern_mask = desc.str.contains(
