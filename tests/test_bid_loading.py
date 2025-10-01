@@ -179,6 +179,52 @@ def test_compare_master_total_with_duplicate_supplier_rows() -> None:
     assert np.isclose(df.attrs["master_total_sum"], 100)
 
 
+def test_compare_ignores_summary_total_rows() -> None:
+    master_raw = pd.DataFrame(
+        {
+            "code": ["1", ""],
+            "description": ["Stěna", "Součet oddílu"],
+            "unit": ["m2", ""],
+            "quantity": ["10", ""],
+            "total price": ["1000", ""],
+            "summary total": ["", "1000"],
+        }
+    )
+    supplier_raw = pd.DataFrame(
+        {
+            "code": ["1", ""],
+            "description": ["Stěna", "Součet oddílu"],
+            "unit": ["m2", ""],
+            "quantity": ["10", ""],
+            "total price": ["950", ""],
+            "summary total": ["", "950"],
+        }
+    )
+
+    mapping = {
+        "code": 0,
+        "description": 1,
+        "unit": 2,
+        "quantity": 3,
+        "total_price": 4,
+        "summary_total": 5,
+    }
+
+    master_table = module.build_normalized_table(master_raw, mapping)
+    supplier_table = module.build_normalized_table(supplier_raw, mapping)
+
+    master = WorkbookData(name="Master", sheets={"Sheet": {"table": master_table}})
+    supplier = WorkbookData(name="Dodavatel", sheets={"Sheet": {"table": supplier_table}})
+
+    results = module.compare(master, {"Dodavatel": supplier})
+    assert "Sheet" in results
+    df = results["Sheet"]
+    assert df.shape[0] == 1
+    assert df.loc[df.index[0], "code"] == "1"
+    assert np.isclose(df.loc[df.index[0], "Master total"], 1000.0)
+    assert np.isclose(df.loc[df.index[0], "Dodavatel total"], 950.0)
+
+
 def test_compare_transfers_supplier_quantity_and_unit() -> None:
     master_table = module.build_normalized_table(
         pd.DataFrame(
