@@ -4098,6 +4098,25 @@ with tab_rekap:
                     return subset.sum(skipna=True)
                 return pd.Series(0.0, index=value_cols, dtype=float)
 
+            def extract_values_for_mask(mask: pd.Series) -> pd.Series:
+                """Return the first non-null value for each numeric column within ``mask``.
+
+                Rekapitulace tabulky obsahují již agregovaná čísla (sloupec
+                ``total price``), která potřebujeme převzít beze změny.
+                Sčítání by v těchto případech vedlo k chybným výsledkům, proto
+                vždy bereme první dostupnou hodnotu pro každý sloupec.
+                """
+
+                if value_cols and not working_sections.empty and mask.any():
+                    subset = working_sections.loc[mask, value_cols].apply(
+                        pd.to_numeric, errors="coerce"
+                    )
+                    first_values = subset.apply(
+                        lambda col: col.dropna().iloc[0] if not col.dropna().empty else np.nan
+                    )
+                    return first_values.reindex(value_cols)
+                return pd.Series(np.nan, index=value_cols, dtype=float)
+
             st.markdown("### Rekapitulace finančních nákladů stavby")
             main_detail = pd.DataFrame()
             main_detail_display_base = pd.DataFrame()
@@ -4146,7 +4165,7 @@ with tab_rekap:
                             if partial_mask.any():
                                 mask = partial_mask
                     if mask.any():
-                        sums = sum_for_mask(mask)
+                        sums = extract_values_for_mask(mask)
                         available_mask.loc[mask] = False
                     else:
                         sums = pd.Series(np.nan, index=value_cols, dtype=float)
