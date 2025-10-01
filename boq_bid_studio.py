@@ -272,6 +272,14 @@ def sanitize_key(prefix: str, name: str) -> str:
     return f"{prefix}_{safe}" if safe else f"{prefix}_anon"
 
 
+def make_widget_key(prefix: str, name: str) -> str:
+    """Return a Streamlit widget key safe for arbitrary sheet names."""
+
+    base = sanitize_key(prefix, name)
+    digest = hashlib.md5(str(name).encode("utf-8")).hexdigest()[:8]
+    return f"{base}_{digest}"
+
+
 def normalize_text(value: Any) -> str:
     """Return lower-case text without diacritics for fuzzy comparisons."""
 
@@ -3475,23 +3483,28 @@ with tab_compare:
                         key=natural_sort_key,
                     )
 
+                search_key = make_widget_key("compare_search", selected_sheet)
+                section_key = make_widget_key("compare_sections", selected_sheet)
+                lowest_key = make_widget_key("compare_lowest", selected_sheet)
+                limit_key = make_widget_key("compare_limit", selected_sheet)
+
                 filter_top = st.container()
                 with filter_top:
                     col_search, col_section, col_lowest, col_limit = st.columns([3, 3, 2, 1])
                     search_query = col_search.text_input(
                         "Vyhledávání (kód, popis, oddíl)",
-                        key=f"compare_search_{selected_sheet}",
+                        key=search_key,
                         placeholder="např. 3.1 dveře",
                     )
                     section_selection = col_section.multiselect(
                         "Oddíly",
                         dataset.section_labels,
-                        key=f"compare_sections_{selected_sheet}",
+                        key=section_key,
                     )
                     lowest_selection = col_lowest.multiselect(
                         "Dodavatel s nejnižší cenou",
                         lowest_supplier_options,
-                        key=f"compare_lowest_{selected_sheet}",
+                        key=lowest_key,
                     )
                     max_rows = col_limit.number_input(
                         "Limit řádků",
@@ -3499,19 +3512,23 @@ with tab_compare:
                         max_value=5000,
                         value=200,
                         step=10,
-                        key=f"compare_limit_{selected_sheet}",
+                        key=limit_key,
                     )
+
+                above_key = make_widget_key("compare_above_only", selected_sheet)
+                below_key = make_widget_key("compare_below_only", selected_sheet)
+                view_mode_key = make_widget_key("compare_view_mode", selected_sheet)
 
                 filter_bottom = st.container()
                 with filter_bottom:
                     col_above, col_below, col_view = st.columns([1, 1, 2])
                     show_above_only = col_above.checkbox(
                         "Jen nad horním limitem",
-                        key=f"compare_above_only_{selected_sheet}",
+                        key=above_key,
                     )
                     show_below_only = col_below.checkbox(
                         "Jen pod dolním limitem",
-                        key=f"compare_below_only_{selected_sheet}",
+                        key=below_key,
                     )
                     view_mode = col_view.radio(
                         "Rychlý přehled",
@@ -3523,7 +3540,7 @@ with tab_compare:
                         ],
                         index=0,
                         horizontal=True,
-                        key=f"compare_view_mode_{selected_sheet}",
+                        key=view_mode_key,
                     )
 
                 filtered = working.copy()
@@ -4763,12 +4780,9 @@ with tab_dashboard:
                 item_deltas = item_abs.sum(axis=1).sort_values(ascending=False).head(20)
                 leading_supplier = item_abs.loc[item_deltas.index].idxmax(axis=1)
                 item_chart_df = (
-                    pd.DataFrame(
-                        {
-                            "value": item_deltas,
-                            "supplier": leading_supplier.reindex(item_deltas.index),
-                        }
-                    )
+                    item_deltas.rename("value")
+                    .to_frame()
+                    .assign(supplier=leading_supplier.to_numpy())
                     .reset_index()
                     .rename(columns={"index": "item"})
                 )
