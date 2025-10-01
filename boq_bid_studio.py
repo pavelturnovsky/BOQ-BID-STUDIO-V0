@@ -1299,14 +1299,32 @@ def coerce_numeric(s: pd.Series) -> pd.Series:
 def detect_summary_rows(df: pd.DataFrame) -> pd.Series:
     """Return boolean Series marking summary/subtotal rows.
 
-    Detection combines textual patterns (e.g. "součet", "total") and
-    structural hints such as empty code with zero quantity and unit price.
+    In addition to textual and structural patterns, any row with a numeric
+    value in ``summary_total`` is treated as summary so that manually curated
+    control columns are respected.
     """
+
+    if df is None or df.empty:
+        return pd.Series(dtype=bool)
+
+    index = df.index
     desc_str = df.get("description", "").fillna("").astype(str)
     summary_patterns = (
         r"(celkem za odd[ií]l|sou[cč]et za odd[ií]l|celkov[aá] cena za list|sou[cč]et za list|"
         r"sou[cč]et|souhrn|subtotal|total|celkem)"
     )
+
+    # Rows with explicit numeric data in summary_total are always summaries.
+    summary_total_raw = df.get("summary_total")
+    if summary_total_raw is None:
+        summary_total_mask = pd.Series(False, index=index)
+    else:
+        summary_total_numeric = coerce_numeric(summary_total_raw)
+        has_value = summary_total_raw.notna()
+        if summary_total_raw.dtype == object:
+            has_value = has_value | summary_total_raw.astype(str).str.strip().ne("")
+        summary_total_mask = has_value & summary_total_numeric.notna()
+
     code_blank = df.get("code", "").astype(str).str.strip() == ""
     qty_zero = coerce_numeric(df.get("quantity", 0)).fillna(0) == 0
     unit_price_combined = (
@@ -1315,11 +1333,43 @@ def detect_summary_rows(df: pd.DataFrame) -> pd.Series:
     )
     up_zero = unit_price_combined == 0
     pattern_mask = desc_str.str.contains(summary_patterns, case=False, na=False)
-    totals = coerce_numeric(df.get("summary_total", 0)).fillna(0) + coerce_numeric(
-        df.get("total_price", 0)
-    ).fillna(0)
+    total_price_numeric = coerce_numeric(df.get("total_price", 0)).fillna(0)
     structural_mask = code_blank & qty_zero & up_zero
-    return pattern_mask & structural_mask & (totals != 0)
+    fallback_mask = pattern_mask & (structural_mask | total_price_numeric.eq(0))
+
+    return summary_total_mask | fallback_mask
+
+
+def is_summary_like_row(df: pd.DataFrame) -> pd.Series:
+    """Return boolean mask for rows that should be treated as summaries."""
+
+    if df is None or df.empty:
+        return pd.Series(dtype=bool)
+
+    index = df.index
+    mask = pd.Series(False, index=index)
+
+    if "is_summary" in df.columns:
+        mask = mask | df["is_summary"].fillna(False).astype(bool)
+
+    summary_total_raw = df.get("summary_total")
+    if summary_total_raw is not None:
+        summary_total_numeric = coerce_numeric(summary_total_raw)
+        has_value = summary_total_raw.notna()
+        if summary_total_raw.dtype == object:
+            has_value = has_value | summary_total_raw.astype(str).str.strip().ne("")
+        mask = mask | (has_value & summary_total_numeric.notna())
+
+    desc = df.get("description", pd.Series("", index=index, dtype="object")).fillna("").astype(str)
+    pattern_mask = desc.str.contains(
+        r"(sou[cč]et|celkem|sum[aá]r|subtotal|total)", case=False, na=False
+    )
+    code_blank = df.get("code", pd.Series("", index=index, dtype="object")).astype(str).str.strip() == ""
+    totals = coerce_numeric(df.get("total_price", np.nan))
+    totals_zero = totals.isna() | totals.eq(0)
+    mask = mask | (pattern_mask & code_blank & totals_zero)
+
+    return mask
 
 def classify_summary_type(df: pd.DataFrame, summary_mask: pd.Series) -> pd.Series:
     """Categorize summary rows into section, grand, or other totals."""
@@ -2157,8 +2207,9 @@ def compare(master: WorkbookData, bids: Dict[str, WorkbookData], join_mode: str 
         mtab = mobj.get("table", pd.DataFrame())
         if mtab is None or mtab.empty:
             continue
-        if "is_summary" in mtab.columns:
-            mtab = mtab[~mtab["is_summary"].fillna(False).astype(bool)]
+        summary_mask_master = is_summary_like_row(mtab)
+        if summary_mask_master.any():
+            mtab = mtab.loc[~summary_mask_master].copy()
         mtab = mtab[mtab["description"].astype(str).str.strip() != ""]
         base_cols = ["__key__", "code", "description", "unit", "quantity", "total_price"]
         if "item_id" in mtab.columns:
@@ -2197,8 +2248,9 @@ def compare(master: WorkbookData, bids: Dict[str, WorkbookData], join_mode: str 
                 comp[f"{sup_name} unit_price"] = np.nan
                 comp[f"{sup_name} total"] = np.nan
                 continue
-            if "is_summary" in ttab.columns:
-                ttab = ttab[~ttab["is_summary"].fillna(False).astype(bool)]
+            summary_mask_supplier = is_summary_like_row(ttab)
+            if summary_mask_supplier.any():
+                ttab = ttab.loc[~summary_mask_supplier].copy()
             ttab = ttab[ttab["description"].astype(str).str.strip() != ""]
             # join by __key__ (manual mapping already built in normalized table)
             sup_qty_col = "quantity_supplier" if "quantity_supplier" in ttab.columns else "quantity"
