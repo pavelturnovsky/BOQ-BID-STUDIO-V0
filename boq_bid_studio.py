@@ -721,8 +721,11 @@ def compute_display_column_widths(
             max_length = as_text.map(lambda x: len(str(x))).max()
         else:
             max_length = len(str(as_text))
-        header_length = len(str(col))
-        effective_len = max(int(max_length or 0), header_length)
+        header_text = str(col)
+        header_length = len(header_text)
+        effective_len = int(max_length or 0)
+        if "%" not in header_text:
+            effective_len = max(effective_len, header_length)
         width_px = max(min_width, min(max_width, (effective_len + 1) * 9))
         widths[col] = int(width_px)
     return widths
@@ -996,11 +999,14 @@ def build_recap_chart_data(
             continue
         deltas.append(((float(value) - master_val) / master_val) * 100.0)
     chart_df["Odchylka vs Master (%)"] = deltas
-    chart_df["Popisek"] = chart_df["Odchylka vs Master (%)"].apply(format_percent_label)
+    chart_df["Odchylka (text)"] = chart_df["Odchylka vs Master (%)"].apply(
+        format_percent_label
+    )
     chart_df["Cena (text)"] = [
         format_currency_label(value, currency_label)
         for value in chart_df["Cena po odečtech"]
     ]
+    chart_df["Popisek"] = chart_df["Cena (text)"]
     return chart_df
 
 
@@ -4439,12 +4445,12 @@ with tab_rekap:
                             textposition="outside",
                             texttemplate="%{text}",
                             customdata=np.column_stack(
-                                [chart_df["Cena (text)"].fillna("–")]
+                                [chart_df["Odchylka (text)"].fillna("–")]
                             ),
                             hovertemplate=(
                                 "<b>%{x}</b><br>"
-                                "Cena po odečtech: %{customdata[0]}<br>"
-                                "Odchylka vs Master: %{text}<extra></extra>"
+                                "Cena po odečtech: %{text}<br>"
+                                "Odchylka vs Master: %{customdata[0]}<extra></extra>"
                             ),
                         )
                         fig_recap.update_layout(yaxis_title=f"{base_currency}", showlegend=False)

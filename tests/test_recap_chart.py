@@ -32,9 +32,12 @@ def test_build_recap_chart_data_calculates_percentages() -> None:
     assert master_row["Odchylka vs Master (%)"] == pytest.approx(0.0)
     assert bid1_row["Odchylka vs Master (%)"] == pytest.approx(10.0)
     assert bid2_row["Odchylka vs Master (%)"] == pytest.approx(-10.0)
-    assert master_row["Popisek"] == "+0,00 %"
-    assert bid1_row["Popisek"] == "+10,00 %"
-    assert bid2_row["Popisek"] == "-10,00 %"
+    assert master_row["Popisek"] == "100,00 CZK"
+    assert bid1_row["Popisek"] == "110,00 CZK"
+    assert bid2_row["Popisek"] == "90,00 CZK"
+    assert master_row["Odchylka (text)"] == "+0,00 %"
+    assert bid1_row["Odchylka (text)"] == "+10,00 %"
+    assert bid2_row["Odchylka (text)"] == "-10,00 %"
     assert master_row["Cena (text)"] == "100,00 CZK"
     assert bid1_row["Cena (text)"] == "110,00 CZK"
     assert bid2_row["Cena (text)"] == "90,00 CZK"
@@ -51,7 +54,7 @@ def test_build_recap_chart_data_handles_missing_master() -> None:
     bid_row = chart_df.loc[chart_df["Dodavatel"] == "Bid1"].iloc[0]
 
     assert pd.isna(bid_row["Odchylka vs Master (%)"])
-    assert bid_row["Popisek"] == "–"
+    assert bid_row["Popisek"] == "120,00 CZK"
     assert bid_row["Cena (text)"] == "120,00 CZK"
 
 
