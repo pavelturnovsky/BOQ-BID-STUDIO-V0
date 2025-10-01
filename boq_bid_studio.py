@@ -1173,9 +1173,16 @@ def generate_tables_pdf(title: str, tables: List[Tuple[str, pd.DataFrame]]) -> b
 def _normalize_key_part(value: Any) -> str:
     """Normalize part of a widget key to avoid Streamlit duplicate IDs."""
 
-    safe = re.sub(r"[^0-9a-zA-Z_]+", "_", str(value))
+    raw_text = str(value)
+    safe = re.sub(r"[^0-9a-zA-Z_]+", "_", raw_text)
     safe = safe.strip("_")
-    return safe or "anon"
+    if not safe:
+        safe = "anon"
+
+    if safe != raw_text:
+        digest = hashlib.sha1(raw_text.encode("utf-8")).hexdigest()[:8]
+        return f"{safe}_{digest}"
+    return safe
 
 
 def make_widget_key(*parts: Any) -> str:
@@ -4782,7 +4789,7 @@ with tab_dashboard:
                 item_chart_df = (
                     item_deltas.rename("value")
                     .to_frame()
-                    .assign(supplier=leading_supplier.to_numpy())
+                    .join(leading_supplier.rename("supplier"), how="left")
                     .reset_index()
                     .rename(columns={"index": "item"})
                 )
