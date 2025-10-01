@@ -2628,7 +2628,7 @@ def overview_comparison(
     mtab = mtab.copy()
     if "__row_order__" not in mtab.columns:
         mtab["__row_order__"] = np.arange(len(mtab))
-    mtab["total_for_sum"] = mtab["total_price"].fillna(0)
+    mtab["total_for_sum"] = coerce_numeric(mtab.get("total_price", np.nan)).fillna(0)
     if "item_id" in mtab.columns:
         master_item_ids = normalize_identifier(mtab["item_id"])
     else:
@@ -2697,7 +2697,7 @@ def overview_comparison(
             if "is_summary" in ttab.columns:
                 ttab = ttab[~ttab["is_summary"].fillna(False).astype(bool)]
             ttab = ttab.copy()
-            ttab["total_for_sum"] = ttab["total_price"].fillna(0)
+            ttab["total_for_sum"] = coerce_numeric(ttab.get("total_price", np.nan)).fillna(0)
             if "item_id" in ttab.columns:
                 supplier_item_ids = normalize_identifier(ttab["item_id"])
             else:
