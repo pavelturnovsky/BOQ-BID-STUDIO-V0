@@ -694,6 +694,32 @@ def test_summary_total_column() -> None:
     assert pd.isna(out.loc[1, "total_price"])
 
 
+def test_preserve_summary_totals_keeps_values() -> None:
+    df = pd.DataFrame(
+        {
+            "code": ["1", ""],
+            "description": ["Položka", "Součet rekapitulace"],
+            "total_price": ["100", "200"],
+        }
+    )
+    mapping = {
+        "code": 0,
+        "description": 1,
+        "total_price": 2,
+        "summary_total": -1,
+    }
+    out_default = module.build_normalized_table(df, mapping)
+    assert pd.isna(out_default.loc[1, "total_price"])
+
+    out_preserved = module.build_normalized_table(
+        df,
+        mapping,
+        preserve_summary_totals=True,
+    )
+    assert out_preserved.loc[1, "total_price"] == 200
+    assert not out_preserved.loc[1, "is_summary"]
+
+
 def test_continuation_and_indirect_rows() -> None:
     df = pd.DataFrame(
         {
