@@ -3963,6 +3963,10 @@ with tab_compare:
                         )
                         detail_chart_df = detail_chart_df.dropna(subset=["total"])
                         if not detail_chart_df.empty:
+                            detail_chart_df["Cena (text)"] = [
+                                format_currency_label(value, currency)
+                                for value in detail_chart_df["total"]
+                            ]
                             if dataset.supplier_order:
                                 detail_chart_df["supplier"] = pd.Categorical(
                                     detail_chart_df["supplier"],
@@ -3976,7 +3980,16 @@ with tab_compare:
                                 y="total",
                                 color="supplier",
                                 color_discrete_map=chart_color_map,
+                                text="Cena (text)",
                                 title=f"Cenové srovnání — {detail_map.get(selected_index, selected_sheet)}",
+                            )
+                            fig_detail.update_traces(
+                                textposition="outside",
+                                texttemplate="%{text}",
+                                hovertemplate=(
+                                    "<b>%{x}</b><br>"
+                                    "Cena: %{text}<extra></extra>"
+                                ),
                             )
                             fig_detail.update_yaxes(title=f"Cena ({currency})")
                             fig_detail.update_layout(xaxis_title="Dodavatel")
