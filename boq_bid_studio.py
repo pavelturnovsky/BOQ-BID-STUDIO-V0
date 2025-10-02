@@ -4428,22 +4428,11 @@ with tab_rekap:
 
             st.markdown("### Souhrn hlavních položek a vedlejších nákladů")
 
-            def positive_recap_sum() -> pd.Series:
-                token_mask = pd.Series(False, index=working_sections.index)
-                if positive_tokens:
-                    token_mask = working_sections["__code_token__"].isin(positive_tokens)
-                if token_mask.any():
-                    return sum_for_mask(token_mask)
-                numeric_cols = [col for col in value_cols if col in main_detail.columns]
-                if not numeric_cols:
-                    return pd.Series(0.0, index=value_cols, dtype=float)
-                numeric_values = main_detail[numeric_cols].apply(
-                    pd.to_numeric, errors="coerce"
-                )
-                result = numeric_values.clip(lower=0).sum(skipna=True, min_count=1)
-                return result.reindex(value_cols, fill_value=0.0)
-
-            plus_sum = positive_recap_sum()
+            if "__code_token__" in working_sections.columns and positive_tokens:
+                plus_mask = working_sections["__code_token__"].isin(positive_tokens)
+            else:
+                plus_mask = pd.Series(False, index=working_sections.index)
+            plus_sum = sum_for_mask(plus_mask)
             deduction_sum = sum_for_mask(
                 working_sections["__code_token__"].isin(deduction_tokens), absolute=True
             )
