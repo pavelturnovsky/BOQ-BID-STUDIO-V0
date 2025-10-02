@@ -151,6 +151,9 @@ RECAP_CATEGORY_CONFIG = [
 ]
 
 
+MAIN_RECAP_TOKENS = ["0", "1", "2", "3", "4", "5"]
+
+
 PERCENT_DIFF_SUFFIX = "_pct_diff"
 PERCENT_DIFF_LABEL = " — ODCHYLKA VS MASTER (%)"
 UNMAPPED_ROW_LABEL = "Nemapované položky"
@@ -4333,11 +4336,7 @@ with tab_rekap:
             summary_display_converted = pd.DataFrame()
             chart_df = pd.DataFrame()
             fig_recap = None
-            positive_tokens = {
-                str(item.get("code_token", ""))
-                for item in RECAP_CATEGORY_CONFIG
-                if item.get("code_token") and not item.get("is_deduction")
-            }
+            section_totals_by_token: Dict[str, pd.Series] = {}
             deduction_tokens = {
                 str(item.get("code_token", ""))
                 for item in RECAP_CATEGORY_CONFIG
@@ -4400,6 +4399,12 @@ with tab_rekap:
                     for col in value_cols:
                         recap_row[col] = sums.get(col, np.nan)
                     recap_rows.append(recap_row)
+                    if code_token:
+                        section_totals_by_token[code_token] = sums.reindex(
+                            value_cols
+                        )
+                    elif target_key:
+                        section_totals_by_token[target_key] = sums.reindex(value_cols)
                 if recap_rows:
                     main_detail = pd.DataFrame(recap_rows)
                     for col in value_cols:
@@ -4428,14 +4433,25 @@ with tab_rekap:
 
             st.markdown("### Souhrn hlavních položek a vedlejších nákladů")
 
-            if "__code_token__" in working_sections.columns and positive_tokens:
-                plus_mask = working_sections["__code_token__"].isin(positive_tokens)
-            else:
-                plus_mask = pd.Series(False, index=working_sections.index)
-            plus_sum = sum_for_mask(plus_mask)
-            deduction_sum = sum_for_mask(
-                working_sections["__code_token__"].isin(deduction_tokens), absolute=True
-            )
+            def sum_series_for_tokens(tokens: Iterable[str], absolute: bool = False) -> pd.Series:
+                relevant: List[pd.Series] = []
+                for token in tokens:
+                    values = section_totals_by_token.get(str(token))
+                    if values is None:
+                        continue
+                    series = values.apply(pd.to_numeric, errors="coerce")
+                    if absolute:
+                        series = series.abs()
+                    relevant.append(series.reindex(value_cols))
+                if relevant:
+                    summed = pd.concat(relevant, axis=1).sum(
+                        axis=1, skipna=True, min_count=1
+                    )
+                    return summed.reindex(value_cols, fill_value=0.0)
+                return pd.Series(0.0, index=value_cols, dtype=float)
+
+            plus_sum = sum_series_for_tokens(MAIN_RECAP_TOKENS)
+            deduction_sum = sum_series_for_tokens(deduction_tokens, absolute=True)
             net_sum = plus_sum - deduction_sum
 
             indirect_sum = pd.Series(0.0, index=value_cols, dtype=float)
