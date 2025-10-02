@@ -1042,6 +1042,108 @@ def build_recap_chart_data(
     return chart_df
 
 
+def build_comparison_join_key(df: pd.DataFrame) -> pd.Series:
+    """Return a deterministic join key for comparison tables.
+
+    Primarily uses ``item_id`` when available and falls back to the
+    combination of code/description. The helper mirrors the behaviour of the
+    lookups used during workbook alignment so that aggregated data (e.g.
+    rekapitulace) can be reliably matched back to detail rows in the
+    comparison tab.
+    """
+
+    if df is None or df.empty:
+        return pd.Series(dtype=str)
+
+    index = df.index
+    if "item_id" in df.columns:
+        item_ids = normalize_identifier(df["item_id"]).fillna("")
+    else:
+        item_ids = pd.Series(["" for _ in range(len(index))], index=index, dtype=object)
+
+    codes = (
+        df.get("code", pd.Series(["" for _ in range(len(index))], index=index, dtype=object))
+        .fillna("")
+        .astype(str)
+        .str.strip()
+    )
+    descriptions = (
+        df.get("description", pd.Series(["" for _ in range(len(index))], index=index, dtype=object))
+        .fillna("")
+        .astype(str)
+        .str.strip()
+    )
+    fallback = (codes + "||" + descriptions).str.strip()
+    join_key = item_ids.astype(str).str.strip()
+    join_key = join_key.where(join_key != "", fallback)
+    return join_key.fillna("").astype(str)
+
+
+def align_total_columns(
+    base_df: pd.DataFrame,
+    totals_df: pd.DataFrame,
+    rename_map: Optional[Dict[str, str]] = None,
+) -> pd.DataFrame:
+    """Return ``base_df`` with value columns replaced by ``totals_df``.
+
+    The helper ensures that detailed comparison tables reuse the same summed
+    totals as the rekapitulace overview. It aligns rows via
+    :func:`build_comparison_join_key` and overwrites numeric values whenever a
+    matching aggregated value exists. Optional ``rename_map`` can be supplied
+    to harmonise supplier aliases before matching.
+    """
+
+    if base_df is None or base_df.empty or totals_df is None or totals_df.empty:
+        return base_df
+
+    working_totals = totals_df.copy()
+    if rename_map:
+        working_totals = working_totals.rename(columns=rename_map)
+
+    total_columns = [
+        col
+        for col in working_totals.columns
+        if str(col).endswith(" total") and not str(col).startswith("__present__")
+    ]
+    if not total_columns:
+        return base_df
+
+    base_with_keys = base_df.copy()
+    key_col = "__comparison_join_key__"
+    base_with_keys[key_col] = build_comparison_join_key(base_with_keys)
+    working_totals[key_col] = build_comparison_join_key(working_totals)
+
+    if base_with_keys[key_col].empty:
+        base_with_keys.drop(columns=[key_col], inplace=True, errors="ignore")
+        return base_with_keys
+
+    aggregated = (
+        working_totals.groupby(key_col, sort=False)[total_columns]
+        .sum(min_count=1)
+        .dropna(how="all")
+    )
+    if aggregated.empty:
+        base_with_keys.drop(columns=[key_col], inplace=True, errors="ignore")
+        return base_with_keys
+
+    base_with_keys = base_with_keys.set_index(key_col, drop=False)
+    for col in total_columns:
+        if col not in base_with_keys.columns:
+            base_with_keys[col] = np.nan
+        current = pd.to_numeric(base_with_keys[col], errors="coerce")
+        updates = pd.to_numeric(aggregated.get(col), errors="coerce")
+        if updates is None or updates.empty:
+            continue
+        updates_aligned = updates.reindex(current.index)
+        valid_mask = updates_aligned.notna()
+        if valid_mask.any():
+            current.loc[valid_mask] = updates_aligned.loc[valid_mask]
+        base_with_keys[col] = current
+    base_with_keys.reset_index(drop=True, inplace=True)
+    base_with_keys.drop(columns=[key_col], inplace=True, errors="ignore")
+    return base_with_keys
+
+
 def format_table_value(value: Any) -> str:
     if pd.isna(value):
         return "–"
@@ -2530,6 +2632,12 @@ def compare(master: WorkbookData, bids: Dict[str, WorkbookData], join_mode: str 
             comp["MIDRANGE supplier range"] = comp.apply(supplier_range, axis=1)
 
         comp.attrs["master_total_sum"] = master_total_sum
+        try:
+            sections_view, _, _, _, _ = overview_comparison(master, bids, sheet)
+        except Exception:
+            sections_view = pd.DataFrame()
+        if isinstance(sections_view, pd.DataFrame) and not sections_view.empty:
+            comp = align_total_columns(comp, sections_view)
         results[sheet] = comp
     return results
 
@@ -4194,7 +4302,8 @@ with tab_rekap:
                     )
                     if absolute:
                         subset = subset.abs()
-                    return subset.sum(skipna=True)
+                    summed = subset.sum(skipna=True, min_count=1)
+                    return summed.reindex(value_cols, fill_value=0.0)
                 return pd.Series(0.0, index=value_cols, dtype=float)
 
             def extract_values_for_mask(mask: pd.Series) -> pd.Series:
@@ -4320,20 +4429,18 @@ with tab_rekap:
             st.markdown("### Souhrn hlavních položek a vedlejších nákladů")
 
             def positive_recap_sum() -> pd.Series:
-                if main_detail.empty:
-                    if not positive_tokens:
-                        return pd.Series(0.0, index=value_cols, dtype=float)
-                    base_sum = sum_for_mask(
-                        working_sections["__code_token__"].isin(positive_tokens)
-                    )
-                    return base_sum.reindex(value_cols, fill_value=0.0)
+                token_mask = pd.Series(False, index=working_sections.index)
+                if positive_tokens:
+                    token_mask = working_sections["__code_token__"].isin(positive_tokens)
+                if token_mask.any():
+                    return sum_for_mask(token_mask)
                 numeric_cols = [col for col in value_cols if col in main_detail.columns]
                 if not numeric_cols:
                     return pd.Series(0.0, index=value_cols, dtype=float)
                 numeric_values = main_detail[numeric_cols].apply(
                     pd.to_numeric, errors="coerce"
                 )
-                result = numeric_values.clip(lower=0).sum(skipna=True)
+                result = numeric_values.clip(lower=0).sum(skipna=True, min_count=1)
                 return result.reindex(value_cols, fill_value=0.0)
 
             plus_sum = positive_recap_sum()
