@@ -4399,7 +4399,7 @@ with tab_preview:
                 component_key=json.dumps(widget_suffix),
             )
 
-            components.html(script, height=0, key=widget_suffix)
+            components.html(script, height=0)
 
         master_sheet = master_wb.sheets.get(selected_preview_sheet, {})
         master_table = master_sheet.get("table", pd.DataFrame())
