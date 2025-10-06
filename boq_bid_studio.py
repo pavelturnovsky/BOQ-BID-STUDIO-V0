@@ -10,11 +10,13 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
+from string import Template
 
 import numpy as np
 import pandas as pd
 import plotly.express as px
 import streamlit as st
+import streamlit.components.v1 as components
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4, landscape
 from reportlab.lib.enums import TA_CENTER, TA_LEFT
@@ -3859,8 +3861,14 @@ with tab_preview:
             sheet_label: str,
             table_label: str,
             widget_suffix: str,
-        ) -> None:
+        ) -> str:
             prepared = prepare_preview_table(df)
+            wrapper_id = f"preview-wrapper-{widget_suffix}"
+            st.markdown(
+                f"<div id=\"{wrapper_id}\" class=\"preview-table-wrapper\">",
+                unsafe_allow_html=True,
+            )
+
             row_count = len(prepared)
             if row_count == 0:
                 st.info("Tabulka je prázdná nebo list neobsahuje položky.")
@@ -3887,17 +3895,137 @@ with tab_preview:
                 key=f"{widget_suffix}_xlsx",
             )
 
+            st.markdown("</div>", unsafe_allow_html=True)
+            return wrapper_id
+
+        def inject_preview_scroll_sync(
+            master_wrapper: str,
+            target_wrapper: str,
+            widget_suffix: str,
+            enabled: bool,
+        ) -> None:
+            if not master_wrapper or not target_wrapper:
+                return
+
+            script_template = Template(
+                """
+<script>
+(function() {
+    const masterId = $master_id;
+    const targetId = $target_id;
+    const enabled = $enabled;
+    const componentKey = $component_key;
+    const parentWindow = window.parent;
+    if (!parentWindow) {
+        return;
+    }
+    const syncRegistry = parentWindow.__previewTableSync = parentWindow.__previewTableSync || {};
+    const selectors = [
+        '[data-testid="stDataFrameResizable"] [role="grid"]',
+        '[data-testid="stDataFrame"] [role="grid"]',
+        '[data-testid="stDataFrameResizable"] .stDataFrame',
+        '[data-testid="stDataFrame"] .stDataFrame',
+        '[data-testid="stDataFrame"]'
+    ];
+
+    function findScrollable(rootId) {
+        const root = parentWindow.document.getElementById(rootId);
+        if (!root) {
+            return null;
+        }
+        for (const selector of selectors) {
+            const el = root.querySelector(selector);
+            if (el) {
+                return el;
+            }
+        }
+        return null;
+    }
+
+    function setup(attempt) {
+        const masterEl = findScrollable(masterId);
+        const targetEl = findScrollable(targetId);
+        if (!masterEl || !targetEl) {
+            if (attempt < 25) {
+                window.setTimeout(() => setup(attempt + 1), 200);
+            }
+            return;
+        }
+
+        const existing = syncRegistry[componentKey];
+        if (existing) {
+            masterEl.removeEventListener('scroll', existing.masterHandler);
+            targetEl.removeEventListener('scroll', existing.targetHandler);
+            delete syncRegistry[componentKey];
+        }
+
+        if (!enabled) {
+            return;
+        }
+
+        let syncing = false;
+        const masterHandler = () => {
+            if (syncing) {
+                return;
+            }
+            syncing = true;
+            targetEl.scrollTop = masterEl.scrollTop;
+            targetEl.scrollLeft = masterEl.scrollLeft;
+            syncing = false;
+        };
+        const targetHandler = () => {
+            if (syncing) {
+                return;
+            }
+            syncing = true;
+            masterEl.scrollTop = targetEl.scrollTop;
+            masterEl.scrollLeft = targetEl.scrollLeft;
+            syncing = false;
+        };
+        masterEl.addEventListener('scroll', masterHandler, { passive: true });
+        targetEl.addEventListener('scroll', targetHandler, { passive: true });
+        syncRegistry[componentKey] = {
+            masterHandler: masterHandler,
+            targetHandler: targetHandler
+        };
+    }
+
+    setup(0);
+})();
+</script>
+"""
+            )
+
+            script = script_template.substitute(
+                master_id=json.dumps(master_wrapper),
+                target_id=json.dumps(target_wrapper),
+                enabled=str(enabled).lower(),
+                component_key=json.dumps(widget_suffix),
+            )
+
+            components.html(script, height=0, key=widget_suffix)
+
         master_sheet = master_wb.sheets.get(selected_preview_sheet, {})
         master_table = master_sheet.get("table", pd.DataFrame())
 
+        sync_scroll_enabled = st.checkbox(
+            "🔒 Zamknout společné rolování tabulek",
+            key="preview_sync_scroll_enabled",
+            help="Při zapnutí se Master a vybraná nabídka posouvají zároveň.",
+        )
+
+        master_wrapper_id = ""
         cols_preview = st.columns(2)
         with cols_preview[0]:
             st.markdown(f"**Master — {selected_preview_sheet}**")
-            render_preview_table(
+            master_widget_suffix = make_widget_key(
+                "preview", selected_preview_sheet, "master"
+            )
+            master_wrapper_id = render_preview_table(
                 master_table,
                 selected_preview_sheet,
                 "master",
-                make_widget_key("preview", selected_preview_sheet, "master"),
+                master_widget_suffix,
             )
 
         with cols_preview[1]:
@@ -3913,11 +4041,27 @@ with tab_preview:
                             st.warning("Tento list nebyl v nabídce nalezen.")
                             continue
                         else:
-                            render_preview_table(
+                            supplier_widget_suffix = make_widget_key(
+                                "preview",
+                                selected_preview_sheet,
+                                alias,
+                            )
+                            supplier_wrapper_id = render_preview_table(
                                 sheet_obj.get("table", pd.DataFrame()),
                                 selected_preview_sheet,
                                 alias,
-                                make_widget_key("preview", selected_preview_sheet, alias),
+                                supplier_widget_suffix,
+                            )
+                            inject_preview_scroll_sync(
+                                master_wrapper_id,
+                                supplier_wrapper_id,
+                                make_widget_key(
+                                    "preview",
+                                    selected_preview_sheet,
+                                    alias,
+                                    "sync",
+                                ),
+                                sync_scroll_enabled,
                             )
 
 # Pre-compute comparison results for reuse in tabs (after mapping)
