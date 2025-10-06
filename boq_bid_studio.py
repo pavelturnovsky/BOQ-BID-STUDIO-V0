@@ -1867,6 +1867,16 @@ def filter_table_by_keys(table: Any, keys: Set[str]) -> pd.DataFrame:
     return working.loc[mask].reset_index(drop=True)
 
 
+def count_rows_by_keys(table: Any, keys: Set[str]) -> int:
+    """Return the number of rows in ``table`` matching ``keys`` including duplicates."""
+
+    if not isinstance(table, pd.DataFrame) or table.empty or not keys:
+        return 0
+
+    subset = filter_table_by_keys(table, keys)
+    return int(len(subset))
+
+
 def describe_preview_rows(table: Any, keys: Set[str], max_items: int = 10) -> str:
     if not keys:
         return ""
@@ -2602,11 +2612,26 @@ def _choose_join_columns(
 
     use_item_ids = False
     if join_mode != "code+description" and not empty_master and not empty_supplier:
-        master_has_ids = master_lookup["__item_join__"].fillna("").astype(str).str.strip().ne("").any()
-        supplier_has_ids = (
-            supplier_lookup["__item_join__"].fillna("").astype(str).str.strip().ne("").any()
-        )
-        use_item_ids = master_has_ids and supplier_has_ids
+        master_ids = master_lookup["__item_join__"].fillna("").astype(str).str.strip()
+        supplier_ids = supplier_lookup["__item_join__"].fillna("").astype(str).str.strip()
+        master_non_empty = master_ids[master_ids != ""]
+        supplier_non_empty = supplier_ids[supplier_ids != ""]
+        master_has_ids = not master_non_empty.empty
+        supplier_has_ids = not supplier_non_empty.empty
+        if master_has_ids and supplier_has_ids:
+            master_coverage = len(master_non_empty) / max(len(master_ids), 1)
+            supplier_coverage = len(supplier_non_empty) / max(len(supplier_ids), 1)
+            master_duplicates = len(master_non_empty) - master_non_empty.nunique(dropna=True)
+            supplier_duplicates = len(supplier_non_empty) - supplier_non_empty.nunique(dropna=True)
+            master_duplicate_share = master_duplicates / max(len(master_non_empty), 1)
+            supplier_duplicate_share = supplier_duplicates / max(len(supplier_non_empty), 1)
+            if (
+                master_coverage >= 0.6
+                and supplier_coverage >= 0.6
+                and master_duplicate_share <= 0.4
+                and supplier_duplicate_share <= 0.4
+            ):
+                use_item_ids = True
 
     master_col = "__item_join__" if use_item_ids else "__fallback_join__"
     supplier_col = "__item_join__" if use_item_ids else "__fallback_join__"
@@ -4042,6 +4067,13 @@ with tab_preview:
                     ]
                     row_keys = extract_preview_row_keys(df)
 
+                    allowed_summary_columns = {"summary_total", "item_id"}
+                    preferred_cols = [
+                        col for col in numeric_cols if str(col).strip() in allowed_summary_columns
+                    ]
+                    if preferred_cols:
+                        numeric_cols = preferred_cols
+
                 display_df = format_preview_numbers(prepared, numeric_source, numeric_cols)
 
                 highlight_set: Set[str] = set()
@@ -4050,13 +4082,24 @@ with tab_preview:
 
                 if not display_df.empty:
                     if highlight_set and row_keys:
-                        def highlight_row(row: pd.Series) -> List[str]:
-                            key = row_keys[row.name] if row.name < len(row_keys) else ""
-                            if key in highlight_set:
-                                return [f"background-color: {highlight_color}"] * len(row)
-                            return [""] * len(row)
+                        row_index = pd.Series(row_keys[: len(display_df)], index=display_df.index)
+                        highlight_mask = row_index.isin(highlight_set)
+                        if highlight_mask.any():
+                            highlight_styles = pd.DataFrame(
+                                "",
+                                index=display_df.index,
+                                columns=display_df.columns,
+                            )
+                            highlight_styles.loc[highlight_mask, :] = (
+                                f"background-color: {highlight_color}"
+                            )
 
-                        styler = display_df.style.apply(highlight_row, axis=1)
+                            def apply_styles(_: pd.DataFrame) -> pd.DataFrame:
+                                return highlight_styles
+
+                            styler = display_df.style.apply(apply_styles, axis=None)
+                        else:
+                            styler = display_df.style
                         st.dataframe(styler, use_container_width=True, height=height)
                     else:
                         st.dataframe(display_df, use_container_width=True, height=height)
@@ -4114,47 +4157,187 @@ with tab_preview:
     const targetId = $target_id;
     const enabled = $enabled;
     const componentKey = $component_key;
-    const parentWindow = window.parent;
+    const parentWindow = window.parent || window;
     if (!parentWindow) {
+        return;
+    }
+    const parentDocument = parentWindow.document || document;
+    if (!parentDocument) {
         return;
     }
     const syncRegistry = parentWindow.__previewTableSync = parentWindow.__previewTableSync || {};
     const selectors = [
         '[data-testid="stDataFrameResizable"] [role="grid"]',
         '[data-testid="stDataFrame"] [role="grid"]',
+        '[data-testid="stDataFrameResizable"] .stDataFrame [role="grid"]',
+        '[data-testid="stDataFrame"] .stDataFrame [role="grid"]',
         '[data-testid="stDataFrameResizable"] .stDataFrame',
         '[data-testid="stDataFrame"] .stDataFrame',
-        '[data-testid="stDataFrame"]'
+        '[data-testid="stDataFrameResizable"] [data-baseweb="table"]',
+        '[data-testid="stDataFrame"] [data-baseweb="table"]',
+        '.stDataFrame [role="grid"]',
+        '.fixed-table',
+        '.ag-theme-streamlit'
     ];
 
-    function findScrollable(rootId) {
-        const root = parentWindow.document.getElementById(rootId);
-        if (!root) {
+    function resolveScrollable(element) {
+        if (!element || !element.ownerDocument) {
             return null;
         }
-        for (const selector of selectors) {
-            const el = root.querySelector(selector);
-            if (el) {
-                return el;
+        let current = element;
+        const visited = new Set();
+        while (current && current.ownerDocument && !visited.has(current)) {
+            visited.add(current);
+            if (
+                (current.scrollHeight > current.clientHeight) ||
+                (current.scrollWidth > current.clientWidth)
+            ) {
+                return current;
+            }
+            current = current.parentElement;
+        }
+        return element;
+    }
+
+    function collectScopes(root) {
+        const scopes = [];
+        if (!root) {
+            return scopes;
+        }
+        scopes.push(root);
+        if (root.querySelectorAll) {
+            const frames = root.querySelectorAll('iframe');
+            for (const frame of frames) {
+                if (!frame) {
+                    continue;
+                }
+                try {
+                    const frameDoc = frame.contentDocument || (frame.contentWindow && frame.contentWindow.document);
+                    if (frameDoc) {
+                        scopes.push(frameDoc);
+                        if (frameDoc.body) {
+                            scopes.push(frameDoc.body);
+                        }
+                        frame.addEventListener('load', () => setup(0), { once: true });
+                    }
+                } catch (err) {
+                    continue;
+                }
+            }
+        }
+        return scopes;
+    }
+
+    function findScrollable(rootId) {
+        const wrapper = parentDocument.getElementById(rootId);
+        if (!wrapper) {
+            return null;
+        }
+        const queue = collectScopes(wrapper);
+        const visited = new Set(queue);
+        while (queue.length) {
+            const scope = queue.shift();
+            if (!scope || !scope.querySelector) {
+                continue;
+            }
+            for (const selector of selectors) {
+                let element = null;
+                try {
+                    element = scope.querySelector(selector);
+                } catch (err) {
+                    element = null;
+                }
+                if (!element) {
+                    continue;
+                }
+                if (element.tagName && element.tagName.toLowerCase() === 'iframe') {
+                    try {
+                        const doc = element.contentDocument || (element.contentWindow && element.contentWindow.document);
+                        if (doc && !visited.has(doc)) {
+                            visited.add(doc);
+                            queue.push(doc);
+                            if (doc.body && !visited.has(doc.body)) {
+                                visited.add(doc.body);
+                                queue.push(doc.body);
+                            }
+                            element.addEventListener('load', () => setup(0), { once: true });
+                        }
+                    } catch (err) {
+                        continue;
+                    }
+                    continue;
+                }
+                const scrollable = resolveScrollable(element);
+                if (scrollable) {
+                    return scrollable;
+                }
+            }
+            if (scope.querySelectorAll) {
+                const nestedFrames = scope.querySelectorAll('iframe');
+                for (const frame of nestedFrames) {
+                    if (!frame || visited.has(frame)) {
+                        continue;
+                    }
+                    try {
+                        const doc = frame.contentDocument || (frame.contentWindow && frame.contentWindow.document);
+                        if (doc && !visited.has(doc)) {
+                            visited.add(doc);
+                            queue.push(doc);
+                            if (doc.body && !visited.has(doc.body)) {
+                                visited.add(doc.body);
+                                queue.push(doc.body);
+                            }
+                            frame.addEventListener('load', () => setup(0), { once: true });
+                        }
+                    } catch (err) {
+                        continue;
+                    }
+                }
             }
         }
         return null;
+    }
+
+    function watchWrapper(wrapperId) {
+        const root = parentDocument.getElementById(wrapperId);
+        if (!root || !parentWindow.MutationObserver) {
+            return null;
+        }
+        const observer = new parentWindow.MutationObserver(() => {
+            observer.disconnect();
+            window.setTimeout(() => setup(0), 0);
+        });
+        observer.observe(root, { childList: true, subtree: true });
+        return observer;
     }
 
     function setup(attempt) {
         const masterEl = findScrollable(masterId);
         const targetEl = findScrollable(targetId);
         if (!masterEl || !targetEl) {
-            if (attempt < 25) {
-                window.setTimeout(() => setup(attempt + 1), 200);
+            if (attempt < 40) {
+                window.setTimeout(() => setup(attempt + 1), 250);
             }
             return;
         }
 
         const existing = syncRegistry[componentKey];
         if (existing) {
-            masterEl.removeEventListener('scroll', existing.masterHandler);
-            targetEl.removeEventListener('scroll', existing.targetHandler);
+            if (existing.masterEl && existing.masterHandler) {
+                existing.masterEl.removeEventListener('scroll', existing.masterHandler);
+            }
+            if (existing.targetEl && existing.targetHandler) {
+                existing.targetEl.removeEventListener('scroll', existing.targetHandler);
+            }
+            if (existing.observers) {
+                for (const obs of existing.observers) {
+                    try {
+                        obs.disconnect();
+                    } catch (err) {
+                        continue;
+                    }
+                }
+            }
             delete syncRegistry[componentKey];
         }
 
@@ -4183,9 +4366,23 @@ with tab_preview:
         };
         masterEl.addEventListener('scroll', masterHandler, { passive: true });
         targetEl.addEventListener('scroll', targetHandler, { passive: true });
+
+        const observers = [];
+        const masterObserver = watchWrapper(masterId);
+        if (masterObserver) {
+            observers.push(masterObserver);
+        }
+        const targetObserver = watchWrapper(targetId);
+        if (targetObserver) {
+            observers.push(targetObserver);
+        }
+
         syncRegistry[componentKey] = {
             masterHandler: masterHandler,
-            targetHandler: targetHandler
+            targetHandler: targetHandler,
+            masterEl: masterEl,
+            targetEl: targetEl,
+            observers: observers
         };
     }
 
@@ -4249,11 +4446,12 @@ with tab_preview:
                 summary_title="Součty — Master",
             )
             if master_highlight_keys:
-                missing_lines = [
-                    f"- {alias}: {len(missing)} řádků chybí"
-                    for alias, missing in supplier_missing_map.items()
-                    if missing
-                ]
+                missing_lines = []
+                for alias, missing in supplier_missing_map.items():
+                    if not missing:
+                        continue
+                    missing_count = count_rows_by_keys(master_table, missing)
+                    missing_lines.append(f"- {alias}: {missing_count} řádků chybí")
                 if missing_lines:
                     st.caption(
                         "Červeně zvýrazněné řádky chybí v těchto nabídkách:\n" + "\n".join(missing_lines)
@@ -4291,8 +4489,11 @@ with tab_preview:
                             missing_keys = supplier_missing_map.get(alias, set())
                             extra_keys = supplier_extra_map.get(alias, set())
                             if missing_keys:
+                                missing_count = count_rows_by_keys(
+                                    master_table, missing_keys
+                                )
                                 st.error(
-                                    f"Chybí {len(missing_keys)} řádků oproti Master."
+                                    f"Chybí {missing_count} řádků oproti Master."
                                 )
                                 missing_desc = describe_preview_rows(
                                     master_table, missing_keys
@@ -4300,8 +4501,11 @@ with tab_preview:
                                 if missing_desc:
                                     st.markdown(missing_desc)
                             if extra_keys:
+                                extra_count = count_rows_by_keys(
+                                    supplier_table, extra_keys
+                                )
                                 st.info(
-                                    f"Dodavatel obsahuje {len(extra_keys)} řádků navíc oproti Master."
+                                    f"Dodavatel obsahuje {extra_count} řádků navíc oproti Master."
                                 )
                                 extra_desc = describe_preview_rows(
                                     supplier_table, extra_keys
