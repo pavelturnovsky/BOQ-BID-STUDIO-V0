@@ -1811,10 +1811,33 @@ def extract_preview_row_keys(df: pd.DataFrame) -> List[str]:
         .astype(str)
     )
 
+    # Build stable identifiers for rows. Prefer code + description so that
+    # reordering rows or inserting new ones does not falsely mark identical
+    # items as missing/extra. Track occurrences of each pair to distinguish
+    # duplicates while still ignoring the ``__row_order__`` helper column.
+    occurrence_counts: Dict[Tuple[str, str], int] = {}
     keys: List[str] = []
     for idx in working.index:
-        parts = [order_series.iloc[idx], code_series.iloc[idx], description_series.iloc[idx]]
-        key = "|".join(parts).strip("|")
+        code_value = code_series.iloc[idx]
+        desc_value = description_series.iloc[idx]
+        has_identity = bool(code_value or desc_value)
+
+        if has_identity:
+            pair = (code_value, desc_value)
+            occurrence = occurrence_counts.get(pair, 0) + 1
+            occurrence_counts[pair] = occurrence
+            payload = {
+                "code": code_value,
+                "description": desc_value,
+                "occurrence": occurrence,
+            }
+        else:
+            order_value = order_series.iloc[idx]
+            payload = {"index": int(idx)}
+            if order_value:
+                payload["row_order"] = order_value
+
+        key = json.dumps(payload, sort_keys=True, ensure_ascii=False)
         keys.append(key)
     return keys
 
