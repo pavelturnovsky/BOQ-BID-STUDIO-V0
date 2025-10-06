@@ -1729,6 +1729,45 @@ def make_unique_columns(columns: Iterable[Any]) -> List[str]:
     return unique_labels
 
 
+def sanitize_filename(value: Any, default: str = "data") -> str:
+    """Return a filesystem-friendly name derived from arbitrary text."""
+
+    if value is None:
+        return default
+    text = str(value).strip()
+    if not text:
+        return default
+    normalized = unicodedata.normalize("NFKD", text)
+    without_diacritics = "".join(ch for ch in normalized if not unicodedata.combining(ch))
+    safe = re.sub(r"[^0-9A-Za-z]+", "_", without_diacritics)
+    safe = safe.strip("_")
+    return safe or default
+
+
+def prepare_preview_table(table: Any) -> pd.DataFrame:
+    """Prepare a normalized table for preview/export by removing helper columns."""
+
+    if not isinstance(table, pd.DataFrame) or table.empty:
+        return pd.DataFrame()
+
+    display = table.copy()
+    helper_cols = [col for col in display.columns if str(col).startswith("__")]
+    display = display.drop(columns=helper_cols, errors="ignore")
+    display = display.reset_index(drop=True)
+    return display
+
+
+def dataframe_to_excel_bytes(df: pd.DataFrame, sheet_name: str) -> bytes:
+    """Serialize a dataframe into XLSX bytes for download widgets."""
+
+    buffer = io.BytesIO()
+    safe_sheet = sheet_name[:31] or "Data"
+    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name=safe_sheet)
+    buffer.seek(0)
+    return buffer.getvalue()
+
+
 def show_df(df: pd.DataFrame) -> None:
     if not isinstance(df, pd.DataFrame):
         st.dataframe(df)
@@ -3747,8 +3786,9 @@ st.session_state["compare_threshold_range"] = (min_threshold, max_threshold)
 ensure_exchange_rate_state()
 
 # ------------- Tabs -------------
-tab_data, tab_compare, tab_summary, tab_rekap, tab_dashboard, tab_qa = st.tabs([
+tab_data, tab_preview, tab_compare, tab_summary, tab_rekap, tab_dashboard, tab_qa = st.tabs([
     "📑 Mapování",
+    "🧾 Kontrola dat",
     "⚖️ Porovnání",
     "📋 Celkový přehled",
     "📊 Rekapitulace",
@@ -3798,6 +3838,87 @@ with tab_data:
                         section_id=f"bid_recap_{sup_name}",
                     )
     st.success("Mapování připraveno. Přepni na záložku **Porovnání**.")
+
+with tab_preview:
+    st.subheader("Kontrola načtených tabulek")
+
+    preview_sheets = [sheet for sheet in compare_sheets if sheet in master_wb.sheets]
+    if not preview_sheets:
+        st.info("Vyber alespoň jeden list pro zobrazení v levém panelu.")
+    else:
+        default_preview = preview_sheets[0]
+        selected_preview_sheet = st.selectbox(
+            "List pro kontrolu",
+            preview_sheets,
+            index=preview_sheets.index(default_preview) if default_preview in preview_sheets else 0,
+            key="preview_sheet_select",
+        )
+
+        def render_preview_table(
+            df: pd.DataFrame,
+            sheet_label: str,
+            table_label: str,
+            widget_suffix: str,
+        ) -> None:
+            prepared = prepare_preview_table(df)
+            row_count = len(prepared)
+            if row_count == 0:
+                st.info("Tabulka je prázdná nebo list neobsahuje položky.")
+            height = min(900, 220 + max(row_count, 1) * 28)
+            st.dataframe(prepared, use_container_width=True, height=height)
+            st.caption(f"{row_count} řádků")
+
+            file_stub = sanitize_filename(f"{table_label}_{sheet_label}")
+            csv_bytes = prepared.to_csv(index=False).encode("utf-8-sig")
+            excel_bytes = dataframe_to_excel_bytes(prepared, sheet_label)
+            export_cols = st.columns(2)
+            export_cols[0].download_button(
+                "⬇️ Export CSV",
+                data=csv_bytes,
+                file_name=f"{file_stub}.csv",
+                mime="text/csv",
+                key=f"{widget_suffix}_csv",
+            )
+            export_cols[1].download_button(
+                "⬇️ Export XLSX",
+                data=excel_bytes,
+                file_name=f"{file_stub}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key=f"{widget_suffix}_xlsx",
+            )
+
+        master_sheet = master_wb.sheets.get(selected_preview_sheet, {})
+        master_table = master_sheet.get("table", pd.DataFrame())
+
+        cols_preview = st.columns(2)
+        with cols_preview[0]:
+            st.markdown(f"**Master — {selected_preview_sheet}**")
+            render_preview_table(
+                master_table,
+                selected_preview_sheet,
+                "master",
+                make_widget_key("preview", selected_preview_sheet, "master"),
+            )
+
+        with cols_preview[1]:
+            if not bids_dict:
+                st.info("Nahraj alespoň jednu nabídku dodavatele v levém panelu.")
+            else:
+                supplier_tabs = st.tabs([display_names.get(name, name) for name in bids_dict.keys()])
+                for tab, (sup_name, wb) in zip(supplier_tabs, bids_dict.items()):
+                    alias = display_names.get(sup_name, sup_name)
+                    with tab:
+                        sheet_obj = wb.sheets.get(selected_preview_sheet)
+                        if sheet_obj is None:
+                            st.warning("Tento list nebyl v nabídce nalezen.")
+                            continue
+                        else:
+                            render_preview_table(
+                                sheet_obj.get("table", pd.DataFrame()),
+                                selected_preview_sheet,
+                                alias,
+                                make_widget_key("preview", selected_preview_sheet, alias),
+                            )
 
 # Pre-compute comparison results for reuse in tabs (after mapping)
 compare_results: Dict[str, pd.DataFrame] = {}
