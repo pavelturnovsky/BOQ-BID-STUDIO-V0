@@ -1850,7 +1850,7 @@ def extract_preview_key_set(table: Any) -> Set[str]:
     return {key for key in keys if key}
 
 
-def format_preview_integer(value: Any) -> str:
+def format_preview_number(value: Any, decimals: int = 1) -> str:
     if value is None or (isinstance(value, str) and not value.strip()):
         return ""
     try:
@@ -1859,8 +1859,15 @@ def format_preview_integer(value: Any) -> str:
         return str(value)
     if math.isnan(numeric_value):
         return ""
-    rounded = int(np.round(numeric_value))
-    return f"{rounded:,}".replace(",", "\u00a0")
+
+    format_spec = f",.{max(decimals, 0)}f"
+    rounded = float(np.round(numeric_value, decimals)) if decimals > 0 else float(
+        np.round(numeric_value)
+    )
+    formatted = format(rounded, format_spec)
+    formatted = formatted.replace(",", "\u00a0")
+    formatted = formatted.replace(".", ",")
+    return formatted
 
 
 def format_preview_numbers(
@@ -1872,7 +1879,7 @@ def format_preview_numbers(
     formatted = display_df.copy()
     for col in numeric_cols:
         if col in numeric_source.columns:
-            formatted[col] = numeric_source[col].apply(format_preview_integer)
+            formatted[col] = numeric_source[col].apply(format_preview_number)
     return formatted
 
 
@@ -1890,7 +1897,7 @@ def build_preview_summary(
         total = series.sum(min_count=1)
         if pd.isna(total):
             continue
-        rows.append({"Sloupec": col, "Součet": format_preview_integer(total)})
+        rows.append({"Sloupec": col, "Součet": format_preview_number(total)})
 
     if not rows:
         return pd.DataFrame(columns=["Sloupec", "Součet"])
@@ -4078,6 +4085,25 @@ with tab_data:
 with tab_preview:
     st.subheader("Kontrola načtených tabulek")
 
+    st.markdown(
+        """
+        <style>
+        .preview-table-wrapper .stTabs [role="tablist"] {
+            margin-bottom: 0.25rem;
+        }
+        .preview-table-wrapper .stTabs [role="tabpanel"] > div:first-child {
+            padding-top: 0 !important;
+        }
+        .preview-table-wrapper {
+            display: flex;
+            flex-direction: column;
+            gap: 0.5rem;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
     preview_sheets = [sheet for sheet in compare_sheets if sheet in master_wb.sheets]
     if not preview_sheets:
         st.info("Vyber alespoň jeden list pro zobrazení v levém panelu.")
@@ -4103,10 +4129,14 @@ with tab_preview:
         ) -> str:
             prepared = prepare_preview_table(df)
             wrapper_id = f"preview-wrapper-{widget_suffix}"
+            label_slug = re.sub(r"[^0-9A-Za-z_-]+", "-", str(table_label).strip().lower()).strip("-")
+            if not label_slug:
+                label_slug = "table"
+            wrapper_class = f"preview-table-wrapper preview-{label_slug}"
             wrapper_container = st.container()
             with wrapper_container:
                 st.markdown(
-                    f"<div id=\"{wrapper_id}\" class=\"preview-table-wrapper\">",
+                    f"<div id=\"{wrapper_id}\" class=\"{wrapper_class}\">",
                     unsafe_allow_html=True,
                 )
 
@@ -4129,9 +4159,16 @@ with tab_preview:
                     ]
                     row_keys = extract_preview_row_keys(df)
 
-                    allowed_summary_columns = {"summary_total", "item_id"}
+                    def _normalize_summary_label(label: Any) -> str:
+                        text = str(label or "").strip().lower()
+                        text = text.replace("_", " ")
+                        return re.sub(r"\s+", " ", text)
+
+                    summary_targets = {"total price", "item id", "summary total"}
                     preferred_cols = [
-                        col for col in numeric_cols if str(col).strip() in allowed_summary_columns
+                        col
+                        for col in numeric_cols
+                        if _normalize_summary_label(col) in summary_targets
                     ]
                     if preferred_cols:
                         numeric_cols = preferred_cols
@@ -4237,6 +4274,9 @@ with tab_preview:
         '[data-testid="stDataFrame"] .stDataFrame',
         '[data-testid="stDataFrameResizable"] [data-baseweb="table"]',
         '[data-testid="stDataFrame"] [data-baseweb="table"]',
+        '[data-testid="stDataFrame"] [data-testid="styled-dataframe"]',
+        '[data-testid="stDataFrame"] table',
+        '[data-testid="stDataFrame"] [class*="stDataFrame"]',
         '.stDataFrame [role="grid"]',
         '.fixed-table',
         '.ag-theme-streamlit'
@@ -4258,7 +4298,7 @@ with tab_preview:
             }
             current = current.parentElement;
         }
-        return element;
+        return null;
     }
 
     function collectScopes(root) {
@@ -4354,6 +4394,15 @@ with tab_preview:
                     } catch (err) {
                         continue;
                     }
+                }
+            }
+        }
+        if (wrapper && wrapper.querySelectorAll) {
+            const fallbackElements = wrapper.querySelectorAll('*');
+            for (const element of fallbackElements) {
+                const scrollable = resolveScrollable(element);
+                if (scrollable) {
+                    return scrollable;
                 }
             }
         }
@@ -4461,7 +4510,11 @@ with tab_preview:
                 component_key=json.dumps(widget_suffix),
             )
 
-            components.html(script, height=0)
+            components.html(
+                script,
+                height=0,
+                key=f"preview_sync_script_{widget_suffix}",
+            )
 
         master_sheet = master_wb.sheets.get(selected_preview_sheet, {})
         master_table = master_sheet.get("table", pd.DataFrame())
@@ -4493,31 +4546,34 @@ with tab_preview:
         master_wrapper_id = ""
         cols_preview = st.columns(2)
         with cols_preview[0]:
-            st.markdown(f"**Master — {selected_preview_sheet}**")
-            master_widget_suffix = make_widget_key(
-                "preview", selected_preview_sheet, "master"
-            )
-            master_wrapper_id = render_preview_table(
-                master_table,
-                selected_preview_sheet,
-                "master",
-                master_widget_suffix,
-                highlight_keys=master_highlight_keys,
-                highlight_color="#FFE3E3",
-                currency_label=currency,
-                summary_title="Součty — Master",
-            )
-            if master_highlight_keys:
-                missing_lines = []
-                for alias, missing in supplier_missing_map.items():
-                    if not missing:
-                        continue
-                    missing_count = count_rows_by_keys(master_table, missing)
-                    missing_lines.append(f"- {alias}: {missing_count} řádků chybí")
-                if missing_lines:
-                    st.caption(
-                        "Červeně zvýrazněné řádky chybí v těchto nabídkách:\n" + "\n".join(missing_lines)
-                    )
+            master_tab_label = f"Master — {selected_preview_sheet}"
+            master_tab, = st.tabs([master_tab_label])
+            with master_tab:
+                master_widget_suffix = make_widget_key(
+                    "preview", selected_preview_sheet, "master"
+                )
+                master_wrapper_id = render_preview_table(
+                    master_table,
+                    selected_preview_sheet,
+                    "master",
+                    master_widget_suffix,
+                    highlight_keys=master_highlight_keys,
+                    highlight_color="#FFE3E3",
+                    currency_label=currency,
+                    summary_title="Součty — Master",
+                )
+                if master_highlight_keys:
+                    missing_lines = []
+                    for alias, missing in supplier_missing_map.items():
+                        if not missing:
+                            continue
+                        missing_count = count_rows_by_keys(master_table, missing)
+                        missing_lines.append(f"- {alias}: {missing_count} řádků chybí")
+                    if missing_lines:
+                        st.caption(
+                            "Červeně zvýrazněné řádky chybí v těchto nabídkách:\n"
+                            + "\n".join(missing_lines)
+                        )
 
         with cols_preview[1]:
             if not bids_dict:
