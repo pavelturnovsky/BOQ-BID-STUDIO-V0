@@ -1,5 +1,6 @@
 
 import hashlib
+import logging
 import io
 import math
 import re
@@ -1573,6 +1574,10 @@ def is_summary_like_row(df: pd.DataFrame) -> pd.Series:
     totals_zero = totals.isna() | totals.eq(0)
     mask = mask | (pattern_mask & code_blank & totals_zero)
 
+    include_summary_other = summary_rows_included_as_items(df)
+    if isinstance(include_summary_other, pd.Series) and not include_summary_other.empty:
+        mask = mask & ~include_summary_other.reindex(index, fill_value=False)
+
     return mask
 
 def classify_summary_type(df: pd.DataFrame, summary_mask: pd.Series) -> pd.Series:
@@ -1585,6 +1590,44 @@ def classify_summary_type(df: pd.DataFrame, summary_mask: pd.Series) -> pd.Serie
     summary_type.loc[summary_mask & grand] = "grand"
     summary_type.loc[summary_mask & (summary_type == "")] = "other"
     return summary_type
+
+
+def summary_rows_included_as_items(df: pd.DataFrame) -> pd.Series:
+    """Return mask for summary rows that should still behave like regular items."""
+
+    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+        return pd.Series(dtype=bool)
+
+    index = df.index
+    summary_flag = df.get("is_summary")
+    if isinstance(summary_flag, pd.Series):
+        base = summary_flag.fillna(False).astype(bool)
+    else:
+        base = pd.Series(False, index=index, dtype=bool)
+
+    summary_type_series = (
+        df.get("summary_type", pd.Series("", index=index, dtype="object"))
+        .fillna("")
+        .astype(str)
+        .str.lower()
+    )
+
+    summary_total_series = df.get("summary_total")
+    if isinstance(summary_total_series, pd.Series):
+        summary_total_numeric = coerce_numeric(summary_total_series)
+        has_value = summary_total_series.notna()
+        if summary_total_series.dtype == object:
+            has_value = has_value & summary_total_series.astype(str).str.strip().ne("")
+        non_zero = summary_total_numeric.notna() & summary_total_numeric.abs().gt(1e-9)
+        effective = has_value & non_zero
+        if effective.any():
+            missing = ~effective
+        else:
+            missing = pd.Series(False, index=index, dtype=bool)
+    else:
+        missing = pd.Series(False, index=index, dtype=bool)
+
+    return base & summary_type_series.eq("other") & missing
 
 @st.cache_data
 def build_normalized_table(
@@ -1643,10 +1686,14 @@ def build_normalized_table(
     out = out[~dup_mask].copy()
 
     # Preserve summary totals separately and exclude them from item totals
-    out.loc[summary_mask & out["summary_total"].isna(), "summary_total"] = out.loc[
-        summary_mask & out["summary_total"].isna(), "total_price"
+    include_summary_other = summary_rows_included_as_items(out)
+    adjustable_summary_mask = summary_mask & ~include_summary_other
+    out.loc[
+        adjustable_summary_mask & out["summary_total"].isna(), "summary_total"
+    ] = out.loc[
+        adjustable_summary_mask & out["summary_total"].isna(), "total_price"
     ]
-    out.loc[summary_mask, "total_price"] = np.nan
+    out.loc[adjustable_summary_mask, "total_price"] = np.nan
 
     # Compute section totals (propagate section summary values upwards)
     section_vals = out["summary_total"].where(out["summary_type"] == "section")
@@ -1668,6 +1715,8 @@ def build_normalized_table(
     desc_str = out["description"].fillna("").astype(str)
     numeric_cols = out.select_dtypes(include=[np.number]).columns
     summary_col = out["is_summary"].fillna(False).astype(bool)
+    if isinstance(include_summary_other, pd.Series):
+        summary_col &= ~include_summary_other.reindex(out.index, fill_value=False)
     out = out[~((out[numeric_cols].isna() | (out[numeric_cols] == 0)).all(axis=1) & ~summary_col)]
     # Canonical key (will be overridden if user picks dedicated Item ID)
     out["__key__"] = (
@@ -1708,7 +1757,7 @@ def build_normalized_table(
 def format_number(x):
     if pd.isna(x):
         return ""
-    return f"{x:,.2f}".replace(",", " ").replace(".", ",")
+    return f"{x:,.1f}".replace(",", " ").replace(".", ",")
 
 
 def make_unique_columns(columns: Iterable[Any]) -> List[str]:
@@ -1917,7 +1966,7 @@ def describe_summary_columns(numeric_cols: List[str], currency_label: Optional[s
     )
     return (
         "Součty níže vycházejí z numerických sloupců: "
-        f"{column_list}. Hodnoty jsou zaokrouhleny na celá čísla a zobrazeny s mezerami mezi tisíci."
+        f"{column_list}. Hodnoty jsou zaokrouhleny na jedno desetinné místo a zobrazeny s mezerami mezi tisíci."
         f"{currency_note}"
     )
 
@@ -3164,7 +3213,11 @@ def overview_comparison(
     if mtab is None or mtab.empty:
         return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
     if "is_summary" in mtab.columns and not master_preserve_totals:
-        mtab = mtab[~mtab["is_summary"].fillna(False).astype(bool)]
+        summary_mask = mtab["is_summary"].fillna(False).astype(bool)
+        include_summary_other = summary_rows_included_as_items(mtab)
+        if isinstance(include_summary_other, pd.Series):
+            summary_mask &= ~include_summary_other.reindex(mtab.index, fill_value=False)
+        mtab = mtab[~summary_mask]
     mtab = mtab.copy()
     if "__row_order__" not in mtab.columns:
         mtab["__row_order__"] = np.arange(len(mtab))
@@ -3240,7 +3293,11 @@ def overview_comparison(
             df[f"{sup_name} total"] = np.nan
         else:
             if "is_summary" in ttab.columns and not supplier_preserve_totals:
-                ttab = ttab[~ttab["is_summary"].fillna(False).astype(bool)]
+                summary_mask = ttab["is_summary"].fillna(False).astype(bool)
+                include_summary_other = summary_rows_included_as_items(ttab)
+                if isinstance(include_summary_other, pd.Series):
+                    summary_mask &= ~include_summary_other.reindex(ttab.index, fill_value=False)
+                ttab = ttab[~summary_mask]
             ttab = ttab.copy()
             ttab["total_for_sum"] = coerce_numeric(ttab.get("total_price", np.nan)).fillna(0)
             if "item_id" in ttab.columns:
@@ -3696,7 +3753,11 @@ def validate_totals(df: pd.DataFrame) -> float:
 
     line_tp = coerce_numeric(df.get("total_price", 0)).fillna(0.0)
     sum_tp = coerce_numeric(df.get("summary_total", 0)).fillna(0.0)
-    summaries = df["is_summary"].fillna(False).astype(bool).tolist()
+    summary_mask = df["is_summary"].fillna(False).astype(bool)
+    include_summary_other = summary_rows_included_as_items(df)
+    if isinstance(include_summary_other, pd.Series):
+        summary_mask &= ~include_summary_other.reindex(df.index, fill_value=False)
+    summaries = summary_mask.tolist()
 
     diffs: List[float] = []
     running = 0.0
@@ -3730,7 +3791,11 @@ def qa_checks(master: WorkbookData, bids: Dict[str, WorkbookData]) -> Dict[str, 
             continue
         mtotal_diff = validate_totals(mtab)
         if "is_summary" in mtab.columns:
-            mtab_clean = mtab[~mtab["is_summary"].fillna(False).astype(bool)]
+            summary_mask = mtab["is_summary"].fillna(False).astype(bool)
+            include_summary_other = summary_rows_included_as_items(mtab)
+            if isinstance(include_summary_other, pd.Series):
+                summary_mask &= ~include_summary_other.reindex(mtab.index, fill_value=False)
+            mtab_clean = mtab[~summary_mask]
         else:
             mtab_clean = mtab
         mkeys = set(mtab_clean["__key__"].dropna().astype(str))
@@ -3753,7 +3818,11 @@ def qa_checks(master: WorkbookData, bids: Dict[str, WorkbookData]) -> Dict[str, 
             else:
                 total_diff = validate_totals(ttab)
                 if "is_summary" in ttab.columns:
-                    ttab_clean = ttab[~ttab["is_summary"].fillna(False).astype(bool)]
+                    summary_mask = ttab["is_summary"].fillna(False).astype(bool)
+                    include_summary_other = summary_rows_included_as_items(ttab)
+                    if isinstance(include_summary_other, pd.Series):
+                        summary_mask &= ~include_summary_other.reindex(ttab.index, fill_value=False)
+                    ttab_clean = ttab[~summary_mask]
                 else:
                     ttab_clean = ttab
                 tkeys_series = ttab_clean["__key__"].dropna().astype(str)
@@ -4164,7 +4233,7 @@ with tab_preview:
                         text = text.replace("_", " ")
                         return re.sub(r"\s+", " ", text)
 
-                    summary_targets = {"total price", "item id", "summary total"}
+                    summary_targets = {"total price"}
                     preferred_cols = [
                         col
                         for col in numeric_cols
@@ -4510,11 +4579,18 @@ with tab_preview:
                 component_key=json.dumps(widget_suffix),
             )
 
-            components.html(
-                script,
-                height=0,
-                key=f"preview_sync_script_{widget_suffix}",
-            )
+            try:
+                components.html(
+                    script,
+                    height=1,
+                    key=f"preview_sync_script_{widget_suffix}",
+                )
+            except Exception as exc:  # pragma: no cover - guard against Streamlit quirks
+                logging.getLogger(__name__).warning(
+                    "Failed to initialize preview scroll sync for %s: %s",
+                    widget_suffix,
+                    exc,
+                )
 
         master_sheet = master_wb.sheets.get(selected_preview_sheet, {})
         master_table = master_sheet.get("table", pd.DataFrame())
