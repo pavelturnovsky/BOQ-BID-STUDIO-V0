@@ -9,7 +9,7 @@ import unicodedata
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 from string import Template
 
 import numpy as np
@@ -1753,10 +1753,157 @@ def prepare_preview_table(table: Any) -> pd.DataFrame:
         return pd.DataFrame()
 
     display = table.copy()
+    display = display.reset_index(drop=True)
     helper_cols = [col for col in display.columns if str(col).startswith("__")]
     display = display.drop(columns=helper_cols, errors="ignore")
     display = display.reset_index(drop=True)
     return display
+
+
+def extract_preview_row_keys(df: pd.DataFrame) -> List[str]:
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return []
+
+    working = df.reset_index(drop=True)
+    if "__key__" in working.columns:
+        key_series = working["__key__"].where(~working["__key__"].isna(), "")
+        normalized = key_series.astype(str)
+    else:
+        normalized = working.index.astype(str)
+
+    keys: List[str] = []
+    for value in normalized.tolist():
+        if value is None:
+            keys.append("")
+        else:
+            text = str(value).strip()
+            keys.append("" if text.lower() == "nan" else text)
+    return keys
+
+
+def extract_preview_key_set(table: Any) -> Set[str]:
+    if not isinstance(table, pd.DataFrame) or table.empty:
+        return set()
+
+    keys = extract_preview_row_keys(table)
+    return {key for key in keys if key}
+
+
+def format_preview_integer(value: Any) -> str:
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return ""
+    try:
+        numeric_value = float(value)
+    except (TypeError, ValueError):
+        return str(value)
+    if math.isnan(numeric_value):
+        return ""
+    rounded = int(np.round(numeric_value))
+    return f"{rounded:,}".replace(",", "\u00a0")
+
+
+def format_preview_numbers(
+    display_df: pd.DataFrame, numeric_source: pd.DataFrame, numeric_cols: List[str]
+) -> pd.DataFrame:
+    if not isinstance(display_df, pd.DataFrame) or display_df.empty or not numeric_cols:
+        return display_df
+
+    formatted = display_df.copy()
+    for col in numeric_cols:
+        if col in numeric_source.columns:
+            formatted[col] = numeric_source[col].apply(format_preview_integer)
+    return formatted
+
+
+def build_preview_summary(
+    numeric_source: pd.DataFrame, numeric_cols: List[str]
+) -> pd.DataFrame:
+    if not numeric_cols:
+        return pd.DataFrame(columns=["Sloupec", "Součet"])
+
+    rows: List[Dict[str, str]] = []
+    for col in numeric_cols:
+        if col not in numeric_source.columns:
+            continue
+        series = numeric_source[col]
+        total = series.sum(min_count=1)
+        if pd.isna(total):
+            continue
+        rows.append({"Sloupec": col, "Součet": format_preview_integer(total)})
+
+    if not rows:
+        return pd.DataFrame(columns=["Sloupec", "Součet"])
+
+    return pd.DataFrame(rows)
+
+
+def describe_summary_columns(numeric_cols: List[str], currency_label: Optional[str]) -> str:
+    if not numeric_cols:
+        return ""
+
+    column_list = ", ".join(f"`{col}`" for col in numeric_cols)
+    currency_note = (
+        f" U finančních sloupců je použita měna {currency_label}."
+        if currency_label
+        else ""
+    )
+    return (
+        "Součty níže vycházejí z numerických sloupců: "
+        f"{column_list}. Hodnoty jsou zaokrouhleny na celá čísla a zobrazeny s mezerami mezi tisíci."
+        f"{currency_note}"
+    )
+
+
+def filter_table_by_keys(table: Any, keys: Set[str]) -> pd.DataFrame:
+    if not isinstance(table, pd.DataFrame) or table.empty or not keys:
+        return pd.DataFrame()
+
+    working = table.reset_index(drop=True)
+    if "__key__" not in working.columns:
+        return pd.DataFrame()
+
+    key_series = working["__key__"].where(~working["__key__"].isna(), "").astype(str)
+    mask = key_series.isin(keys)
+    return working.loc[mask].reset_index(drop=True)
+
+
+def describe_preview_rows(table: Any, keys: Set[str], max_items: int = 10) -> str:
+    if not keys:
+        return ""
+
+    subset = filter_table_by_keys(table, keys)
+    if subset.empty:
+        return ""
+
+    prepared = prepare_preview_table(subset)
+    lines: List[str] = []
+    code_col = "code" if "code" in prepared.columns else None
+    desc_col = "description" if "description" in prepared.columns else None
+
+    for idx, (_, row) in enumerate(prepared.iterrows()):
+        if idx >= max_items:
+            break
+        parts: List[str] = []
+        if code_col:
+            code_val = str(row.get(code_col, "")).strip()
+            if code_val and code_val.lower() != "nan":
+                parts.append(f"**{code_val}**")
+        if desc_col:
+            desc_val = str(row.get(desc_col, "")).strip()
+            if desc_val and desc_val.lower() != "nan":
+                if parts:
+                    parts[-1] = f"{parts[-1]} — {desc_val}"
+                else:
+                    parts.append(desc_val)
+        if not parts:
+            parts.append(str({k: v for k, v in row.items() if not str(k).startswith("__")}))
+        lines.append(f"- {parts[0]}")
+
+    remaining = len(keys) - min(len(keys), max(0, len(lines)))
+    if remaining > 0:
+        lines.append(f"- … a další {remaining} položek.")
+
+    return "\n".join(lines)
 
 
 def dataframe_to_excel_bytes(df: pd.DataFrame, sheet_name: str) -> bytes:
@@ -3861,41 +4008,93 @@ with tab_preview:
             sheet_label: str,
             table_label: str,
             widget_suffix: str,
+            *,
+            highlight_keys: Optional[Set[str]] = None,
+            highlight_color: str = "#FFE8CC",
+            currency_label: Optional[str] = None,
+            summary_title: Optional[str] = None,
         ) -> str:
             prepared = prepare_preview_table(df)
             wrapper_id = f"preview-wrapper-{widget_suffix}"
-            st.markdown(
-                f"<div id=\"{wrapper_id}\" class=\"preview-table-wrapper\">",
-                unsafe_allow_html=True,
-            )
+            wrapper_container = st.container()
+            with wrapper_container:
+                st.markdown(
+                    f"<div id=\"{wrapper_id}\" class=\"preview-table-wrapper\">",
+                    unsafe_allow_html=True,
+                )
 
-            row_count = len(prepared)
-            if row_count == 0:
-                st.info("Tabulka je prázdná nebo list neobsahuje položky.")
-            height = min(900, 220 + max(row_count, 1) * 28)
-            st.dataframe(prepared, use_container_width=True, height=height)
-            st.caption(f"{row_count} řádků")
+                row_count = len(prepared)
+                if row_count == 0:
+                    st.info("Tabulka je prázdná nebo list neobsahuje položky.")
 
-            file_stub = sanitize_filename(f"{table_label}_{sheet_label}")
-            csv_bytes = prepared.to_csv(index=False).encode("utf-8-sig")
-            excel_bytes = dataframe_to_excel_bytes(prepared, sheet_label)
-            export_cols = st.columns(2)
-            export_cols[0].download_button(
-                "⬇️ Export CSV",
-                data=csv_bytes,
-                file_name=f"{file_stub}.csv",
-                mime="text/csv",
-                key=f"{widget_suffix}_csv",
-            )
-            export_cols[1].download_button(
-                "⬇️ Export XLSX",
-                data=excel_bytes,
-                file_name=f"{file_stub}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                key=f"{widget_suffix}_xlsx",
-            )
+                height = min(900, 220 + max(row_count, 1) * 28)
 
-            st.markdown("</div>", unsafe_allow_html=True)
+                numeric_source = pd.DataFrame()
+                numeric_cols: List[str] = []
+                row_keys: List[str] = []
+                if isinstance(df, pd.DataFrame) and not df.empty:
+                    numeric_source = df.reset_index(drop=True)
+                    numeric_cols = [
+                        col
+                        for col in prepared.columns
+                        if col in numeric_source.columns
+                        and pd.api.types.is_numeric_dtype(numeric_source[col])
+                    ]
+                    row_keys = extract_preview_row_keys(df)
+
+                display_df = format_preview_numbers(prepared, numeric_source, numeric_cols)
+
+                highlight_set: Set[str] = set()
+                if highlight_keys:
+                    highlight_set = {str(key).strip() for key in highlight_keys if str(key).strip()}
+
+                if not display_df.empty:
+                    if highlight_set and row_keys:
+                        def highlight_row(row: pd.Series) -> List[str]:
+                            key = row_keys[row.name] if row.name < len(row_keys) else ""
+                            if key in highlight_set:
+                                return [f"background-color: {highlight_color}"] * len(row)
+                            return [""] * len(row)
+
+                        styler = display_df.style.apply(highlight_row, axis=1)
+                        st.dataframe(styler, use_container_width=True, height=height)
+                    else:
+                        st.dataframe(display_df, use_container_width=True, height=height)
+                else:
+                    st.dataframe(display_df, use_container_width=True, height=height)
+
+                st.caption(f"{row_count} řádků")
+
+                summary_df = build_preview_summary(numeric_source, numeric_cols)
+                if not summary_df.empty:
+                    heading = summary_title or f"Součty — {table_label}"
+                    st.markdown(f"**{heading}**")
+                    summary_desc = describe_summary_columns(numeric_cols, currency_label)
+                    if summary_desc:
+                        st.caption(summary_desc)
+                    st.dataframe(summary_df, use_container_width=True, height=160)
+
+                file_stub = sanitize_filename(f"{table_label}_{sheet_label}")
+                csv_bytes = prepared.to_csv(index=False).encode("utf-8-sig")
+                excel_bytes = dataframe_to_excel_bytes(prepared, sheet_label)
+                export_cols = st.columns(2)
+                export_cols[0].download_button(
+                    "⬇️ Export CSV",
+                    data=csv_bytes,
+                    file_name=f"{file_stub}.csv",
+                    mime="text/csv",
+                    key=f"{widget_suffix}_csv",
+                )
+                export_cols[1].download_button(
+                    "⬇️ Export XLSX",
+                    data=excel_bytes,
+                    file_name=f"{file_stub}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    key=f"{widget_suffix}_xlsx",
+                )
+
+                st.markdown("</div>", unsafe_allow_html=True)
+
             return wrapper_id
 
         def inject_preview_scroll_sync(
@@ -4014,6 +4213,24 @@ with tab_preview:
             help="Při zapnutí se Master a vybraná nabídka posouvají zároveň.",
         )
 
+        master_keys_set = extract_preview_key_set(master_table)
+        master_highlight_keys: Set[str] = set()
+        supplier_missing_map: Dict[str, Set[str]] = {}
+        supplier_extra_map: Dict[str, Set[str]] = {}
+        if bids_dict:
+            for sup_name, wb in bids_dict.items():
+                alias = display_names.get(sup_name, sup_name)
+                sheet_obj = wb.sheets.get(selected_preview_sheet)
+                if sheet_obj is None:
+                    continue
+                supplier_table = sheet_obj.get("table", pd.DataFrame())
+                supplier_keys = extract_preview_key_set(supplier_table)
+                missing_keys = master_keys_set - supplier_keys
+                extra_keys = supplier_keys - master_keys_set
+                supplier_missing_map[alias] = missing_keys
+                supplier_extra_map[alias] = extra_keys
+                master_highlight_keys.update(missing_keys)
+
         master_wrapper_id = ""
         cols_preview = st.columns(2)
         with cols_preview[0]:
@@ -4026,7 +4243,21 @@ with tab_preview:
                 selected_preview_sheet,
                 "master",
                 master_widget_suffix,
+                highlight_keys=master_highlight_keys,
+                highlight_color="#FFE3E3",
+                currency_label=currency,
+                summary_title="Součty — Master",
             )
+            if master_highlight_keys:
+                missing_lines = [
+                    f"- {alias}: {len(missing)} řádků chybí"
+                    for alias, missing in supplier_missing_map.items()
+                    if missing
+                ]
+                if missing_lines:
+                    st.caption(
+                        "Červeně zvýrazněné řádky chybí v těchto nabídkách:\n" + "\n".join(missing_lines)
+                    )
 
         with cols_preview[1]:
             if not bids_dict:
@@ -4041,17 +4272,42 @@ with tab_preview:
                             st.warning("Tento list nebyl v nabídce nalezen.")
                             continue
                         else:
+                            supplier_table = sheet_obj.get("table", pd.DataFrame())
                             supplier_widget_suffix = make_widget_key(
                                 "preview",
                                 selected_preview_sheet,
                                 alias,
                             )
                             supplier_wrapper_id = render_preview_table(
-                                sheet_obj.get("table", pd.DataFrame()),
+                                supplier_table,
                                 selected_preview_sheet,
                                 alias,
                                 supplier_widget_suffix,
+                                highlight_keys=supplier_extra_map.get(alias, set()),
+                                highlight_color="#FFF0D6",
+                                currency_label=currency,
+                                summary_title=f"Součty — {alias}",
                             )
+                            missing_keys = supplier_missing_map.get(alias, set())
+                            extra_keys = supplier_extra_map.get(alias, set())
+                            if missing_keys:
+                                st.error(
+                                    f"Chybí {len(missing_keys)} řádků oproti Master."
+                                )
+                                missing_desc = describe_preview_rows(
+                                    master_table, missing_keys
+                                )
+                                if missing_desc:
+                                    st.markdown(missing_desc)
+                            if extra_keys:
+                                st.info(
+                                    f"Dodavatel obsahuje {len(extra_keys)} řádků navíc oproti Master."
+                                )
+                                extra_desc = describe_preview_rows(
+                                    supplier_table, extra_keys
+                                )
+                                if extra_desc:
+                                    st.markdown(extra_desc)
                             inject_preview_scroll_sync(
                                 master_wrapper_id,
                                 supplier_wrapper_id,
