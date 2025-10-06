@@ -1760,24 +1760,62 @@ def prepare_preview_table(table: Any) -> pd.DataFrame:
     return display
 
 
+def _normalize_preview_value(value: Any) -> str:
+    if pd.isna(value):
+        return ""
+    text = str(value).strip()
+    if not text:
+        return ""
+    if text.lower() in {"nan", "none", "null"}:
+        return ""
+    return text
+
+
+def _format_preview_row_order(value: Any) -> str:
+    if pd.isna(value):
+        return ""
+    if isinstance(value, (int, np.integer)):
+        return str(int(value))
+    if isinstance(value, (float, np.floating)):
+        float_value = float(value)
+        if math.isfinite(float_value) and float_value.is_integer():
+            return str(int(float_value))
+        return str(float_value)
+    text = str(value).strip()
+    if not text:
+        return ""
+    return text
+
+
 def extract_preview_row_keys(df: pd.DataFrame) -> List[str]:
     if not isinstance(df, pd.DataFrame) or df.empty:
         return []
 
     working = df.reset_index(drop=True)
-    if "__key__" in working.columns:
-        key_series = working["__key__"].where(~working["__key__"].isna(), "")
-        normalized = key_series.astype(str)
+    if "__row_order__" in working.columns:
+        order_series = working["__row_order__"].apply(_format_preview_row_order)
     else:
-        normalized = working.index.astype(str)
+        order_series = (
+            pd.Series(np.arange(len(working)), index=working.index)
+            .apply(_format_preview_row_order)
+        )
+
+    code_series = (
+        working.get("code", pd.Series("", index=working.index))
+        .map(_normalize_preview_value)
+        .astype(str)
+    )
+    description_series = (
+        working.get("description", pd.Series("", index=working.index))
+        .map(_normalize_preview_value)
+        .astype(str)
+    )
 
     keys: List[str] = []
-    for value in normalized.tolist():
-        if value is None:
-            keys.append("")
-        else:
-            text = str(value).strip()
-            keys.append("" if text.lower() == "nan" else text)
+    for idx in working.index:
+        parts = [order_series.iloc[idx], code_series.iloc[idx], description_series.iloc[idx]]
+        key = "|".join(parts).strip("|")
+        keys.append(key)
     return keys
 
 
@@ -1859,10 +1897,11 @@ def filter_table_by_keys(table: Any, keys: Set[str]) -> pd.DataFrame:
         return pd.DataFrame()
 
     working = table.reset_index(drop=True)
-    if "__key__" not in working.columns:
+    row_keys = extract_preview_row_keys(working)
+    if not row_keys:
         return pd.DataFrame()
 
-    key_series = working["__key__"].where(~working["__key__"].isna(), "").astype(str)
+    key_series = pd.Series(row_keys, index=working.index)
     mask = key_series.isin(keys)
     return working.loc[mask].reset_index(drop=True)
 
