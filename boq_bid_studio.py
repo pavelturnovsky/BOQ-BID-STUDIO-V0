@@ -15,6 +15,7 @@ from string import Template
 
 import numpy as np
 import pandas as pd
+from pandas.api.types import is_numeric_dtype
 import plotly.express as px
 import streamlit as st
 import streamlit.components.v1 as components
@@ -1932,6 +1933,22 @@ def format_preview_numbers(
     return formatted
 
 
+def format_preview_dataframe_for_export(df: pd.DataFrame) -> pd.DataFrame:
+    """Return a copy of ``df`` with numeric columns formatted for exports."""
+
+    if not isinstance(df, pd.DataFrame):
+        return pd.DataFrame()
+    if df.empty:
+        return df.copy()
+
+    formatted = df.copy()
+    for col in formatted.columns:
+        series = formatted[col]
+        if is_numeric_dtype(series):
+            formatted[col] = series.apply(format_preview_number)
+    return formatted
+
+
 def build_preview_summary(
     numeric_source: pd.DataFrame, numeric_cols: List[str]
 ) -> pd.DataFrame:
@@ -1995,45 +2012,6 @@ def count_rows_by_keys(table: Any, keys: Set[str]) -> int:
     return int(len(subset))
 
 
-def describe_preview_rows(table: Any, keys: Set[str], max_items: int = 10) -> str:
-    if not keys:
-        return ""
-
-    subset = filter_table_by_keys(table, keys)
-    if subset.empty:
-        return ""
-
-    prepared = prepare_preview_table(subset)
-    lines: List[str] = []
-    code_col = "code" if "code" in prepared.columns else None
-    desc_col = "description" if "description" in prepared.columns else None
-
-    for idx, (_, row) in enumerate(prepared.iterrows()):
-        if idx >= max_items:
-            break
-        parts: List[str] = []
-        if code_col:
-            code_val = str(row.get(code_col, "")).strip()
-            if code_val and code_val.lower() != "nan":
-                parts.append(f"**{code_val}**")
-        if desc_col:
-            desc_val = str(row.get(desc_col, "")).strip()
-            if desc_val and desc_val.lower() != "nan":
-                if parts:
-                    parts[-1] = f"{parts[-1]} — {desc_val}"
-                else:
-                    parts.append(desc_val)
-        if not parts:
-            parts.append(str({k: v for k, v in row.items() if not str(k).startswith("__")}))
-        lines.append(f"- {parts[0]}")
-
-    remaining = len(keys) - min(len(keys), max(0, len(lines)))
-    if remaining > 0:
-        lines.append(f"- … a další {remaining} položek.")
-
-    return "\n".join(lines)
-
-
 def dataframe_to_excel_bytes(df: pd.DataFrame, sheet_name: str) -> bytes:
     """Serialize a dataframe into XLSX bytes for download widgets."""
 
@@ -2075,7 +2053,9 @@ def show_df(df: pd.DataFrame) -> None:
         display_col = rename_map.get(orig_col, orig_col)
         presence_display[display_col] = series.reindex(df_to_show.index).fillna(False)
 
-    numeric_cols = df_to_show.select_dtypes(include=[np.number]).columns
+    numeric_cols = [
+        col for col in df_to_show.columns if is_numeric_dtype(df_to_show[col])
+    ]
     column_widths = compute_display_column_widths(df_to_show)
     column_config = {
         col: st.column_config.Column(width=width)
@@ -4689,11 +4669,73 @@ with tab_preview:
                                 st.error(
                                     f"Chybí {missing_count} řádků oproti Master."
                                 )
-                                missing_desc = describe_preview_rows(
+                                missing_subset = filter_table_by_keys(
                                     master_table, missing_keys
                                 )
-                                if missing_desc:
-                                    st.markdown(missing_desc)
+                                missing_display = prepare_preview_table(
+                                    missing_subset
+                                )
+                                if not missing_display.empty:
+                                    st.markdown(
+                                        f"**Detail chybějících položek ({len(missing_display)})**"
+                                    )
+                                    show_df(missing_display)
+                                    export_cols = st.columns(2)
+                                    missing_base_name = sanitize_filename(
+                                        f"{selected_preview_sheet}_{alias}_chybi",
+                                        "chybejici_polozky",
+                                    )
+                                    excel_bytes = dataframe_to_excel_bytes(
+                                        missing_display, "Chybejici"
+                                    )
+                                    pdf_bytes = b""
+                                    try:
+                                        pdf_ready = format_preview_dataframe_for_export(
+                                            missing_display
+                                        )
+                                        pdf_bytes = generate_tables_pdf(
+                                            f"Chybějící položky — {alias}",
+                                            [
+                                                (
+                                                    f"{selected_preview_sheet} — chybějící",
+                                                    pdf_ready,
+                                                )
+                                            ],
+                                        )
+                                    except Exception as exc:
+                                        logging.getLogger(__name__).warning(
+                                            "PDF export for missing rows failed: %s",
+                                            exc,
+                                        )
+                                        pdf_bytes = b""
+                                    export_cols[0].download_button(
+                                        "⬇️ Export do Excelu",
+                                        data=excel_bytes,
+                                        file_name=f"{missing_base_name}.xlsx",
+                                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                        key=make_widget_key(
+                                            "preview_missing_xlsx",
+                                            selected_preview_sheet,
+                                            alias,
+                                        ),
+                                    )
+                                    if pdf_bytes:
+                                        export_cols[1].download_button(
+                                            "📄 Export do PDF",
+                                            data=pdf_bytes,
+                                            file_name=f"{missing_base_name}.pdf",
+                                            mime="application/pdf",
+                                            key=make_widget_key(
+                                                "preview_missing_pdf",
+                                                selected_preview_sheet,
+                                                alias,
+                                            ),
+                                        )
+                                    else:
+                                        with export_cols[1]:
+                                            st.warning(
+                                                "Export do PDF se nezdařil."
+                                            )
                             if extra_keys:
                                 extra_count = count_rows_by_keys(
                                     supplier_table, extra_keys
@@ -4701,11 +4743,73 @@ with tab_preview:
                                 st.info(
                                     f"Dodavatel obsahuje {extra_count} řádků navíc oproti Master."
                                 )
-                                extra_desc = describe_preview_rows(
+                                extra_subset = filter_table_by_keys(
                                     supplier_table, extra_keys
                                 )
-                                if extra_desc:
-                                    st.markdown(extra_desc)
+                                extra_display = prepare_preview_table(extra_subset)
+                                if not extra_display.empty:
+                                    st.markdown(
+                                        f"**Detail nadbytečných položek ({len(extra_display)})**"
+                                    )
+                                    show_df(extra_display)
+                                    export_cols_extra = st.columns(2)
+                                    extra_base_name = sanitize_filename(
+                                        f"{selected_preview_sheet}_{alias}_navic",
+                                        "nadbytecne_polozky",
+                                    )
+                                    excel_extra = dataframe_to_excel_bytes(
+                                        extra_display, "Nadbytecne"
+                                    )
+                                    pdf_extra = b""
+                                    try:
+                                        pdf_ready_extra = (
+                                            format_preview_dataframe_for_export(
+                                                extra_display
+                                            )
+                                        )
+                                        pdf_extra = generate_tables_pdf(
+                                            f"Nadbytečné položky — {alias}",
+                                            [
+                                                (
+                                                    f"{selected_preview_sheet} — navíc",
+                                                    pdf_ready_extra,
+                                                )
+                                            ],
+                                        )
+                                    except Exception as exc:
+                                        logging.getLogger(__name__).warning(
+                                            "PDF export for extra rows failed: %s",
+                                            exc,
+                                        )
+                                        pdf_extra = b""
+                                    export_cols_extra[0].download_button(
+                                        "⬇️ Export do Excelu",
+                                        data=excel_extra,
+                                        file_name=f"{extra_base_name}.xlsx",
+                                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                        key=make_widget_key(
+                                            "preview_extra_xlsx",
+                                            selected_preview_sheet,
+                                            alias,
+                                        ),
+                                    )
+                                    if pdf_extra:
+                                        export_cols_extra[1].download_button(
+                                            "📄 Export do PDF",
+                                            data=pdf_extra,
+                                            file_name=f"{extra_base_name}.pdf",
+                                            mime="application/pdf",
+                                            key=make_widget_key(
+                                                "preview_extra_pdf",
+                                                selected_preview_sheet,
+                                                alias,
+                                            ),
+                                        )
+                                    else:
+                                        with export_cols_extra[1]:
+                                            st.warning(
+                                                "Export do PDF se nezdařil."
+                                            )
                             inject_preview_scroll_sync(
                                 master_wrapper_id,
                                 supplier_wrapper_id,
