@@ -169,6 +169,91 @@ SECTION_ONTOLOGY = {
 SECTION_ONTOLOGY.setdefault("", "Nezařazeno")
 
 
+def aggregate_weighted_average_by_key(
+    df: pd.DataFrame,
+    value_col: str,
+    weight_col: str,
+    key_col: str = "__key__",
+) -> pd.Series:
+    """Return weighted averages of ``value_col`` grouped by ``key_col``.
+
+    The helper prefers a weighted average using ``weight_col`` whenever both
+    the value and weight are known. If weights are missing or zero, the first
+    available value in the group is used as a fallback to avoid returning
+    ``NaN`` for otherwise valid rows.
+    """
+
+    required = {value_col, weight_col, key_col}
+    if not required.issubset(df.columns):
+        return pd.Series(dtype=float)
+
+    working = df[list(required)].copy()
+    working[key_col] = working[key_col].astype(str)
+    working[value_col] = pd.to_numeric(working[value_col], errors="coerce")
+    working[weight_col] = pd.to_numeric(working[weight_col], errors="coerce")
+    working = working.dropna(subset=[key_col])
+    if working.empty:
+        return pd.Series(dtype=float)
+
+    grouped = working.groupby(key_col, sort=False)
+
+    def _aggregate(group: pd.DataFrame) -> float:
+        values = group[value_col]
+        weights = group[weight_col]
+        valid = values.notna() & weights.notna()
+        if valid.any():
+            total_weight = weights.loc[valid].sum(min_count=1)
+            if pd.notna(total_weight) and total_weight != 0:
+                weighted_sum = (values.loc[valid] * weights.loc[valid]).sum(min_count=1)
+                if pd.notna(weighted_sum):
+                    return float(weighted_sum / total_weight)
+        for val in values:
+            if pd.notna(val):
+                return float(val)
+        return float("nan")
+
+    aggregated = grouped.apply(_aggregate)
+    aggregated.index = aggregated.index.astype(str)
+    return aggregated
+
+COMPARISON_METRICS_CONFIG = {
+    "total": {
+        "label": "Cena celkem",
+        "master_columns": ["Master total"],
+        "supplier_suffix": " total",
+        "number_format": "currency",
+        "help": "Porovnání celkové ceny položky.",
+    },
+    "quantity": {
+        "label": "Množství",
+        "master_columns": ["Master quantity", "quantity"],
+        "supplier_suffix": " quantity",
+        "number_format": "number",
+        "help": "Srovnání vykázaných množství.",
+    },
+    "unit_price_material": {
+        "label": "Jedn. cena materiál",
+        "master_columns": ["Master unit_price_material", "unit_price_material"],
+        "supplier_suffix": " unit_price_material",
+        "number_format": "currency",
+        "help": "Materiálová jednotková cena.",
+    },
+    "unit_price_install": {
+        "label": "Jedn. cena montáž",
+        "master_columns": ["Master unit_price_install", "unit_price_install"],
+        "supplier_suffix": " unit_price_install",
+        "number_format": "currency",
+        "help": "Montážní jednotková cena.",
+    },
+}
+
+COMPARISON_METRIC_ORDER = [
+    "total",
+    "quantity",
+    "unit_price_material",
+    "unit_price_install",
+]
+
 @dataclass
 class ComparisonDataset:
     sheet: str
@@ -381,6 +466,16 @@ def build_comparison_dataset(sheet: str, df: pd.DataFrame) -> ComparisonDataset:
     analysis_df = df.copy()
     if "__key__" not in analysis_df.columns:
         analysis_df["__key__"] = np.arange(len(analysis_df))
+
+    for master_helper in (
+        "Master quantity",
+        "Master unit_price_material",
+        "Master unit_price_install",
+    ):
+        if master_helper in analysis_df.columns:
+            analysis_df[master_helper] = pd.to_numeric(
+                analysis_df[master_helper], errors="coerce"
+            )
 
     section_tokens: List[str] = []
     section_labels: List[str] = []
@@ -2788,10 +2883,16 @@ def compare(master: WorkbookData, bids: Dict[str, WorkbookData], join_mode: str 
         existing_base_cols = [col for col in base_cols if col in mtab.columns]
         base = mtab[existing_base_cols].copy()
         price_cols_master: List[str] = []
+        master_price_averages: Dict[str, pd.Series] = {}
         for price_col in ("unit_price_material", "unit_price_install"):
             if price_col in mtab.columns:
                 price_cols_master.append(price_col)
                 base[price_col] = pd.to_numeric(mtab[price_col], errors="coerce")
+                avg_series = aggregate_weighted_average_by_key(
+                    mtab, price_col, "quantity"
+                )
+                if not avg_series.empty:
+                    master_price_averages[price_col] = avg_series
         if "quantity" in base.columns:
             base["quantity"] = pd.to_numeric(base["quantity"], errors="coerce").fillna(0)
         else:
@@ -2826,7 +2927,14 @@ def compare(master: WorkbookData, bids: Dict[str, WorkbookData], join_mode: str 
         master_lookup = _build_join_lookup(mtab)
         master_total_sum = base_grouped["total_price"].sum()
         base_grouped.rename(columns={"total_price": "Master total"}, inplace=True)
+        if master_price_averages:
+            key_series = base_grouped["__key__"].astype(str)
+            for price_col, avg_series in master_price_averages.items():
+                mapped = key_series.map(avg_series)
+                base_grouped[f"Master {price_col}"] = mapped
         comp = base_grouped.copy()
+        if "quantity" in comp.columns and "Master quantity" not in comp.columns:
+            comp["Master quantity"] = comp["quantity"]
 
         supplier_totals: Dict[str, float] = {}
         for sup_name, wb in bids.items():
@@ -2924,6 +3032,14 @@ def compare(master: WorkbookData, bids: Dict[str, WorkbookData], join_mode: str 
                 }
             )
             tt_grouped = tt_grouped.merge(first_price, on="__key__", how="left")
+            component_averages: Dict[str, pd.Series] = {}
+            for price_component in ("unit_price_material", "unit_price_install"):
+                if price_component in tt.columns:
+                    avg_series = aggregate_weighted_average_by_key(
+                        tt, price_component, sup_qty_col
+                    )
+                    if not avg_series.empty:
+                        component_averages[price_component] = avg_series
             if "unit" in tt.columns:
                 unit_source = tt[["__key__", "unit"]].copy()
                 unit_source = unit_source[unit_source["unit"].astype(str).str.strip() != ""]
@@ -2938,6 +3054,10 @@ def compare(master: WorkbookData, bids: Dict[str, WorkbookData], join_mode: str 
             mask = qty_for_division.isna()
             tt_grouped.loc[mask, "unit_price_combined"] = tt_grouped.loc[mask, "first_unit_price"]
             tt_grouped.drop(columns=["first_unit_price"], inplace=True)
+            if component_averages:
+                key_series_sup = tt_grouped["__key__"].astype(str)
+                for component_name, avg_series in component_averages.items():
+                    tt_grouped[component_name] = key_series_sup.map(avg_series)
             master_join_series, supplier_join_series = _choose_join_columns(
                 master_lookup, supplier_lookup, join_mode
             )
@@ -2962,6 +3082,9 @@ def compare(master: WorkbookData, bids: Dict[str, WorkbookData], join_mode: str 
                 "unit_price_combined": f"{sup_name} unit_price",
                 "total_price": f"{sup_name} total",
             }
+            if component_averages:
+                for component_name in component_averages.keys():
+                    rename_map[component_name] = f"{sup_name} {component_name}"
             if unit_merge_col:
                 rename_map[unit_merge_col] = f"{sup_name} unit"
             comp.rename(columns=rename_map, inplace=True)
@@ -3064,6 +3187,8 @@ def rename_comparison_columns(df: pd.DataFrame, mapping: Dict[str, str]) -> pd.D
         rename_map[f"{raw} quantity"] = f"{alias} quantity"
         rename_map[f"{raw} unit"] = f"{alias} unit"
         rename_map[f"{raw} unit_price"] = f"{alias} unit_price"
+        rename_map[f"{raw} unit_price_material"] = f"{alias} unit_price_material"
+        rename_map[f"{raw} unit_price_install"] = f"{alias} unit_price_install"
         rename_map[f"{raw} total"] = f"{alias} total"
         rename_map[f"{raw} Δ qty"] = f"{alias} Δ qty"
         rename_map[f"{raw} Δ vs LOWEST"] = f"{alias} Δ vs LOWEST"
@@ -4084,17 +4209,6 @@ if current_suppliers:
 chart_color_map = color_map.copy()
 chart_color_map.setdefault("Master", "#636EFA")
 
-default_threshold_range = st.session_state.get("compare_threshold_range", (-10.0, 10.0))
-min_threshold, max_threshold = st.sidebar.slider(
-    "Rozmezí odchylky vs Master (%)",
-    min_value=-200.0,
-    max_value=200.0,
-    value=default_threshold_range,
-    step=0.5,
-    help="Rozsah procentuální odchylky, který se považuje za přijatelný. Hodnoty mimo rozsah budou zvýrazněny.",
-)
-st.session_state["compare_threshold_range"] = (min_threshold, max_threshold)
-
 ensure_exchange_rate_state()
 
 # ------------- Tabs -------------
@@ -4869,347 +4983,470 @@ with tab_compare:
                 st.warning("Vybraný list neobsahuje žádné položky k porovnání.")
             else:
                 st.subheader(f"List: {selected_sheet}")
-                threshold_min, threshold_max = st.session_state.get(
-                    "compare_threshold_range", (-10.0, 10.0)
+                default_range = st.session_state.get("compare_threshold_range", (-10.0, 10.0))
+                threshold_min, threshold_max = st.slider(
+                    "Rozmezí odchylky vs Master (%)",
+                    min_value=-200.0,
+                    max_value=200.0,
+                    value=default_range,
+                    step=0.5,
+                    help="Rozsah procentní odchylky, který se považuje za přijatelný. Hodnoty mimo rozsah budou zvýrazněny.",
+                    key=make_widget_key("compare_threshold", selected_sheet),
                 )
-                working = dataset.analysis_df.copy()
+                st.session_state["compare_threshold_range"] = (threshold_min, threshold_max)
+                analysis_df = dataset.analysis_df.copy()
 
-                if dataset.percent_columns:
-                    pct_matrix = working[dataset.percent_columns]
-                    above_mask = pct_matrix.gt(threshold_max)
-                    below_mask = pct_matrix.lt(threshold_min)
-                    working["__above_threshold__"] = above_mask.any(axis=1)
-                    working["__below_threshold__"] = below_mask.any(axis=1)
-                    working["__outside_threshold__"] = working["__above_threshold__"] | working["__below_threshold__"]
-                else:
-                    working["__above_threshold__"] = False
-                    working["__below_threshold__"] = False
-                    working["__outside_threshold__"] = False
-
-                lowest_supplier_col = "LOWEST supplier" if "LOWEST supplier" in working.columns else None
-                lowest_supplier_options = []
-                if lowest_supplier_col:
-                    lowest_supplier_options = sorted(
-                        {
-                            str(val)
-                            for val in working[lowest_supplier_col].dropna().astype(str).tolist()
-                            if str(val).strip()
-                        },
-                        key=natural_sort_key,
-                    )
-
-                search_key = make_widget_key("compare_search", selected_sheet)
-                section_key = make_widget_key("compare_sections", selected_sheet)
-                lowest_key = make_widget_key("compare_lowest", selected_sheet)
-                limit_key = make_widget_key("compare_limit", selected_sheet)
-
-                filter_top = st.container()
-                with filter_top:
-                    col_search, col_section, col_lowest, col_limit = st.columns([3, 3, 2, 1])
-                    search_query = col_search.text_input(
-                        "Vyhledávání (kód, popis, oddíl)",
-                        key=search_key,
-                        placeholder="např. 3.1 dveře",
-                    )
-                    section_selection = col_section.multiselect(
-                        "Oddíly",
-                        dataset.section_labels,
-                        key=section_key,
-                    )
-                    lowest_selection = col_lowest.multiselect(
-                        "Dodavatel s nejnižší cenou",
-                        lowest_supplier_options,
-                        key=lowest_key,
-                    )
-                    max_rows = col_limit.number_input(
-                        "Limit řádků",
-                        min_value=10,
-                        max_value=5000,
-                        value=200,
-                        step=10,
-                        key=limit_key,
-                    )
-
-                above_key = make_widget_key("compare_above_only", selected_sheet)
-                below_key = make_widget_key("compare_below_only", selected_sheet)
-                view_mode_key = make_widget_key("compare_view_mode", selected_sheet)
-
-                filter_bottom = st.container()
-                with filter_bottom:
-                    col_above, col_below, col_view = st.columns([1, 1, 2])
-                    show_above_only = col_above.checkbox(
-                        "Jen nad horním limitem",
-                        key=above_key,
-                    )
-                    show_below_only = col_below.checkbox(
-                        "Jen pod dolním limitem",
-                        key=below_key,
-                    )
-                    view_mode = col_view.radio(
-                        "Rychlý přehled",
-                        options=[
-                            "Vše",
-                            "Top 10 odchylek",
-                            "Položky mimo rozsah",
-                            "Položky bez nabídky",
-                        ],
-                        index=0,
-                        horizontal=True,
-                        key=view_mode_key,
-                    )
-
-                filtered = working.copy()
-                if search_query:
-                    normalized = normalize_text(search_query)
-                    tokens = [token for token in re.split(r"\s+", normalized) if token]
-                    if tokens:
-                        search_series = filtered.get("__search_token__", pd.Series("", index=filtered.index))
-                        mask = pd.Series(True, index=filtered.index, dtype=bool)
-                        for token in tokens:
-                            mask &= search_series.str.contains(re.escape(token), na=False)
-                        filtered = filtered.loc[mask]
-
-                if section_selection:
-                    filtered = filtered[filtered["Oddíl"].isin(section_selection)]
-
-                if lowest_selection and lowest_supplier_col:
-                    filtered = filtered[filtered[lowest_supplier_col].isin(lowest_selection)]
-
-                if show_above_only:
-                    filtered = filtered[filtered["__above_threshold__"]]
-                if show_below_only:
-                    filtered = filtered[filtered["__below_threshold__"]]
-
-                if view_mode == "Top 10 odchylek":
-                    filtered = filtered.sort_values("__abs_diff_max__", ascending=False)
-                    filtered = filtered.head(min(int(max_rows), 10))
-                elif view_mode == "Položky mimo rozsah":
-                    filtered = filtered[filtered["__outside_threshold__"]]
-                elif view_mode == "Položky bez nabídky":
-                    filtered = filtered[filtered["__missing_offer__"]]
-
-                if view_mode != "Top 10 odchylek":
-                    filtered = filtered.head(int(max_rows))
-
-                if "__row_order__" in filtered.columns:
-                    filtered = filtered.sort_values("__row_order__")
-
-                visible = filtered.copy()
-                visible_count = len(visible)
-
-                metrics_cols = st.columns(4)
-                outside_count = int(visible.get("__outside_threshold__", pd.Series(False, index=visible.index)).sum())
-                outside_ratio = (outside_count / visible_count * 100.0) if visible_count else 0.0
-
-                if dataset.percent_columns and not visible.empty:
-                    pct_values = (
-                        visible[dataset.percent_columns]
-                        .replace([np.inf, -np.inf], np.nan)
-                        .abs()
-                        .to_numpy()
-                        .ravel()
-                    )
-                    pct_values = pct_values[~np.isnan(pct_values)]
-                else:
-                    pct_values = np.array([], dtype=float)
-                avg_abs_pct = float(np.mean(pct_values)) if pct_values.size else 0.0
-                median_abs_pct = float(np.median(pct_values)) if pct_values.size else 0.0
-
-                financial_series = pd.to_numeric(
-                    visible.get("__abs_diff_sum__", pd.Series(0.0, index=visible.index)),
-                    errors="coerce",
-                ).fillna(0.0)
-                financial_impact = float(financial_series.sum())
-
-                missing_series = visible.get("__missing_any__", pd.Series(False, index=visible.index)).astype(bool)
-                missing_count = int(missing_series.sum())
-                missing_ratio = (missing_count / visible_count * 100.0) if visible_count else 0.0
-
-                metrics_cols[0].metric(
-                    "Položky mimo rozsah",
-                    f"{outside_count}",
-                    f"{outside_ratio:.1f}% výběru",
-                )
-                metrics_cols[1].metric(
-                    "Průměrná | medián odchylka",
-                    f"{avg_abs_pct:.2f} %",
-                    f"medián {median_abs_pct:.2f} %",
-                )
-                metrics_cols[2].metric(
-                    "Finanční dopad",
-                    f"{format_number(financial_impact)} {currency}",
-                )
-                metrics_cols[3].metric(
-                    "Neúplné položky",
-                    f"{missing_ratio:.1f} %",
-                    f"{missing_count} ks",
-                )
-
-                value_totals: List[Tuple[str, float]] = []
-                for col in dataset.value_columns:
-                    if col not in visible.columns:
+                available_metric_keys = []
+                for key in COMPARISON_METRIC_ORDER:
+                    config = COMPARISON_METRICS_CONFIG.get(key)
+                    if not config:
                         continue
-                    total_sum = pd.to_numeric(visible[col], errors="coerce").sum(skipna=True)
-                    value_totals.append((col.replace(" total", ""), float(total_sum)))
-                if value_totals:
-                    totals_df = pd.DataFrame(value_totals, columns=["Dodavatel", "Součet"])
-                    st.markdown("**Součty dle aktuálního filtru:**")
-                    show_df(totals_df)
-                    try:
-                        fig_totals = px.bar(
-                            totals_df,
-                            x="Dodavatel",
-                            y="Součet",
-                            color="Dodavatel",
-                            color_discrete_map=chart_color_map,
-                            title=f"Součty dle filtru — {selected_sheet} ({currency})",
-                        )
-                        fig_totals.update_layout(showlegend=False)
-                        fig_totals.update_yaxes(title=f"{currency}")
-                        st.plotly_chart(fig_totals, use_container_width=True)
-                    except Exception:
-                        pass
-
-                if visible.empty:
-                    st.info("Žádná položka neodpovídá zadaným filtrům.")
-                else:
-                    hidden_cols = [col for col in visible.columns if str(col).startswith("__")]
-                    display_base = visible.drop(columns=hidden_cols, errors="ignore")
-                    display_base = display_base.drop(columns=["__key__"], errors="ignore")
-                    display_ready = rename_value_columns_for_display(
-                        display_base.copy(), f" — {currency}"
+                    master_col = next(
+                        (col for col in config["master_columns"] if col in analysis_df.columns),
+                        None,
                     )
-                    show_df(display_ready)
+                    if not master_col:
+                        continue
+                    supplier_available = False
+                    for supplier_alias in dataset.suppliers:
+                        supplier_col = f"{supplier_alias}{config['supplier_suffix']}"
+                        if supplier_col in analysis_df.columns:
+                            supplier_available = True
+                            break
+                    if supplier_available:
+                        available_metric_keys.append(key)
 
-                    safe_sheet = re.sub(r"[^0-9A-Za-z]+", "_", selected_sheet).strip("_") or "porovnani"
-                    export_csv = display_ready.to_csv(index=False).encode("utf-8-sig")
-                    export_container = st.container()
-                    with export_container:
-                        col_csv, col_xlsx = st.columns(2)
-                        col_csv.download_button(
-                            "⬇️ Export CSV",
-                            data=export_csv,
-                            file_name=f"{safe_sheet}_filter.csv",
-                            mime="text/csv",
-                        )
-                        excel_buffer = io.BytesIO()
-                        with pd.ExcelWriter(excel_buffer, engine="openpyxl") as writer:
-                            display_ready.to_excel(writer, index=False, sheet_name="Porovnani")
-                        excel_buffer.seek(0)
-                        col_xlsx.download_button(
-                            "⬇️ Export XLSX",
-                            data=excel_buffer.getvalue(),
-                            file_name=f"{safe_sheet}_filter.xlsx",
-                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        )
-
-                    with st.expander("Detail položky", expanded=True):
-                        detail_map: Dict[Any, str] = {}
-                        for idx, row in visible.iterrows():
-                            code_text = str(row.get("code", "") or "").strip()
-                            desc_text = str(row.get("description", "") or "").strip()
-                            section_text = str(row.get("Oddíl", "") or "").strip()
-                            label_parts = [part for part in [code_text, desc_text] if part]
-                            label = " — ".join(label_parts) if label_parts else f"Položka {idx}"
-                            if section_text:
-                                label = f"{label} [{section_text}]"
-                            detail_map[idx] = label
-
-                        selected_index = st.selectbox(
-                            "Vyber položku",
-                            options=list(visible.index),
-                            format_func=lambda idx: detail_map.get(idx, str(idx)),
-                            key=f"compare_detail_{selected_sheet}",
+                if not available_metric_keys:
+                    st.info("Pro vybraný list nejsou k dispozici žádné srovnatelné parametry.")
+                else:
+                    selected_metrics_raw = st.multiselect(
+                        "Parametry k porovnání",
+                        options=available_metric_keys,
+                        default=available_metric_keys,
+                        format_func=lambda key: COMPARISON_METRICS_CONFIG[key]["label"],
+                        key=make_widget_key("compare_metric_select", selected_sheet),
+                    )
+                    if not selected_metrics_raw:
+                        st.warning("Vyber alespoň jeden parametr pro zobrazení.")
+                    else:
+                        selected_metrics = [
+                            key
+                            for key in COMPARISON_METRIC_ORDER
+                            if key in selected_metrics_raw
+                        ]
+                        st.caption(
+                            "Porovnání se provádí pouze na položkách s dostupnými a nenulovými hodnotami u Master i dodavatele."
                         )
 
-                        detail_row = visible.loc[selected_index]
-                        detail_key = detail_row.get("__key__", selected_index)
-                        detail_long = dataset.long_df[dataset.long_df["__key__"] == detail_key].copy()
+                        supplier_aliases = [alias for alias in dataset.suppliers if alias]
+                        if not supplier_aliases:
+                            st.info("Žádný z dodavatelů neobsahuje data pro vybraný list.")
+                        else:
 
-                        info_cols = st.columns(4)
-                        info_cols[0].markdown(f"**Kód:** {detail_row.get('code', '—') or '—'}")
-                        info_cols[1].markdown(f"**Oddíl:** {detail_row.get('Oddíl', '—') or '—'}")
-                        info_cols[2].markdown(f"**Jednotka:** {detail_row.get('unit', '—') or '—'}")
-                        qty_value = detail_row.get("quantity")
-                        qty_numeric = pd.to_numeric(pd.Series([qty_value]), errors="coerce").iat[0]
-                        qty_text = format_number(float(qty_numeric)) if pd.notna(qty_numeric) else "—"
-                        info_cols[3].markdown(f"**Množství Master:** {qty_text}")
+                            def resolve_master_column(df: pd.DataFrame, candidates) -> Optional[str]:
+                                for col in candidates:
+                                    if col in df.columns:
+                                        return col
+                                return None
 
-                        if lowest_supplier_col:
-                            lowest_value = detail_row.get(lowest_supplier_col)
-                            if pd.notna(lowest_value):
-                                st.caption(f"Nejnižší cena: {lowest_value}")
+                            def build_supplier_view(supplier_alias: str) -> Dict[str, Any]:
+                                metric_frames: List[pd.DataFrame] = []
+                                metric_column_map: Dict[str, Dict[str, str]] = {}
+                                used_metrics: List[str] = []
+                                for metric_key in selected_metrics:
+                                    config = COMPARISON_METRICS_CONFIG.get(metric_key)
+                                    if not config:
+                                        continue
+                                    master_col = resolve_master_column(analysis_df, config["master_columns"])
+                                    supplier_col = f"{supplier_alias}{config['supplier_suffix']}"
+                                    if not master_col or supplier_col not in analysis_df.columns:
+                                        continue
+                                    master_values = pd.to_numeric(analysis_df[master_col], errors="coerce")
+                                    supplier_values = pd.to_numeric(analysis_df[supplier_col], errors="coerce")
+                                    diff_values = supplier_values - master_values
+                                    pct_values = compute_percent_difference(supplier_values, master_values)
+                                    label = config["label"]
+                                    metric_frame = pd.DataFrame(
+                                        {
+                                            f"{label} — Master": master_values,
+                                            f"{label} — {supplier_alias}": supplier_values,
+                                            f"{label} — Rozdíl": diff_values,
+                                            f"{label} — Δ (%)": pct_values,
+                                        },
+                                        index=analysis_df.index,
+                                    )
+                                    metric_frames.append(metric_frame)
+                                    metric_column_map[metric_key] = {
+                                        "master": f"{label} — Master",
+                                        "supplier": f"{label} — {supplier_alias}",
+                                        "diff": f"{label} — Rozdíl",
+                                        "pct": f"{label} — Δ (%)",
+                                    }
+                                    used_metrics.append(metric_key)
 
-                        detail_chart_df = detail_long.copy()
-                        detail_chart_df["total"] = pd.to_numeric(
-                            detail_chart_df["total"], errors="coerce"
-                        )
-                        detail_chart_df = detail_chart_df.dropna(subset=["total"])
-                        if not detail_chart_df.empty:
-                            detail_chart_df["Cena (text)"] = [
-                                format_currency_label(value, currency)
-                                for value in detail_chart_df["total"]
-                            ]
-                            if dataset.supplier_order:
-                                detail_chart_df["supplier"] = pd.Categorical(
-                                    detail_chart_df["supplier"],
-                                    categories=dataset.supplier_order,
-                                    ordered=True,
+                                if not used_metrics:
+                                    return {"available": False, "message": "Dodavatel neobsahuje vybrané parametry."}
+
+                                display_df = pd.DataFrame(index=analysis_df.index)
+                                if "code" in analysis_df.columns:
+                                    display_df["Kód"] = analysis_df["code"]
+                                if "description" in analysis_df.columns:
+                                    display_df["Popis"] = analysis_df["description"]
+                                if "unit" in analysis_df.columns:
+                                    display_df["Jednotka"] = analysis_df["unit"]
+                                if "Oddíl" in analysis_df.columns:
+                                    display_df["Oddíl"] = analysis_df["Oddíl"]
+                                for frame in metric_frames:
+                                    display_df = pd.concat([display_df, frame], axis=1)
+
+                                relevant_mask = pd.Series(False, index=display_df.index, dtype=bool)
+                                diff_mask = pd.Series(False, index=display_df.index, dtype=bool)
+                                threshold_mask = pd.Series(False, index=display_df.index, dtype=bool)
+
+                                for metric_key in used_metrics:
+                                    cols = metric_column_map[metric_key]
+                                    master_vals = pd.to_numeric(display_df[cols["master"]], errors="coerce")
+                                    supplier_vals = pd.to_numeric(display_df[cols["supplier"]], errors="coerce")
+                                    has_data = ~(master_vals.fillna(0).eq(0) & supplier_vals.fillna(0).eq(0))
+                                    has_data &= ~(master_vals.isna() & supplier_vals.isna())
+                                    relevant_mask |= has_data
+                                    diff_vals = pd.to_numeric(display_df[cols["diff"]], errors="coerce")
+                                    diff_mask |= diff_vals.fillna(0).abs() > 1e-9
+                                    pct_vals = pd.to_numeric(display_df[cols["pct"]], errors="coerce")
+                                    threshold_mask |= (pct_vals > threshold_max) | (pct_vals < threshold_min)
+
+                                display_df = display_df.loc[relevant_mask].copy()
+                                diff_mask = diff_mask.loc[display_df.index]
+                                threshold_mask = threshold_mask.loc[display_df.index]
+                                differences_df = display_df.loc[diff_mask].copy()
+
+                                summary_stats: Dict[str, Any] = {
+                                    "supplier": supplier_alias,
+                                    "relevant_rows": int(len(display_df)),
+                                    "missing_count": 0,
+                                }
+
+                                master_total_col = resolve_master_column(
+                                    analysis_df,
+                                    COMPARISON_METRICS_CONFIG["total"]["master_columns"],
+                                ) if "total" in COMPARISON_METRICS_CONFIG else None
+                                supplier_total_col = (
+                                    f"{supplier_alias}{COMPARISON_METRICS_CONFIG['total']['supplier_suffix']}"
+                                    if "total" in COMPARISON_METRICS_CONFIG
+                                    else None
                                 )
-                                detail_chart_df = detail_chart_df.sort_values("supplier")
-                            fig_detail = px.bar(
-                                detail_chart_df,
-                                x="supplier",
-                                y="total",
-                                color="supplier",
-                                color_discrete_map=chart_color_map,
-                                text="Cena (text)",
-                                title=f"Cenové srovnání — {detail_map.get(selected_index, selected_sheet)}",
-                            )
-                            fig_detail.update_traces(
-                                textposition="outside",
-                                texttemplate="%{text}",
-                                hovertemplate=(
-                                    "<b>%{x}</b><br>"
-                                    "Cena: %{text}<extra></extra>"
-                                ),
-                            )
-                            fig_detail.update_yaxes(title=f"Cena ({currency})")
-                            fig_detail.update_layout(xaxis_title="Dodavatel")
-                            st.plotly_chart(fig_detail, use_container_width=True)
+                                missing_df = pd.DataFrame()
+                                if (
+                                    master_total_col
+                                    and supplier_total_col
+                                    and master_total_col in analysis_df.columns
+                                    and supplier_total_col in analysis_df.columns
+                                ):
+                                    master_totals = pd.to_numeric(analysis_df[master_total_col], errors="coerce")
+                                    supplier_totals = pd.to_numeric(analysis_df[supplier_total_col], errors="coerce")
+                                    missing_mask_all = master_totals.fillna(0).ne(0) & supplier_totals.isna()
+                                    missing_count = int(missing_mask_all.sum())
+                                    summary_stats["missing_count"] = missing_count
+                                    if missing_count:
+                                        keep_cols = ["code", "description", "Oddíl", master_total_col]
+                                        existing_cols = [col for col in keep_cols if col in analysis_df.columns]
+                                        missing_df = analysis_df.loc[missing_mask_all, existing_cols].copy()
+                                        rename_map = {}
+                                        if "code" in missing_df.columns:
+                                            rename_map["code"] = "Kód"
+                                        if "description" in missing_df.columns:
+                                            rename_map["description"] = "Popis"
+                                        if master_total_col in missing_df.columns:
+                                            rename_map[master_total_col] = f"Master celkem ({currency})"
+                                        missing_df.rename(columns=rename_map, inplace=True)
 
-                        detail_table = detail_long.copy()
-                        detail_table["total"] = pd.to_numeric(detail_table["total"], errors="coerce")
-                        detail_table["difference_vs_master"] = pd.to_numeric(
-                            detail_table["difference_vs_master"], errors="coerce"
-                        )
-                        detail_table["pct_vs_master"] = pd.to_numeric(
-                            detail_table["pct_vs_master"], errors="coerce"
-                        )
-                        detail_display = detail_table[[
-                            "supplier",
-                            "total",
-                            "difference_vs_master",
-                            "pct_vs_master",
-                        ]].rename(
-                            columns={
-                                "supplier": "Dodavatel",
-                                "total": f"Cena ({currency})",
-                                "difference_vs_master": f"Rozdíl vs Master ({currency})",
-                                "pct_vs_master": "Odchylka (%)",
-                            }
-                        )
-                        for column in detail_display.columns:
-                            if column == "Dodavatel":
-                                continue
-                            if column == "Odchylka (%)":
-                                detail_display[column] = detail_display[column].apply(
-                                    lambda value: f"{format_number(value)} %" if pd.notna(value) else ""
-                                )
+                                if "total" in metric_column_map:
+                                    total_cols = metric_column_map["total"]
+                                    total_master = pd.to_numeric(display_df[total_cols["master"]], errors="coerce")
+                                    total_supplier = pd.to_numeric(display_df[total_cols["supplier"]], errors="coerce")
+                                    total_diff = pd.to_numeric(display_df[total_cols["diff"]], errors="coerce")
+                                    total_pct = pd.to_numeric(display_df[total_cols["pct"]], errors="coerce")
+                                    priced_mask = total_master.notna() & total_supplier.notna()
+                                    priced_count = int(priced_mask.sum())
+                                    expensive_mask = (total_diff > 0) & priced_mask
+                                    cheaper_mask = (total_diff < 0) & priced_mask
+                                    outside_mask = (priced_mask & ((total_pct > threshold_max) | (total_pct < threshold_min)))
+                                    summary_stats.update(
+                                        {
+                                            "priced_count": priced_count,
+                                            "expensive_count": int(expensive_mask.sum()),
+                                            "cheaper_count": int(cheaper_mask.sum()),
+                                            "outside_count": int(outside_mask.sum()),
+                                            "cheaper_pct": float(cheaper_mask.mean() * 100) if priced_count else np.nan,
+                                            "expensive_pct": float(expensive_mask.mean() * 100) if priced_count else np.nan,
+                                            "outside_range_pct": float(outside_mask.mean() * 100) if priced_count else np.nan,
+                                            "avg_pct": float(total_pct.loc[priced_mask].mean()) if priced_count else np.nan,
+                                            "abs_diff_sum": float(total_diff.loc[priced_mask].abs().sum()) if priced_count else 0.0,
+                                            "total_diff_sum": float(total_diff.loc[priced_mask].sum()) if priced_count else 0.0,
+                                        }
+                                    )
+                                else:
+                                    summary_stats.update(
+                                        {
+                                            "priced_count": 0,
+                                            "expensive_count": 0,
+                                            "cheaper_count": 0,
+                                            "outside_count": 0,
+                                            "cheaper_pct": np.nan,
+                                            "expensive_pct": np.nan,
+                                            "outside_range_pct": np.nan,
+                                            "avg_pct": np.nan,
+                                            "abs_diff_sum": 0.0,
+                                            "total_diff_sum": 0.0,
+                                        }
+                                    )
+
+                                return {
+                                    "available": True,
+                                    "display": display_df,
+                                    "differences": differences_df,
+                                    "metrics": used_metrics,
+                                    "metric_columns": metric_column_map,
+                                    "summary": summary_stats,
+                                    "missing": missing_df,
+                                    "threshold_mask": threshold_mask,
+                                }
+
+                            supplier_views: Dict[str, Dict[str, Any]] = {}
+                            for alias in supplier_aliases:
+                                view = build_supplier_view(alias)
+                                if view.get("available"):
+                                    supplier_views[alias] = view
+
+                            if not supplier_views:
+                                st.info("Dodavatelé neobsahují žádné položky odpovídající vybraným parametrům.")
                             else:
-                                detail_display[column] = detail_display[column].apply(format_number)
-                        st.dataframe(detail_display, use_container_width=True, hide_index=True)
+                                summary_rows: List[Dict[str, Any]] = []
+                                supplier_tabs = st.tabs(list(supplier_views.keys()) + ["Souhrn dodavatelů"])
 
+                                def _format_pct(value: Any) -> str:
+                                    if pd.isna(value):
+                                        return "—"
+                                    return f"{value:.1f} %"
+
+                                def _style_diff(value: Any) -> str:
+                                    if pd.isna(value) or abs(float(value)) < 1e-9:
+                                        return ""
+                                    return "background-color: #ffe3e3" if value > 0 else "background-color: #e5f5e0"
+
+                                def _style_pct(value: Any) -> str:
+                                    if pd.isna(value):
+                                        return ""
+                                    if value > threshold_max:
+                                        return "background-color: #ffe3e3"
+                                    if value < threshold_min:
+                                        return "background-color: #e5f5e0"
+                                    return ""
+
+                                for idx, (alias, view) in enumerate(supplier_views.items()):
+                                    with supplier_tabs[idx]:
+                                        display_df = view["display"]
+                                        differences_df = view["differences"]
+                                        metrics_used = view["metrics"]
+                                        metric_column_map = view["metric_columns"]
+                                        summary_stats = view["summary"]
+                                        missing_df = view["missing"]
+                                        summary_rows.append(summary_stats)
+
+                                        metric_cols = st.columns(4)
+                                        metric_cols[0].metric("Chybějící položky", str(summary_stats.get("missing_count", 0)))
+                                        priced = summary_stats.get("priced_count", 0)
+                                        metric_cols[1].metric(
+                                            "Dražší než Master",
+                                            f"{summary_stats.get('expensive_count', 0)} ({_format_pct(summary_stats.get('expensive_pct'))})",
+                                        )
+                                        metric_cols[2].metric(
+                                            "Levnější než Master",
+                                            f"{summary_stats.get('cheaper_count', 0)} ({_format_pct(summary_stats.get('cheaper_pct'))})",
+                                        )
+                                        metric_cols[3].metric(
+                                            "Průměrná odchylka",
+                                            _format_pct(summary_stats.get("avg_pct")),
+                                        )
+
+                                        column_config: Dict[str, Any] = {}
+                                        for col in ["Kód", "Popis", "Jednotka", "Oddíl"]:
+                                            if col in display_df.columns:
+                                                column_config[col] = st.column_config.TextColumn(col, disabled=True)
+
+                                        diff_columns: List[str] = []
+                                        pct_columns: List[str] = []
+                                        for metric_key in metrics_used:
+                                            config = COMPARISON_METRICS_CONFIG.get(metric_key, {})
+                                            columns = metric_column_map.get(metric_key, {})
+                                            label = config.get("label", metric_key)
+                                            number_format = config.get("number_format", "number")
+                                            unit_note = f" ({currency})" if number_format == "currency" else ""
+                                            fmt = "%.2f" if number_format == "currency" else "%.3f"
+                                            master_col = columns.get("master")
+                                            supplier_col = columns.get("supplier")
+                                            diff_col = columns.get("diff")
+                                            pct_col = columns.get("pct")
+                                            if master_col in display_df.columns:
+                                                column_config[master_col] = st.column_config.NumberColumn(
+                                                    f"{label} — Master{unit_note}",
+                                                    format=fmt,
+                                                    help=config.get("help"),
+                                                )
+                                            if supplier_col in display_df.columns:
+                                                column_config[supplier_col] = st.column_config.NumberColumn(
+                                                    f"{label} — {alias}{unit_note}",
+                                                    format=fmt,
+                                                    help=config.get("help"),
+                                                )
+                                            if diff_col in display_df.columns:
+                                                column_config[diff_col] = st.column_config.NumberColumn(
+                                                    f"{label} — Rozdíl{unit_note}",
+                                                    format=fmt,
+                                                    help=f"Rozdíl hodnot dodavatele {alias} vůči Master.",
+                                                )
+                                                diff_columns.append(diff_col)
+                                            if pct_col in display_df.columns:
+                                                column_config[pct_col] = st.column_config.NumberColumn(
+                                                    f"{label} — Δ (%)",
+                                                    format="%.2f",
+                                                    help="Procentní rozdíl oproti Master.",
+                                                )
+                                                pct_columns.append(pct_col)
+
+                                        styled_display = display_df.style
+                                        if diff_columns:
+                                            styled_display = styled_display.applymap(_style_diff, subset=diff_columns)
+                                        if pct_columns:
+                                            styled_display = styled_display.applymap(_style_pct, subset=pct_columns)
+
+                                        st.markdown("#### Kompletní přehled")
+                                        st.dataframe(
+                                            styled_display,
+                                            use_container_width=True,
+                                            hide_index=True,
+                                            column_config=column_config,
+                                        )
+
+                                        st.markdown("#### Položky s rozdíly")
+                                        if differences_df.empty:
+                                            st.info("Všechny vybrané parametry odpovídají Master.")
+                                        else:
+                                            differences_styled = differences_df.style
+                                            if diff_columns:
+                                                differences_styled = differences_styled.applymap(_style_diff, subset=diff_columns)
+                                            if pct_columns:
+                                                differences_styled = differences_styled.applymap(_style_pct, subset=pct_columns)
+                                            st.dataframe(
+                                                differences_styled,
+                                                use_container_width=True,
+                                                hide_index=True,
+                                                column_config=column_config,
+                                            )
+                                            export_stub = sanitize_filename(f"{selected_sheet}_{alias}_rozdily")
+                                            export_bytes = dataframe_to_excel_bytes(
+                                                differences_df.reset_index(drop=True),
+                                                f"Rozdily — {alias}",
+                                            )
+                                            st.download_button(
+                                                "⬇️ Export rozdílové tabulky XLSX",
+                                                data=export_bytes,
+                                                file_name=f"{export_stub}.xlsx",
+                                                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                            )
+
+                                        with st.expander("Chybějící položky v nabídce", expanded=False):
+                                            if missing_df.empty:
+                                                st.write("Dodavatel ocenil všechny položky Master pro vybrané parametry.")
+                                            else:
+                                                st.caption(
+                                                    "Položky, které jsou uvedeny v Master BoQ, ale dodavatel je neocenil (nebo ponechal nulovou hodnotu)."
+                                                )
+                                                st.dataframe(
+                                                    missing_df,
+                                                    use_container_width=True,
+                                                    hide_index=True,
+                                                )
+
+                                with supplier_tabs[-1]:
+                                    st.markdown("### Souhrn napříč dodavateli")
+                                    if not summary_rows:
+                                        st.info("Žádné údaje k sumarizaci.")
+                                    else:
+                                        summary_df = pd.DataFrame(summary_rows)
+                                        percent_cols = [
+                                            "cheaper_pct",
+                                            "expensive_pct",
+                                            "outside_range_pct",
+                                            "avg_pct",
+                                        ]
+                                        for col in percent_cols:
+                                            if col in summary_df.columns:
+                                                summary_df[col] = summary_df[col].apply(_format_pct)
+                                        if "abs_diff_sum" in summary_df.columns:
+                                            summary_df["abs_diff_sum"] = summary_df["abs_diff_sum"].apply(
+                                                lambda v: format_number(v) if pd.notna(v) else "—"
+                                            )
+                                        if "total_diff_sum" in summary_df.columns:
+                                            summary_df["total_diff_sum"] = summary_df["total_diff_sum"].apply(
+                                                lambda v: format_number(v) if pd.notna(v) else "—"
+                                            )
+                                        rename_map = {
+                                            "supplier": "Dodavatel",
+                                            "relevant_rows": "Porovnávané položky",
+                                            "missing_count": "Chybějící položky",
+                                            "priced_count": "Oceněné položky",
+                                            "expensive_count": "Dražší než Master",
+                                            "cheaper_count": "Levnější než Master",
+                                            "outside_count": f"Mimo toleranci ({threshold_min} až {threshold_max} %)",
+                                            "cheaper_pct": "Levnější (%)",
+                                            "expensive_pct": "Dražší (%)",
+                                            "outside_range_pct": "Mimo toleranci (%)",
+                                            "avg_pct": "Průměrná odchylka (%)",
+                                            "abs_diff_sum": f"Součet abs. rozdílů ({currency})",
+                                            "total_diff_sum": f"Součet rozdílů ({currency})",
+                                        }
+                                        summary_display = summary_df.rename(columns=rename_map)
+                                        st.dataframe(
+                                            summary_display,
+                                            use_container_width=True,
+                                            hide_index=True,
+                                        )
+
+                                        total_missing = sum(row.get("missing_count", 0) for row in summary_rows)
+                                        total_abs = sum(
+                                            float(row.get("abs_diff_sum", 0.0))
+                                            for row in summary_rows
+                                            if pd.notna(row.get("abs_diff_sum"))
+                                        )
+                                        total_outside = sum(row.get("outside_count", 0) for row in summary_rows)
+                                        kpi_cols = st.columns(3)
+                                        kpi_cols[0].metric("Celkem chybějících položek", str(total_missing))
+                                        kpi_cols[1].metric(
+                                            "Součet abs. rozdílů",
+                                            f"{format_number(total_abs)} {currency}",
+                                        )
+                                        kpi_cols[2].metric(
+                                            "Položky mimo toleranci",
+                                            str(total_outside),
+                                        )
+
+                                        if summary_rows:
+                                            chart_source = pd.DataFrame(
+                                                {
+                                                    "Dodavatel": [row.get("supplier") for row in summary_rows],
+                                                    "Součet rozdílů": [
+                                                        row.get("total_diff_sum", 0.0)
+                                                        if pd.notna(row.get("total_diff_sum"))
+                                                        else 0.0
+                                                        for row in summary_rows
+                                                    ],
+                                                }
+                                            )
+                                            st.bar_chart(
+                                                chart_source.set_index("Dodavatel"),
+                                                use_container_width=True,
+                                            )
 with tab_summary:
     if not bids_dict:
         st.info("Nahraj alespoň jednu nabídku dodavatele v levém panelu.")
@@ -6283,3 +6520,6 @@ with tab_qa:
 
 st.markdown("---")
 st.caption("© 2025 BoQ Bid Studio — MVP. Doporučení: používat jednotné Item ID pro precizní párování.")
+
+
+
