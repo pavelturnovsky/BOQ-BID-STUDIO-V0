@@ -3070,6 +3070,8 @@ def compare(master: WorkbookData, bids: Dict[str, WorkbookData], join_mode: str 
                 if sup_qty_col in tt_grouped.columns:
                     tt_grouped.rename(columns={sup_qty_col: qty_merge_col}, inplace=True)
             merge_cols = ["__join_key__", qty_merge_col, "unit_price_combined", "total_price"]
+            if component_averages:
+                merge_cols.extend(component_averages.keys())
             unit_merge_col: Optional[str] = None
             if "unit" in tt_grouped.columns:
                 unit_merge_col = f"__{sup_name}__unit"
