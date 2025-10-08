@@ -179,6 +179,41 @@ def test_compare_master_total_with_duplicate_supplier_rows() -> None:
     assert np.isclose(df.attrs["master_total_sum"], 100)
 
 
+def test_compare_normalizes_code_for_join() -> None:
+    master_df = pd.DataFrame(
+        {
+            "code": ["1"],
+            "description": ["Položka"],
+            "unit": ["ks"],
+            "quantity": [1],
+            "total price": [100],
+        }
+    )
+    supplier_df = pd.DataFrame(
+        {
+            "code": [1.0],
+            "description": ["Položka"],
+            "unit": ["ks"],
+            "quantity": [1],
+            "total price": [120],
+        }
+    )
+
+    master_file = make_workbook(master_df)
+    supplier_file = make_workbook(supplier_df)
+
+    master_wb = read_workbook(master_file, limit_sheets=["Sheet1"])
+    supplier_wb = read_workbook(supplier_file, limit_sheets=["Sheet1"])
+
+    apply_master_mapping(master_wb, supplier_wb)
+
+    results = compare(master_wb, {"Bid": supplier_wb})
+    df = results["Sheet1"]
+
+    assert np.isclose(df["Bid total"].iloc[0], 120)
+    assert not df["Bid total"].isna().any()
+
+
 def test_compare_ignores_summary_total_rows() -> None:
     master_raw = pd.DataFrame(
         {

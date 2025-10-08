@@ -2776,12 +2776,8 @@ def _build_join_lookup(df: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame(columns=["__item_join__", "__fallback_join__"])
 
     df_local = df.copy()
-    code_series = (
-        df_local.get("code", pd.Series(index=df_local.index, dtype=object))
-        .fillna("")
-        .astype(str)
-        .str.strip()
-    )
+    raw_codes = df_local.get("code", pd.Series(index=df_local.index, dtype=object))
+    code_series = normalize_identifier(raw_codes).fillna("").astype(str).str.strip()
     desc_series = (
         df_local.get("description", pd.Series(index=df_local.index, dtype=object))
         .fillna("")
