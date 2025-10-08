@@ -473,8 +473,8 @@ def build_comparison_dataset(sheet: str, df: pd.DataFrame) -> ComparisonDataset:
         "Master unit_price_install",
     ):
         if master_helper in analysis_df.columns:
-            analysis_df[master_helper] = pd.to_numeric(
-                analysis_df[master_helper], errors="coerce"
+            analysis_df[master_helper] = coerce_numeric(
+                analysis_df[master_helper]
             )
 
     section_tokens: List[str] = []
@@ -515,13 +515,13 @@ def build_comparison_dataset(sheet: str, df: pd.DataFrame) -> ComparisonDataset:
     supplier_order.extend(suppliers)
 
     if master_column:
-        master_series = pd.to_numeric(analysis_df[master_column], errors="coerce")
+        master_series = coerce_numeric(analysis_df[master_column])
     else:
         master_series = pd.Series(np.nan, index=analysis_df.index, dtype=float)
 
     supplier_series: Dict[str, pd.Series] = {}
     for col, supplier in zip(supplier_columns, suppliers):
-        supplier_series[supplier] = pd.to_numeric(analysis_df[col], errors="coerce")
+        supplier_series[supplier] = coerce_numeric(analysis_df[col])
 
     diff_data: Dict[str, pd.Series] = {}
     pct_data: Dict[str, pd.Series] = {}
@@ -2883,18 +2883,18 @@ def compare(master: WorkbookData, bids: Dict[str, WorkbookData], join_mode: str 
         for price_col in ("unit_price_material", "unit_price_install"):
             if price_col in mtab.columns:
                 price_cols_master.append(price_col)
-                base[price_col] = pd.to_numeric(mtab[price_col], errors="coerce")
+                base[price_col] = coerce_numeric(mtab[price_col])
                 avg_series = aggregate_weighted_average_by_key(
                     mtab, price_col, "quantity"
                 )
                 if not avg_series.empty:
                     master_price_averages[price_col] = avg_series
         if "quantity" in base.columns:
-            base["quantity"] = pd.to_numeric(base["quantity"], errors="coerce").fillna(0)
+            base["quantity"] = coerce_numeric(base["quantity"]).fillna(0)
         else:
             base["quantity"] = 0.0
         if "total_price" in base.columns:
-            base["total_price"] = pd.to_numeric(base["total_price"], errors="coerce")
+            base["total_price"] = coerce_numeric(base["total_price"])
         else:
             base["total_price"] = np.nan
         if price_cols_master:
@@ -2964,7 +2964,7 @@ def compare(master: WorkbookData, bids: Dict[str, WorkbookData], join_mode: str 
             def _numeric(name: str) -> Optional[pd.Series]:
                 if name not in tt.columns:
                     return None
-                series = pd.to_numeric(tt[name], errors="coerce")
+                series = coerce_numeric(tt[name])
                 tt[name] = series
                 return series
 
@@ -3092,7 +3092,7 @@ def compare(master: WorkbookData, bids: Dict[str, WorkbookData], join_mode: str 
             col = f"{sup_name} total"
             if col not in comp.columns:
                 continue
-            mapped_series = pd.to_numeric(comp[col], errors="coerce")
+            mapped_series = coerce_numeric(comp[col])
             mapped_sum = mapped_series.sum(min_count=1)
             mapped_sum = float(mapped_sum) if pd.notna(mapped_sum) else 0.0
             diff = float(total_sum - mapped_sum)
@@ -5059,8 +5059,8 @@ with tab_compare:
                                     supplier_col = f"{supplier_alias}{config['supplier_suffix']}"
                                     if not master_col or supplier_col not in analysis_df.columns:
                                         continue
-                                    master_values = pd.to_numeric(analysis_df[master_col], errors="coerce")
-                                    supplier_values = pd.to_numeric(analysis_df[supplier_col], errors="coerce")
+                                    master_values = coerce_numeric(analysis_df[master_col])
+                                    supplier_values = coerce_numeric(analysis_df[supplier_col])
                                     diff_values = supplier_values - master_values
                                     pct_values = compute_percent_difference(supplier_values, master_values)
                                     label = config["label"]
@@ -5092,8 +5092,6 @@ with tab_compare:
                                     display_df["Popis"] = analysis_df["description"]
                                 if "unit" in analysis_df.columns:
                                     display_df["Jednotka"] = analysis_df["unit"]
-                                if "Oddíl" in analysis_df.columns:
-                                    display_df["Oddíl"] = analysis_df["Oddíl"]
                                 for frame in metric_frames:
                                     display_df = pd.concat([display_df, frame], axis=1)
 
@@ -5103,14 +5101,14 @@ with tab_compare:
 
                                 for metric_key in used_metrics:
                                     cols = metric_column_map[metric_key]
-                                    master_vals = pd.to_numeric(display_df[cols["master"]], errors="coerce")
-                                    supplier_vals = pd.to_numeric(display_df[cols["supplier"]], errors="coerce")
+                                    master_vals = coerce_numeric(display_df[cols["master"]])
+                                    supplier_vals = coerce_numeric(display_df[cols["supplier"]])
                                     has_data = ~(master_vals.fillna(0).eq(0) & supplier_vals.fillna(0).eq(0))
                                     has_data &= ~(master_vals.isna() & supplier_vals.isna())
                                     relevant_mask |= has_data
-                                    diff_vals = pd.to_numeric(display_df[cols["diff"]], errors="coerce")
+                                    diff_vals = coerce_numeric(display_df[cols["diff"]])
                                     diff_mask |= diff_vals.fillna(0).abs() > 1e-9
-                                    pct_vals = pd.to_numeric(display_df[cols["pct"]], errors="coerce")
+                                    pct_vals = coerce_numeric(display_df[cols["pct"]])
                                     threshold_mask |= (pct_vals > threshold_max) | (pct_vals < threshold_min)
 
                                 display_df = display_df.loc[relevant_mask].copy()
@@ -5140,8 +5138,8 @@ with tab_compare:
                                     and master_total_col in analysis_df.columns
                                     and supplier_total_col in analysis_df.columns
                                 ):
-                                    master_totals = pd.to_numeric(analysis_df[master_total_col], errors="coerce")
-                                    supplier_totals = pd.to_numeric(analysis_df[supplier_total_col], errors="coerce")
+                                    master_totals = coerce_numeric(analysis_df[master_total_col])
+                                    supplier_totals = coerce_numeric(analysis_df[supplier_total_col])
                                     missing_mask_all = master_totals.fillna(0).ne(0) & supplier_totals.isna()
                                     missing_count = int(missing_mask_all.sum())
                                     summary_stats["missing_count"] = missing_count
@@ -5158,12 +5156,12 @@ with tab_compare:
                                             rename_map[master_total_col] = f"Master celkem ({currency})"
                                         missing_df.rename(columns=rename_map, inplace=True)
 
-                                if "total" in metric_column_map:
-                                    total_cols = metric_column_map["total"]
-                                    total_master = pd.to_numeric(display_df[total_cols["master"]], errors="coerce")
-                                    total_supplier = pd.to_numeric(display_df[total_cols["supplier"]], errors="coerce")
-                                    total_diff = pd.to_numeric(display_df[total_cols["diff"]], errors="coerce")
-                                    total_pct = pd.to_numeric(display_df[total_cols["pct"]], errors="coerce")
+                                    if "total" in metric_column_map:
+                                        total_cols = metric_column_map["total"]
+                                        total_master = coerce_numeric(display_df[total_cols["master"]])
+                                        total_supplier = coerce_numeric(display_df[total_cols["supplier"]])
+                                        total_diff = coerce_numeric(display_df[total_cols["diff"]])
+                                        total_pct = coerce_numeric(display_df[total_cols["pct"]])
                                     priced_mask = total_master.notna() & total_supplier.notna()
                                     priced_count = int(priced_mask.sum())
                                     expensive_mask = (total_diff > 0) & priced_mask
