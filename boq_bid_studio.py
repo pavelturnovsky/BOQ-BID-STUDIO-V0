@@ -260,6 +260,85 @@ def ensure_pdf_fonts_registered() -> Tuple[str, str]:
         _PDF_FONT_STATE = ("Helvetica", "Helvetica-Bold")
     return _PDF_FONT_STATE
 
+def _hash_dataframe_content(df: Any) -> str:
+    """Return a stable hash for dataframe content used in caches."""
+
+    if not isinstance(df, pd.DataFrame):
+        return "not-dataframe"
+
+    column_meta = [(str(col), str(dtype)) for col, dtype in zip(df.columns, df.dtypes)]
+    if df.empty:
+        payload = {"columns": column_meta, "rows": 0}
+        return hashlib.sha256(json.dumps(payload, ensure_ascii=False).encode("utf-8")).hexdigest()
+
+    hashed_series = pd.util.hash_pandas_object(df, index=True, categorize=True)
+    payload = {
+        "columns": column_meta,
+        "rows": int(len(df)),
+        "hash": hashed_series.values.tobytes().hex(),
+    }
+    return hashlib.sha256(json.dumps(payload, ensure_ascii=False).encode("utf-8")).hexdigest()
+
+
+def _workbook_fingerprint(wb: Optional[WorkbookData], sheets: Optional[Iterable[str]] = None) -> str:
+    """Create deterministic fingerprint for workbook tables and mapping state."""
+
+    if wb is None:
+        return "no-workbook"
+
+    entries: List[Tuple[str, str, int, bool, str]] = []
+    selected_sheets = list(sheets) if sheets is not None else list(wb.sheets.keys())
+    for sheet_name in sorted(selected_sheets):
+        sheet_obj = wb.sheets.get(sheet_name, {})
+        table_hash = _hash_dataframe_content(sheet_obj.get("table", pd.DataFrame()))
+        mapping = sheet_obj.get("mapping", {}) or {}
+        normalized_mapping: List[Tuple[str, int]] = []
+        for key, value in mapping.items():
+            try:
+                normalized_mapping.append((str(key), int(value)))
+            except (TypeError, ValueError):
+                normalized_mapping.append((str(key), -1))
+        normalized_mapping.sort()
+        mapping_repr = json.dumps(normalized_mapping, ensure_ascii=False)
+        header_raw = sheet_obj.get("header_row", -1)
+        try:
+            header_row = int(header_raw)
+        except (TypeError, ValueError):
+            header_row = -1
+        preserve = bool(sheet_obj.get("preserve_summary_totals", False))
+        entries.append((sheet_name, table_hash, header_row, preserve, mapping_repr))
+
+    payload = json.dumps(entries, ensure_ascii=False).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _build_compare_cache_key(
+    master: WorkbookData, bids: Dict[str, WorkbookData], join_mode: str
+) -> Tuple[str, Tuple[Tuple[str, str], ...], str]:
+    """Return cache key representing master/bid normalized tables."""
+
+    master_fp = _workbook_fingerprint(master)
+    bid_fps = tuple(
+        sorted((name, _workbook_fingerprint(wb)) for name, wb in bids.items())
+    )
+    return master_fp, bid_fps, str(join_mode)
+
+
+def _build_overview_cache_key(
+    master: WorkbookData, bids: Dict[str, WorkbookData], sheet_name: str
+) -> Tuple[str, Tuple[Tuple[str, str], ...], str]:
+    """Return cache key representing overview (rekap) tables."""
+
+    master_fp = _workbook_fingerprint(master, sheets=[sheet_name])
+    bid_fps = tuple(
+        sorted(
+            (name, _workbook_fingerprint(wb, sheets=[sheet_name]))
+            for name, wb in bids.items()
+        )
+    )
+    return master_fp, bid_fps, sheet_name
+
+
 def normalize_col(c):
     if not isinstance(c, str):
         c = str(c)
@@ -4825,9 +4904,24 @@ with tab_preview:
 # Pre-compute comparison results for reuse in tabs (after mapping)
 compare_results: Dict[str, pd.DataFrame] = {}
 if bids_dict:
-    raw_compare_results = compare(master_wb, bids_dict, join_mode="auto")
+    compare_cache: Dict[Any, Dict[str, pd.DataFrame]] = st.session_state.setdefault(
+        "compare_cache", {}
+    )
+    compare_key = _build_compare_cache_key(master_wb, bids_dict, "auto")
+    cached_compare = compare_cache.get(compare_key)
+    if cached_compare is not None:
+        raw_compare_results = {
+            sheet: df.copy() for sheet, df in cached_compare.items()
+        }
+    else:
+        raw_compare_results = compare(master_wb, bids_dict, join_mode="auto")
+        compare_cache.clear()
+        compare_cache[compare_key] = {
+            sheet: df.copy() for sheet, df in raw_compare_results.items()
+        }
     compare_results = {
-        sheet: rename_comparison_columns(df, display_names) for sheet, df in raw_compare_results.items()
+        sheet: rename_comparison_columns(df, display_names)
+        for sheet, df in raw_compare_results.items()
     }
 
 comparison_datasets: Dict[str, ComparisonDataset] = {}
@@ -4843,9 +4937,21 @@ recap_results: Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.
     pd.DataFrame(),
 )
 if bids_overview_dict:
-    recap_results = overview_comparison(
+    overview_cache: Dict[Any, Tuple[pd.DataFrame, ...]] = st.session_state.setdefault(
+        "overview_cache", {}
+    )
+    overview_key = _build_overview_cache_key(
         master_overview_wb, bids_overview_dict, overview_sheet
     )
+    cached_overview = overview_cache.get(overview_key)
+    if cached_overview is not None:
+        recap_results = tuple(df.copy() for df in cached_overview)  # type: ignore[arg-type]
+    else:
+        recap_results = overview_comparison(
+            master_overview_wb, bids_overview_dict, overview_sheet
+        )
+        overview_cache.clear()
+        overview_cache[overview_key] = tuple(df.copy() for df in recap_results)
     if display_names:
         recap_results = tuple(
             rename_total_columns(df, display_names) if i < 3 else df
