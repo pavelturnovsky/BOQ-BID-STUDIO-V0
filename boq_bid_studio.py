@@ -641,8 +641,6 @@ def build_comparison_dataset(sheet: str, df: pd.DataFrame) -> ComparisonDataset:
                 supplier_unit = ""
             if isinstance(supplier_unit, str):
                 supplier_unit = supplier_unit.strip()
-            if not supplier_unit:
-                supplier_unit = unit_value_master
             supplier_qty = row.get(f"{supplier} quantity", np.nan)
             long_records.append(
                 {
@@ -3042,8 +3040,8 @@ def compare(master: WorkbookData, bids: Dict[str, WorkbookData], join_mode: str 
             if "unit" in tt.columns:
                 tt["unit"] = tt["unit"].astype(str).str.strip()
             supplier_totals[sup_name] = float(tt["total_price"].sum())
-            first_price = (
-                tt.groupby("__key__", sort=False)["unit_price_combined"].first().reset_index(name="first_unit_price")
+            combined_average = aggregate_weighted_average_by_key(
+                tt, "unit_price_combined", sup_qty_col
             )
             def _sum_with_min_count(series: pd.Series) -> float:
                 return series.sum(min_count=1)
@@ -3054,7 +3052,6 @@ def compare(master: WorkbookData, bids: Dict[str, WorkbookData], join_mode: str 
                     "total_price": "sum",
                 }
             )
-            tt_grouped = tt_grouped.merge(first_price, on="__key__", how="left")
             component_averages: Dict[str, pd.Series] = {}
             for price_component in ("unit_price_material", "unit_price_install"):
                 if price_component in tt.columns:
@@ -3063,6 +3060,11 @@ def compare(master: WorkbookData, bids: Dict[str, WorkbookData], join_mode: str 
                     )
                     if not avg_series.empty:
                         component_averages[price_component] = avg_series
+            if not combined_average.empty:
+                key_series_combined = tt_grouped["__key__"].astype(str)
+                tt_grouped["unit_price_combined"] = key_series_combined.map(combined_average)
+            else:
+                tt_grouped["unit_price_combined"] = np.nan
             if "unit" in tt.columns:
                 unit_source = tt[["__key__", "unit"]].copy()
                 unit_source = unit_source[unit_source["unit"].astype(str).str.strip() != ""]
@@ -3070,13 +3072,6 @@ def compare(master: WorkbookData, bids: Dict[str, WorkbookData], join_mode: str 
                     unit_source.groupby("__key__", sort=False)["unit"].first().reset_index()
                 )
                 tt_grouped = tt_grouped.merge(unit_grouped, on="__key__", how="left")
-            qty = tt_grouped[sup_qty_col]
-            with np.errstate(divide="ignore", invalid="ignore"):
-                qty_for_division = qty.where(qty != 0)
-                tt_grouped["unit_price_combined"] = tt_grouped["total_price"] / qty_for_division
-            mask = qty_for_division.isna()
-            tt_grouped.loc[mask, "unit_price_combined"] = tt_grouped.loc[mask, "first_unit_price"]
-            tt_grouped.drop(columns=["first_unit_price"], inplace=True)
             if component_averages:
                 key_series_sup = tt_grouped["__key__"].astype(str)
                 for component_name, avg_series in component_averages.items():
