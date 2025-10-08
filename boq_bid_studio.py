@@ -15,7 +15,6 @@ from string import Template
 
 import numpy as np
 import pandas as pd
-from pandas.api.types import is_numeric_dtype
 import plotly.express as px
 import streamlit as st
 import streamlit.components.v1 as components
@@ -259,85 +258,6 @@ def ensure_pdf_fonts_registered() -> Tuple[str, str]:
     except Exception:
         _PDF_FONT_STATE = ("Helvetica", "Helvetica-Bold")
     return _PDF_FONT_STATE
-
-def _hash_dataframe_content(df: Any) -> str:
-    """Return a stable hash for dataframe content used in caches."""
-
-    if not isinstance(df, pd.DataFrame):
-        return "not-dataframe"
-
-    column_meta = [(str(col), str(dtype)) for col, dtype in zip(df.columns, df.dtypes)]
-    if df.empty:
-        payload = {"columns": column_meta, "rows": 0}
-        return hashlib.sha256(json.dumps(payload, ensure_ascii=False).encode("utf-8")).hexdigest()
-
-    hashed_series = pd.util.hash_pandas_object(df, index=True, categorize=True)
-    payload = {
-        "columns": column_meta,
-        "rows": int(len(df)),
-        "hash": hashed_series.values.tobytes().hex(),
-    }
-    return hashlib.sha256(json.dumps(payload, ensure_ascii=False).encode("utf-8")).hexdigest()
-
-
-def _workbook_fingerprint(wb: Optional[WorkbookData], sheets: Optional[Iterable[str]] = None) -> str:
-    """Create deterministic fingerprint for workbook tables and mapping state."""
-
-    if wb is None:
-        return "no-workbook"
-
-    entries: List[Tuple[str, str, int, bool, str]] = []
-    selected_sheets = list(sheets) if sheets is not None else list(wb.sheets.keys())
-    for sheet_name in sorted(selected_sheets):
-        sheet_obj = wb.sheets.get(sheet_name, {})
-        table_hash = _hash_dataframe_content(sheet_obj.get("table", pd.DataFrame()))
-        mapping = sheet_obj.get("mapping", {}) or {}
-        normalized_mapping: List[Tuple[str, int]] = []
-        for key, value in mapping.items():
-            try:
-                normalized_mapping.append((str(key), int(value)))
-            except (TypeError, ValueError):
-                normalized_mapping.append((str(key), -1))
-        normalized_mapping.sort()
-        mapping_repr = json.dumps(normalized_mapping, ensure_ascii=False)
-        header_raw = sheet_obj.get("header_row", -1)
-        try:
-            header_row = int(header_raw)
-        except (TypeError, ValueError):
-            header_row = -1
-        preserve = bool(sheet_obj.get("preserve_summary_totals", False))
-        entries.append((sheet_name, table_hash, header_row, preserve, mapping_repr))
-
-    payload = json.dumps(entries, ensure_ascii=False).encode("utf-8")
-    return hashlib.sha256(payload).hexdigest()
-
-
-def _build_compare_cache_key(
-    master: WorkbookData, bids: Dict[str, WorkbookData], join_mode: str
-) -> Tuple[str, Tuple[Tuple[str, str], ...], str]:
-    """Return cache key representing master/bid normalized tables."""
-
-    master_fp = _workbook_fingerprint(master)
-    bid_fps = tuple(
-        sorted((name, _workbook_fingerprint(wb)) for name, wb in bids.items())
-    )
-    return master_fp, bid_fps, str(join_mode)
-
-
-def _build_overview_cache_key(
-    master: WorkbookData, bids: Dict[str, WorkbookData], sheet_name: str
-) -> Tuple[str, Tuple[Tuple[str, str], ...], str]:
-    """Return cache key representing overview (rekap) tables."""
-
-    master_fp = _workbook_fingerprint(master, sheets=[sheet_name])
-    bid_fps = tuple(
-        sorted(
-            (name, _workbook_fingerprint(wb, sheets=[sheet_name]))
-            for name, wb in bids.items()
-        )
-    )
-    return master_fp, bid_fps, sheet_name
-
 
 def normalize_col(c):
     if not isinstance(c, str):
@@ -2012,22 +1932,6 @@ def format_preview_numbers(
     return formatted
 
 
-def format_preview_dataframe_for_export(df: pd.DataFrame) -> pd.DataFrame:
-    """Return a copy of ``df`` with numeric columns formatted for exports."""
-
-    if not isinstance(df, pd.DataFrame):
-        return pd.DataFrame()
-    if df.empty:
-        return df.copy()
-
-    formatted = df.copy()
-    for col in formatted.columns:
-        series = formatted[col]
-        if is_numeric_dtype(series):
-            formatted[col] = series.apply(format_preview_number)
-    return formatted
-
-
 def build_preview_summary(
     numeric_source: pd.DataFrame, numeric_cols: List[str]
 ) -> pd.DataFrame:
@@ -2091,6 +1995,45 @@ def count_rows_by_keys(table: Any, keys: Set[str]) -> int:
     return int(len(subset))
 
 
+def describe_preview_rows(table: Any, keys: Set[str], max_items: int = 10) -> str:
+    if not keys:
+        return ""
+
+    subset = filter_table_by_keys(table, keys)
+    if subset.empty:
+        return ""
+
+    prepared = prepare_preview_table(subset)
+    lines: List[str] = []
+    code_col = "code" if "code" in prepared.columns else None
+    desc_col = "description" if "description" in prepared.columns else None
+
+    for idx, (_, row) in enumerate(prepared.iterrows()):
+        if idx >= max_items:
+            break
+        parts: List[str] = []
+        if code_col:
+            code_val = str(row.get(code_col, "")).strip()
+            if code_val and code_val.lower() != "nan":
+                parts.append(f"**{code_val}**")
+        if desc_col:
+            desc_val = str(row.get(desc_col, "")).strip()
+            if desc_val and desc_val.lower() != "nan":
+                if parts:
+                    parts[-1] = f"{parts[-1]} — {desc_val}"
+                else:
+                    parts.append(desc_val)
+        if not parts:
+            parts.append(str({k: v for k, v in row.items() if not str(k).startswith("__")}))
+        lines.append(f"- {parts[0]}")
+
+    remaining = len(keys) - min(len(keys), max(0, len(lines)))
+    if remaining > 0:
+        lines.append(f"- … a další {remaining} položek.")
+
+    return "\n".join(lines)
+
+
 def dataframe_to_excel_bytes(df: pd.DataFrame, sheet_name: str) -> bytes:
     """Serialize a dataframe into XLSX bytes for download widgets."""
 
@@ -2132,9 +2075,7 @@ def show_df(df: pd.DataFrame) -> None:
         display_col = rename_map.get(orig_col, orig_col)
         presence_display[display_col] = series.reindex(df_to_show.index).fillna(False)
 
-    numeric_cols = [
-        col for col in df_to_show.columns if is_numeric_dtype(df_to_show[col])
-    ]
+    numeric_cols = df_to_show.select_dtypes(include=[np.number]).columns
     column_widths = compute_display_column_widths(df_to_show)
     column_config = {
         col: st.column_config.Column(width=width)
@@ -4748,73 +4689,11 @@ with tab_preview:
                                 st.error(
                                     f"Chybí {missing_count} řádků oproti Master."
                                 )
-                                missing_subset = filter_table_by_keys(
+                                missing_desc = describe_preview_rows(
                                     master_table, missing_keys
                                 )
-                                missing_display = prepare_preview_table(
-                                    missing_subset
-                                )
-                                if not missing_display.empty:
-                                    st.markdown(
-                                        f"**Detail chybějících položek ({len(missing_display)})**"
-                                    )
-                                    show_df(missing_display)
-                                    export_cols = st.columns(2)
-                                    missing_base_name = sanitize_filename(
-                                        f"{selected_preview_sheet}_{alias}_chybi",
-                                        "chybejici_polozky",
-                                    )
-                                    excel_bytes = dataframe_to_excel_bytes(
-                                        missing_display, "Chybejici"
-                                    )
-                                    pdf_bytes = b""
-                                    try:
-                                        pdf_ready = format_preview_dataframe_for_export(
-                                            missing_display
-                                        )
-                                        pdf_bytes = generate_tables_pdf(
-                                            f"Chybějící položky — {alias}",
-                                            [
-                                                (
-                                                    f"{selected_preview_sheet} — chybějící",
-                                                    pdf_ready,
-                                                )
-                                            ],
-                                        )
-                                    except Exception as exc:
-                                        logging.getLogger(__name__).warning(
-                                            "PDF export for missing rows failed: %s",
-                                            exc,
-                                        )
-                                        pdf_bytes = b""
-                                    export_cols[0].download_button(
-                                        "⬇️ Export do Excelu",
-                                        data=excel_bytes,
-                                        file_name=f"{missing_base_name}.xlsx",
-                                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                                        key=make_widget_key(
-                                            "preview_missing_xlsx",
-                                            selected_preview_sheet,
-                                            alias,
-                                        ),
-                                    )
-                                    if pdf_bytes:
-                                        export_cols[1].download_button(
-                                            "📄 Export do PDF",
-                                            data=pdf_bytes,
-                                            file_name=f"{missing_base_name}.pdf",
-                                            mime="application/pdf",
-                                            key=make_widget_key(
-                                                "preview_missing_pdf",
-                                                selected_preview_sheet,
-                                                alias,
-                                            ),
-                                        )
-                                    else:
-                                        with export_cols[1]:
-                                            st.warning(
-                                                "Export do PDF se nezdařil."
-                                            )
+                                if missing_desc:
+                                    st.markdown(missing_desc)
                             if extra_keys:
                                 extra_count = count_rows_by_keys(
                                     supplier_table, extra_keys
@@ -4822,73 +4701,11 @@ with tab_preview:
                                 st.info(
                                     f"Dodavatel obsahuje {extra_count} řádků navíc oproti Master."
                                 )
-                                extra_subset = filter_table_by_keys(
+                                extra_desc = describe_preview_rows(
                                     supplier_table, extra_keys
                                 )
-                                extra_display = prepare_preview_table(extra_subset)
-                                if not extra_display.empty:
-                                    st.markdown(
-                                        f"**Detail nadbytečných položek ({len(extra_display)})**"
-                                    )
-                                    show_df(extra_display)
-                                    export_cols_extra = st.columns(2)
-                                    extra_base_name = sanitize_filename(
-                                        f"{selected_preview_sheet}_{alias}_navic",
-                                        "nadbytecne_polozky",
-                                    )
-                                    excel_extra = dataframe_to_excel_bytes(
-                                        extra_display, "Nadbytecne"
-                                    )
-                                    pdf_extra = b""
-                                    try:
-                                        pdf_ready_extra = (
-                                            format_preview_dataframe_for_export(
-                                                extra_display
-                                            )
-                                        )
-                                        pdf_extra = generate_tables_pdf(
-                                            f"Nadbytečné položky — {alias}",
-                                            [
-                                                (
-                                                    f"{selected_preview_sheet} — navíc",
-                                                    pdf_ready_extra,
-                                                )
-                                            ],
-                                        )
-                                    except Exception as exc:
-                                        logging.getLogger(__name__).warning(
-                                            "PDF export for extra rows failed: %s",
-                                            exc,
-                                        )
-                                        pdf_extra = b""
-                                    export_cols_extra[0].download_button(
-                                        "⬇️ Export do Excelu",
-                                        data=excel_extra,
-                                        file_name=f"{extra_base_name}.xlsx",
-                                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                                        key=make_widget_key(
-                                            "preview_extra_xlsx",
-                                            selected_preview_sheet,
-                                            alias,
-                                        ),
-                                    )
-                                    if pdf_extra:
-                                        export_cols_extra[1].download_button(
-                                            "📄 Export do PDF",
-                                            data=pdf_extra,
-                                            file_name=f"{extra_base_name}.pdf",
-                                            mime="application/pdf",
-                                            key=make_widget_key(
-                                                "preview_extra_pdf",
-                                                selected_preview_sheet,
-                                                alias,
-                                            ),
-                                        )
-                                    else:
-                                        with export_cols_extra[1]:
-                                            st.warning(
-                                                "Export do PDF se nezdařil."
-                                            )
+                                if extra_desc:
+                                    st.markdown(extra_desc)
                             inject_preview_scroll_sync(
                                 master_wrapper_id,
                                 supplier_wrapper_id,
@@ -4904,24 +4721,9 @@ with tab_preview:
 # Pre-compute comparison results for reuse in tabs (after mapping)
 compare_results: Dict[str, pd.DataFrame] = {}
 if bids_dict:
-    compare_cache: Dict[Any, Dict[str, pd.DataFrame]] = st.session_state.setdefault(
-        "compare_cache", {}
-    )
-    compare_key = _build_compare_cache_key(master_wb, bids_dict, "auto")
-    cached_compare = compare_cache.get(compare_key)
-    if cached_compare is not None:
-        raw_compare_results = {
-            sheet: df.copy() for sheet, df in cached_compare.items()
-        }
-    else:
-        raw_compare_results = compare(master_wb, bids_dict, join_mode="auto")
-        compare_cache.clear()
-        compare_cache[compare_key] = {
-            sheet: df.copy() for sheet, df in raw_compare_results.items()
-        }
+    raw_compare_results = compare(master_wb, bids_dict, join_mode="auto")
     compare_results = {
-        sheet: rename_comparison_columns(df, display_names)
-        for sheet, df in raw_compare_results.items()
+        sheet: rename_comparison_columns(df, display_names) for sheet, df in raw_compare_results.items()
     }
 
 comparison_datasets: Dict[str, ComparisonDataset] = {}
@@ -4937,21 +4739,9 @@ recap_results: Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.
     pd.DataFrame(),
 )
 if bids_overview_dict:
-    overview_cache: Dict[Any, Tuple[pd.DataFrame, ...]] = st.session_state.setdefault(
-        "overview_cache", {}
-    )
-    overview_key = _build_overview_cache_key(
+    recap_results = overview_comparison(
         master_overview_wb, bids_overview_dict, overview_sheet
     )
-    cached_overview = overview_cache.get(overview_key)
-    if cached_overview is not None:
-        recap_results = tuple(df.copy() for df in cached_overview)  # type: ignore[arg-type]
-    else:
-        recap_results = overview_comparison(
-            master_overview_wb, bids_overview_dict, overview_sheet
-        )
-        overview_cache.clear()
-        overview_cache[overview_key] = tuple(df.copy() for df in recap_results)
     if display_names:
         recap_results = tuple(
             rename_total_columns(df, display_names) if i < 3 else df
