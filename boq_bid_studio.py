@@ -4605,6 +4605,39 @@ with tab_preview:
         master_highlight_keys: Set[str] = set()
         supplier_missing_map: Dict[str, Set[str]] = {}
         supplier_extra_map: Dict[str, Set[str]] = {}
+        discrepancy_frames: List[pd.DataFrame] = []
+
+        def build_discrepancy_frame(
+            source_table: pd.DataFrame,
+            keys: Set[str],
+            supplier_alias: str,
+            diff_label: str,
+        ) -> pd.DataFrame:
+            if not isinstance(source_table, pd.DataFrame) or source_table.empty or not keys:
+                return pd.DataFrame()
+
+            subset = filter_table_by_keys(source_table, keys)
+            if subset.empty:
+                return pd.DataFrame()
+
+            subset = subset.reset_index(drop=True)
+            prepared_subset = prepare_preview_table(subset)
+            if prepared_subset.empty:
+                return pd.DataFrame()
+
+            numeric_cols = [
+                col
+                for col in prepared_subset.columns
+                if col in subset.columns and pd.api.types.is_numeric_dtype(subset[col])
+            ]
+            formatted_subset = format_preview_numbers(
+                prepared_subset, subset, numeric_cols
+            )
+            formatted_subset.insert(0, "Typ rozdílu", diff_label)
+            formatted_subset.insert(0, "Dodavatel", supplier_alias)
+            formatted_subset.insert(0, "List", selected_preview_sheet)
+            return formatted_subset
+
         if bids_dict:
             for sup_name, wb in bids_dict.items():
                 alias = display_names.get(sup_name, sup_name)
@@ -4618,6 +4651,18 @@ with tab_preview:
                 supplier_missing_map[alias] = missing_keys
                 supplier_extra_map[alias] = extra_keys
                 master_highlight_keys.update(missing_keys)
+
+                missing_frame = build_discrepancy_frame(
+                    master_table, missing_keys, alias, "Chybí v nabídce"
+                )
+                if not missing_frame.empty:
+                    discrepancy_frames.append(missing_frame)
+
+                extra_frame = build_discrepancy_frame(
+                    supplier_table, extra_keys, alias, "Položka navíc"
+                )
+                if not extra_frame.empty:
+                    discrepancy_frames.append(extra_frame)
 
         master_wrapper_id = ""
         cols_preview = st.columns(2)
@@ -4717,6 +4762,48 @@ with tab_preview:
                                 ),
                                 sync_scroll_enabled,
                             )
+
+        discrepancy_table = (
+            pd.concat(discrepancy_frames, ignore_index=True, sort=False)
+            if discrepancy_frames
+            else pd.DataFrame()
+        )
+        if not discrepancy_table.empty:
+            base_columns = ["List", "Dodavatel", "Typ rozdílu"]
+            ordered_columns = base_columns + [
+                col for col in discrepancy_table.columns if col not in base_columns
+            ]
+            discrepancy_table = discrepancy_table.reindex(columns=ordered_columns)
+
+            st.markdown("### Kompletní seznam rozdílů")
+            st.caption(
+                "Tabulka obsahuje všechny chybějící nebo přidané položky pro vybraný list."
+            )
+            diff_height = min(900, 220 + max(len(discrepancy_table), 1) * 28)
+            st.dataframe(discrepancy_table, use_container_width=True, height=diff_height)
+
+            diff_stub = sanitize_filename(f"rozdily_{selected_preview_sheet}")
+            diff_csv = discrepancy_table.to_csv(index=False).encode("utf-8-sig")
+            diff_xlsx = dataframe_to_excel_bytes(
+                discrepancy_table, f"Rozdíly — {selected_preview_sheet}"
+            )
+            diff_cols = st.columns(2)
+            diff_cols[0].download_button(
+                "⬇️ Export rozdílů CSV",
+                data=diff_csv,
+                file_name=f"{diff_stub}.csv",
+                mime="text/csv",
+                key=f"{selected_preview_sheet}_diff_csv",
+            )
+            diff_cols[1].download_button(
+                "⬇️ Export rozdílů XLSX",
+                data=diff_xlsx,
+                file_name=f"{diff_stub}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key=f"{selected_preview_sheet}_diff_xlsx",
+            )
+        elif bids_dict:
+            st.info("Žádné rozdíly mezi Master a nabídkami nebyly nalezeny.")
 
 # Pre-compute comparison results for reuse in tabs (after mapping)
 compare_results: Dict[str, pd.DataFrame] = {}
