@@ -216,6 +216,34 @@ def aggregate_weighted_average_by_key(
     aggregated.index = aggregated.index.astype(str)
     return aggregated
 
+
+def first_non_missing(series: pd.Series) -> Any:
+    """Return the first non-missing/non-empty value from ``series``."""
+
+    if series is None or not isinstance(series, pd.Series) or series.empty:
+        return np.nan
+
+    for value in series:
+        if pd.isna(value):
+            continue
+        if isinstance(value, str) and value.strip() == "":
+            continue
+        return value
+    return np.nan
+
+
+def sum_preserving_na(series: pd.Series) -> float:
+    """Return the numeric sum while keeping ``NaN`` when all values are missing."""
+
+    if series is None or not isinstance(series, pd.Series) or series.empty:
+        return float("nan")
+
+    numeric = pd.to_numeric(series, errors="coerce")
+    result = numeric.sum(min_count=1)
+    if pd.isna(result):
+        return float("nan")
+    return float(result)
+
 COMPARISON_METRICS_CONFIG = {
     "total": {
         "label": "Cena celkem",
@@ -2898,61 +2926,65 @@ def compare(master: WorkbookData, bids: Dict[str, WorkbookData], join_mode: str 
         if summary_mask_master.any():
             mtab = mtab.loc[~summary_mask_master].copy()
         mtab = mtab[mtab["description"].astype(str).str.strip() != ""]
+
         base_cols = ["__key__", "code", "description", "unit", "quantity", "total_price"]
         if "item_id" in mtab.columns:
             base_cols.insert(1, "item_id")
         existing_base_cols = [col for col in base_cols if col in mtab.columns]
         base = mtab[existing_base_cols].copy()
-        price_cols_master: List[str] = []
-        master_price_averages: Dict[str, pd.Series] = {}
-        for price_col in ("unit_price_material", "unit_price_install"):
-            if price_col in mtab.columns:
-                price_cols_master.append(price_col)
-                base[price_col] = coerce_numeric(mtab[price_col])
-                avg_series = aggregate_weighted_average_by_key(
-                    mtab, price_col, "quantity"
-                )
-                if not avg_series.empty:
-                    master_price_averages[price_col] = avg_series
-        if "quantity" in base.columns:
-            base["quantity"] = coerce_numeric(base["quantity"]).fillna(0)
-        else:
-            base["quantity"] = 0.0
-        if "total_price" in base.columns:
-            base["total_price"] = coerce_numeric(base["total_price"])
-        else:
-            base["total_price"] = np.nan
-        if price_cols_master:
-            base["unit_price_combined"] = base[price_cols_master].sum(axis=1, min_count=1)
-            computed_master_total = (
-                base["quantity"].fillna(0) * base["unit_price_combined"].fillna(0)
-            )
-            missing_master_total = base["total_price"].isna() | (base["total_price"] == 0)
-            base.loc[missing_master_total, "total_price"] = computed_master_total.loc[
-                missing_master_total
-            ]
-        base["total_price"] = base["total_price"].fillna(0)
-        for temp_col in ["unit_price_combined", *price_cols_master]:
-            if temp_col in base.columns and temp_col not in existing_base_cols:
-                base.drop(columns=temp_col, inplace=True)
-        agg_mapping = {
-            "code": "first",
-            "description": "first",
-            "unit": "first",
-            "quantity": "sum",
-            "total_price": "sum",
+
+        numeric_master_cols = [
+            col
+            for col in ("quantity", "total_price", "unit_price_material", "unit_price_install")
+            if col in mtab.columns
+        ]
+        for col in numeric_master_cols:
+            base[col] = coerce_numeric(mtab[col])
+
+        if "__row_order__" in mtab.columns:
+            base["__row_order__"] = mtab["__row_order__"]
+
+        price_cols_master = [
+            col for col in ("unit_price_material", "unit_price_install") if col in base.columns
+        ]
+
+        agg_mapping: Dict[str, Any] = {
+            "code": first_non_missing,
+            "description": first_non_missing,
+            "unit": first_non_missing,
         }
         if "item_id" in base.columns:
-            agg_mapping["item_id"] = "first"
+            agg_mapping["item_id"] = first_non_missing
+        if "__row_order__" in base.columns:
+            agg_mapping["__row_order__"] = "min"
+        if "quantity" in base.columns:
+            agg_mapping["quantity"] = sum_preserving_na
+        if "total_price" in base.columns:
+            agg_mapping["total_price"] = sum_preserving_na
+        for price_col in price_cols_master:
+            agg_mapping[price_col] = first_non_missing
+
         base_grouped = base.groupby("__key__", sort=False, as_index=False).agg(agg_mapping)
         master_lookup = _build_join_lookup(mtab)
-        master_total_sum = base_grouped["total_price"].sum()
+
+        master_total_series = base_grouped.get("total_price")
+        if isinstance(master_total_series, pd.Series):
+            master_total_sum_value = sum_preserving_na(master_total_series)
+            master_total_sum = (
+                float(master_total_sum_value)
+                if pd.notna(master_total_sum_value)
+                else 0.0
+            )
+        else:
+            master_total_sum = 0.0
+
         base_grouped.rename(columns={"total_price": "Master total"}, inplace=True)
-        if master_price_averages:
-            key_series = base_grouped["__key__"].astype(str)
-            for price_col, avg_series in master_price_averages.items():
-                mapped = key_series.map(avg_series)
-                base_grouped[f"Master {price_col}"] = mapped
+        for price_col in price_cols_master:
+            if price_col in base_grouped.columns:
+                base_grouped.rename(
+                    columns={price_col: f"Master {price_col}"}, inplace=True
+                )
+
         comp = base_grouped.copy()
         if "quantity" in comp.columns and "Master quantity" not in comp.columns:
             comp["Master quantity"] = comp["quantity"]
@@ -2963,7 +2995,6 @@ def compare(master: WorkbookData, bids: Dict[str, WorkbookData], join_mode: str 
             ttab = tobj.get("table", pd.DataFrame())
             if ttab is None or ttab.empty:
                 comp[f"{sup_name} quantity"] = np.nan
-                comp[f"{sup_name} unit_price"] = np.nan
                 comp[f"{sup_name} total"] = np.nan
                 continue
             summary_mask_supplier = is_summary_like_row(ttab)
@@ -2986,129 +3017,122 @@ def compare(master: WorkbookData, bids: Dict[str, WorkbookData], join_mode: str 
             existing_cols = [c for c in cols if c in ttab.columns]
             tt = ttab[existing_cols].copy()
             supplier_lookup = _build_join_lookup(ttab)
-            def _numeric(name: str) -> Optional[pd.Series]:
-                if name not in tt.columns:
-                    return None
-                series = coerce_numeric(tt[name])
-                tt[name] = series
-                return series
 
-            qty_supplier_series = _numeric("quantity_supplier")
+            numeric_supplier_cols = [
+                col
+                for col in (
+                    "quantity",
+                    "quantity_supplier",
+                    "total_price",
+                    "unit_price_material",
+                    "unit_price_install",
+                )
+                if col in tt.columns
+            ]
+            for col in numeric_supplier_cols:
+                tt[col] = coerce_numeric(tt[col])
+
+            if "__row_order__" in ttab.columns:
+                tt["__row_order__"] = ttab["__row_order__"]
+
+            qty_supplier_series = tt.get("quantity_supplier")
             supplier_qty_has_data = (
-                qty_supplier_series is not None and qty_supplier_series.notna().any()
+                isinstance(qty_supplier_series, pd.Series)
+                and qty_supplier_series.notna().any()
             )
             if supplier_qty_has_data or "quantity_supplier" in supplier_mapping:
                 sup_qty_col = "quantity_supplier"
             else:
-                qty_series = _numeric("quantity")
                 sup_qty_col = "quantity"
-                if qty_series is None:
+                if sup_qty_col not in tt.columns:
                     tt[sup_qty_col] = np.nan
 
-            selected_price_cols: List[str] = []
-            for price_col in ("unit_price_material", "unit_price_install"):
-                series = _numeric(price_col)
-                has_data = series is not None and series.notna().any()
-                if has_data or price_col in supplier_mapping:
-                    selected_price_cols.append(price_col)
-                elif price_col in tt.columns:
-                    # Leave column in place for potential debugging but ensure NaNs
-                    tt[price_col] = series if series is not None else np.nan
-            if selected_price_cols:
-                tt["unit_price_combined"] = tt[selected_price_cols].sum(axis=1, min_count=1)
-            else:
-                tt["unit_price_combined"] = np.nan
-            total_series = _numeric("total_price")
-            total_has_data = total_series is not None and total_series.notna().any()
-            total_mapped = "total_price" in supplier_mapping or total_has_data
-            if selected_price_cols:
-                computed_total = tt[sup_qty_col].fillna(0) * tt["unit_price_combined"].fillna(0)
-            else:
-                computed_total = pd.Series(np.nan, index=tt.index)
-            if total_mapped and total_has_data:
-                if computed_total.notna().any():
-                    missing_totals = tt["total_price"].isna()
-                    tt.loc[missing_totals, "total_price"] = computed_total.loc[missing_totals]
-            elif computed_total.notna().any():
-                tt["total_price"] = computed_total
-            tt["total_price"] = tt["total_price"].fillna(0)
-            qty_for_unit = tt[sup_qty_col].replace(0, np.nan)
-            derived_unit = tt["total_price"].replace(0, np.nan) / qty_for_unit
-            tt["unit_price_combined"] = tt["unit_price_combined"].where(
-                tt["unit_price_combined"].notna(), derived_unit
+            total_series = tt.get("total_price")
+            total_sum_value = (
+                sum_preserving_na(total_series)
+                if isinstance(total_series, pd.Series)
+                else float("nan")
             )
-            if "unit" in tt.columns:
-                tt["unit"] = tt["unit"].astype(str).str.strip()
-            supplier_totals[sup_name] = float(tt["total_price"].sum())
-            combined_average = aggregate_weighted_average_by_key(
-                tt, "unit_price_combined", sup_qty_col
+            supplier_totals[sup_name] = (
+                float(total_sum_value) if pd.notna(total_sum_value) else 0.0
             )
-            def _sum_with_min_count(series: pd.Series) -> float:
-                return series.sum(min_count=1)
 
-            tt_grouped = tt.groupby("__key__", sort=False, as_index=False).agg(
-                {
-                    sup_qty_col: _sum_with_min_count,
-                    "total_price": "sum",
-                }
-            )
-            component_averages: Dict[str, pd.Series] = {}
+            agg_supplier: Dict[str, Any] = {}
+            if sup_qty_col in tt.columns:
+                agg_supplier[sup_qty_col] = sum_preserving_na
+            if "total_price" in tt.columns:
+                agg_supplier["total_price"] = sum_preserving_na
+            if "unit" in tt.columns:
+                agg_supplier["unit"] = first_non_missing
+            if "item_id" in tt.columns:
+                agg_supplier["item_id"] = first_non_missing
+            if "__row_order__" in tt.columns:
+                agg_supplier["__row_order__"] = "min"
+            component_cols: List[str] = []
             for price_component in ("unit_price_material", "unit_price_install"):
                 if price_component in tt.columns:
-                    avg_series = aggregate_weighted_average_by_key(
-                        tt, price_component, sup_qty_col
-                    )
-                    if not avg_series.empty:
-                        component_averages[price_component] = avg_series
-            if not combined_average.empty:
-                key_series_combined = tt_grouped["__key__"].astype(str)
-                tt_grouped["unit_price_combined"] = key_series_combined.map(combined_average)
-            else:
-                tt_grouped["unit_price_combined"] = np.nan
-            if "unit" in tt.columns:
-                unit_source = tt[["__key__", "unit"]].copy()
-                unit_source = unit_source[unit_source["unit"].astype(str).str.strip() != ""]
-                unit_grouped = (
-                    unit_source.groupby("__key__", sort=False)["unit"].first().reset_index()
-                )
-                tt_grouped = tt_grouped.merge(unit_grouped, on="__key__", how="left")
-            if component_averages:
-                key_series_sup = tt_grouped["__key__"].astype(str)
-                for component_name, avg_series in component_averages.items():
-                    tt_grouped[component_name] = key_series_sup.map(avg_series)
+                    agg_supplier[price_component] = first_non_missing
+                    component_cols.append(price_component)
+
+            if not agg_supplier:
+                comp[f"{sup_name} quantity"] = np.nan
+                comp[f"{sup_name} total"] = np.nan
+                continue
+
+            tt_grouped = tt.groupby("__key__", sort=False, as_index=False).agg(agg_supplier)
+
             master_join_series, supplier_join_series = _choose_join_columns(
                 master_lookup, supplier_lookup, join_mode
             )
             comp_join_keys = comp["__key__"].astype(str).map(master_join_series)
-            tt_grouped["__join_key__"] = tt_grouped["__key__"].astype(str).map(supplier_join_series)
+            tt_grouped["__join_key__"] = tt_grouped["__key__"].astype(str).map(
+                supplier_join_series
+            )
             comp["__join_key__"] = comp_join_keys
+
             qty_merge_col = sup_qty_col
             if sup_qty_col == "quantity":
                 qty_merge_col = f"__{sup_name}__quantity"
                 if sup_qty_col in tt_grouped.columns:
                     tt_grouped.rename(columns={sup_qty_col: qty_merge_col}, inplace=True)
-            merge_cols = ["__join_key__", qty_merge_col, "unit_price_combined", "total_price"]
-            if component_averages:
-                merge_cols.extend(component_averages.keys())
+
+            merge_cols = ["__join_key__"]
+            if qty_merge_col in tt_grouped.columns:
+                merge_cols.append(qty_merge_col)
+            if "total_price" in tt_grouped.columns:
+                merge_cols.append("total_price")
+
             unit_merge_col: Optional[str] = None
             if "unit" in tt_grouped.columns:
                 unit_merge_col = f"__{sup_name}__unit"
                 tt_grouped.rename(columns={"unit": unit_merge_col}, inplace=True)
                 merge_cols.append(unit_merge_col)
+
+            for component_name in component_cols:
+                if component_name in tt_grouped.columns:
+                    merge_cols.append(component_name)
+
             comp = comp.merge(tt_grouped[merge_cols], on="__join_key__", how="left")
             comp.drop(columns=["__join_key__"], inplace=True, errors="ignore")
-            rename_map = {
-                qty_merge_col: f"{sup_name} quantity",
-                "unit_price_combined": f"{sup_name} unit_price",
-                "total_price": f"{sup_name} total",
-            }
-            if component_averages:
-                for component_name in component_averages.keys():
+
+            rename_map: Dict[str, str] = {}
+            if qty_merge_col in comp.columns:
+                rename_map[qty_merge_col] = f"{sup_name} quantity"
+            if "total_price" in merge_cols:
+                rename_map["total_price"] = f"{sup_name} total"
+            for component_name in component_cols:
+                if component_name in comp.columns:
                     rename_map[component_name] = f"{sup_name} {component_name}"
             if unit_merge_col:
                 rename_map[unit_merge_col] = f"{sup_name} unit"
+
             comp.rename(columns=rename_map, inplace=True)
-            comp[f"{sup_name} Δ qty"] = comp[f"{sup_name} quantity"] - comp["quantity"]
+
+            qty_col = f"{sup_name} quantity"
+            if qty_col in comp.columns and "quantity" in comp.columns:
+                comp[f"{sup_name} Δ qty"] = comp[qty_col] - comp["quantity"]
+            else:
+                comp[f"{sup_name} Δ qty"] = np.nan
 
         for sup_name, total_sum in supplier_totals.items():
             col = f"{sup_name} total"
