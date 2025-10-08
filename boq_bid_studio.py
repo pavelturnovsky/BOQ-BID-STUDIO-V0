@@ -384,6 +384,30 @@ def normalize_text(value: Any) -> str:
     return without_diacritics.lower()
 
 
+def normalize_join_value(value: Any) -> str:
+    """Return a canonical representation suitable for joining rows."""
+
+    if pd.isna(value):
+        return ""
+    text: str
+    if isinstance(value, (int, np.integer)):
+        text = str(int(value))
+    elif isinstance(value, (float, np.floating)):
+        float_val = float(value)
+        if math.isfinite(float_val) and float_val.is_integer():
+            text = str(int(float_val))
+        else:
+            text = str(float_val)
+    else:
+        text = str(value).strip()
+    if not text:
+        return ""
+    normalized = unicodedata.normalize("NFKD", text)
+    without_diacritics = "".join(ch for ch in normalized if not unicodedata.combining(ch))
+    collapsed = re.sub(r"\s+", " ", without_diacritics)
+    return collapsed.strip().lower()
+
+
 def normalize_identifier(values: Any) -> pd.Series:
     """Return normalized textual identifiers for row-level matching."""
 
@@ -1158,22 +1182,22 @@ def build_comparison_join_key(df: pd.DataFrame) -> pd.Series:
 
     index = df.index
     if "item_id" in df.columns:
-        item_ids = normalize_identifier(df["item_id"]).fillna("")
+        item_ids = df["item_id"].map(normalize_join_value)
     else:
         item_ids = pd.Series(["" for _ in range(len(index))], index=index, dtype=object)
 
-    codes = (
-        df.get("code", pd.Series(["" for _ in range(len(index))], index=index, dtype=object))
-        .fillna("")
-        .astype(str)
-        .str.strip()
-    )
-    descriptions = (
-        df.get("description", pd.Series(["" for _ in range(len(index))], index=index, dtype=object))
-        .fillna("")
-        .astype(str)
-        .str.strip()
-    )
+    if "code" in df.columns:
+        raw_codes = df["code"]
+    else:
+        raw_codes = pd.Series(["" for _ in range(len(index))], index=index, dtype=object)
+    codes = raw_codes.map(normalize_join_value)
+
+    if "description" in df.columns:
+        raw_desc = df["description"]
+    else:
+        raw_desc = pd.Series(["" for _ in range(len(index))], index=index, dtype=object)
+    descriptions = raw_desc.map(normalize_join_value)
+
     fallback = (codes + "||" + descriptions).str.strip()
     join_key = item_ids.astype(str).str.strip()
     join_key = join_key.where(join_key != "", fallback)
@@ -2776,21 +2800,24 @@ def _build_join_lookup(df: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame(columns=["__item_join__", "__fallback_join__"])
 
     df_local = df.copy()
-    raw_codes = df_local.get("code", pd.Series(index=df_local.index, dtype=object))
-    code_series = normalize_identifier(raw_codes).fillna("").astype(str).str.strip()
-    desc_series = (
-        df_local.get("description", pd.Series(index=df_local.index, dtype=object))
-        .fillna("")
-        .astype(str)
-        .str.strip()
-    )
+    if "code" in df_local.columns:
+        raw_codes = df_local["code"].copy()
+    else:
+        raw_codes = pd.Series(["" for _ in range(len(df_local))], index=df_local.index, dtype=object)
+    code_series = raw_codes.map(normalize_join_value)
+
+    if "description" in df_local.columns:
+        raw_descriptions = df_local["description"].copy()
+    else:
+        raw_descriptions = pd.Series(["" for _ in range(len(df_local))], index=df_local.index, dtype=object)
+    desc_series = raw_descriptions.map(normalize_join_value)
 
     key_df = pd.DataFrame({"code": code_series, "description": desc_series}, index=df_local.index)
     line_ids = key_df.groupby(["code", "description"], sort=False).cumcount()
     fallback = code_series + "||" + desc_series + "||" + line_ids.astype(str)
 
     if "item_id" in df_local.columns:
-        item_series = normalize_identifier(df_local["item_id"]).fillna("").astype(str).str.strip()
+        item_series = df_local["item_id"].map(normalize_join_value)
     else:
         item_series = pd.Series(["" for _ in range(len(df_local))], index=df_local.index, dtype=object)
 

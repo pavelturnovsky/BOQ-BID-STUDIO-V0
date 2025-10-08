@@ -214,6 +214,42 @@ def test_compare_normalizes_code_for_join() -> None:
     assert not df["Bid total"].isna().any()
 
 
+def test_compare_matches_description_variants() -> None:
+    master_df = pd.DataFrame(
+        {
+            "code": [""],
+            "description": ["Montáž žaluzií"],
+            "unit": ["ks"],
+            "quantity": [2],
+            "total price": [200],
+        }
+    )
+    supplier_df = pd.DataFrame(
+        {
+            "code": [""],
+            "description": ["MONTAZ ZALUZIÍ"],
+            "unit": ["ks"],
+            "quantity": [2],
+            "total price": [240],
+        }
+    )
+
+    master_file = make_workbook(master_df)
+    supplier_file = make_workbook(supplier_df)
+
+    master_wb = read_workbook(master_file, limit_sheets=["Sheet1"])
+    supplier_wb = read_workbook(supplier_file, limit_sheets=["Sheet1"])
+
+    apply_master_mapping(master_wb, supplier_wb)
+
+    results = compare(master_wb, {"Bid": supplier_wb})
+    df = results["Sheet1"]
+
+    assert df.shape[0] == 1
+    assert np.isclose(df["Master total"].iloc[0], 200)
+    assert np.isclose(df["Bid total"].iloc[0], 240)
+
+
 def test_compare_ignores_summary_total_rows() -> None:
     master_raw = pd.DataFrame(
         {
