@@ -2985,6 +2985,7 @@ def _build_join_lookup(df: pd.DataFrame) -> pd.DataFrame:
         .first()
         .copy()
     )
+    grouped["__direct_join__"] = grouped.index.astype(str)
     return grouped
 
 
@@ -2993,11 +2994,18 @@ def _choose_join_columns(
 ) -> Tuple[pd.Series, pd.Series]:
     """Return matching join key series for master and supplier tables."""
 
-    empty_master = master_lookup.empty or "__item_join__" not in master_lookup
-    empty_supplier = supplier_lookup.empty or "__item_join__" not in supplier_lookup
+    empty_master_lookup = master_lookup.empty
+    empty_supplier_lookup = supplier_lookup.empty
+
+    master_has_item_join = "__item_join__" in master_lookup.columns and not empty_master_lookup
+    supplier_has_item_join = "__item_join__" in supplier_lookup.columns and not empty_supplier_lookup
 
     use_item_ids = False
-    if join_mode != "code+description" and not empty_master and not empty_supplier:
+    if (
+        join_mode != "code+description"
+        and master_has_item_join
+        and supplier_has_item_join
+    ):
         master_ids = master_lookup["__item_join__"].fillna("").astype(str).str.strip()
         supplier_ids = supplier_lookup["__item_join__"].fillna("").astype(str).str.strip()
         master_non_empty = master_ids[master_ids != ""]
@@ -3022,16 +3030,36 @@ def _choose_join_columns(
     master_col = "__item_join__" if use_item_ids else "__fallback_join__"
     supplier_col = "__item_join__" if use_item_ids else "__fallback_join__"
 
-    master_series = (
-        master_lookup.get(master_col, pd.Series(dtype=object))
-        if not master_lookup.empty
-        else pd.Series(dtype=object)
-    )
-    supplier_series = (
-        supplier_lookup.get(supplier_col, pd.Series(dtype=object))
-        if not supplier_lookup.empty
-        else pd.Series(dtype=object)
-    )
+    master_series = master_lookup.get(master_col, pd.Series(dtype=object)).copy()
+    supplier_series = supplier_lookup.get(supplier_col, pd.Series(dtype=object)).copy()
+
+    if not master_series.empty:
+        master_series.index = master_series.index.astype(str)
+    if not supplier_series.empty:
+        supplier_series.index = supplier_series.index.astype(str)
+
+    if (
+        join_mode != "code+description"
+        and "__direct_join__" in master_lookup.columns
+        and "__direct_join__" in supplier_lookup.columns
+        and not empty_master_lookup
+        and not empty_supplier_lookup
+    ):
+        master_direct = master_lookup["__direct_join__"].copy()
+        supplier_direct = supplier_lookup["__direct_join__"].copy()
+        master_direct.index = master_direct.index.astype(str)
+        supplier_direct.index = supplier_direct.index.astype(str)
+        common_keys = master_direct.index.intersection(supplier_direct.index)
+        if len(common_keys) > 0:
+            if master_series.empty:
+                master_series = master_direct.copy()
+            else:
+                master_series.loc[common_keys] = master_direct.loc[common_keys]
+            if supplier_series.empty:
+                supplier_series = supplier_direct.copy()
+            else:
+                supplier_series.loc[common_keys] = supplier_direct.loc[common_keys]
+
     return master_series, supplier_series
 
 
