@@ -5850,45 +5850,220 @@ with tab_compare2:
                         index=supplier_index,
                         key=make_widget_key("compare2_supplier_select", selected_sheet),
                     )
-                    table_df = build_master_supplier_table(dataset, selected_supplier)
-                    if table_df.empty:
+                    alias_lookup = {alias: raw for raw, alias in display_names.items()}
+                    raw_supplier_name = alias_lookup.get(selected_supplier, selected_supplier)
+
+                    def prepare_table_for_join(source_df: Any) -> pd.DataFrame:
+                        if not isinstance(source_df, pd.DataFrame) or source_df.empty:
+                            return pd.DataFrame()
+                        if "description" not in source_df.columns:
+                            return pd.DataFrame()
+                        working = source_df.copy()
+                        working["description"] = working["description"].astype(str)
+                        working = working[working["description"].str.strip() != ""].copy()
+                        if working.empty:
+                            return pd.DataFrame()
+                        working["__desc_key__"] = working["description"].map(normalize_text)
+                        working["__desc_key__"] = working["__desc_key__"].fillna("")
+                        working["__desc_order__"] = working.groupby("__desc_key__").cumcount()
+                        working["__join_key__"] = (
+                            working["__desc_key__"].astype(str)
+                            + "#"
+                            + working["__desc_order__"].astype(str)
+                        )
+                        if "__row_order__" in working.columns:
+                            working["__sort_order__"] = working["__row_order__"]
+                        else:
+                            working["__sort_order__"] = np.arange(len(working))
+                        return working
+
+                    master_source = master_wb.sheets.get(selected_sheet, {}).get(
+                        "table", pd.DataFrame()
+                    )
+                    master_table = (
+                        master_source.copy()
+                        if isinstance(master_source, pd.DataFrame)
+                        else pd.DataFrame()
+                    )
+                    supplier_table = pd.DataFrame()
+                    supplier_wb = bids_dict.get(raw_supplier_name)
+                    if supplier_wb is not None:
+                        supplier_source = supplier_wb.sheets.get(selected_sheet, {}).get(
+                            "table", pd.DataFrame()
+                        )
+                        if isinstance(supplier_source, pd.DataFrame):
+                            supplier_table = supplier_source.copy()
+
+                    master_prepared = prepare_table_for_join(master_table)
+                    supplier_prepared = prepare_table_for_join(supplier_table)
+
+                    if master_prepared.empty and supplier_prepared.empty:
                         st.warning(
-                            "Nebyly nalezeny spárované položky se současnými hodnotami pro Master i dodavatele."
+                            "Nepodařilo se najít položky s popisem pro Master ani vybraného dodavatele."
                         )
                     else:
-                        st.caption(
-                            "Tabulka kombinuje hodnoty z Master a vybraného dodavatele do jednoho řádku podle spárovaných položek."
+                        join_suffix = (" — Master", f" — {selected_supplier}")
+                        combined = pd.merge(
+                            master_prepared,
+                            supplier_prepared,
+                            on="__join_key__",
+                            how="outer",
+                            suffixes=join_suffix,
                         )
-                        st.dataframe(table_df, use_container_width=True, hide_index=True)
-                        export_cols = st.columns(2)
-                        csv_bytes = table_df.to_csv(index=False).encode("utf-8-sig")
-                        excel_bytes = dataframe_to_excel_bytes(
-                            table_df, f"Porovnání — {selected_sheet}"
+
+                        sort_master_col = "__sort_order" + join_suffix[0]
+                        sort_supplier_col = "__sort_order" + join_suffix[1]
+                        combined["__sort_order__"] = combined.get(sort_master_col).combine_first(
+                            combined.get(sort_supplier_col)
                         )
-                        export_cols[0].download_button(
-                            "⬇️ Export CSV",
-                            data=csv_bytes,
-                            file_name=sanitize_filename(
-                                f"porovnani2_{selected_sheet}_{selected_supplier}"
+                        combined.sort_values(
+                            by="__sort_order__", inplace=True, kind="stable"
+                        )
+                        combined.reset_index(drop=True, inplace=True)
+
+                        desc_master_col = "description" + join_suffix[0]
+                        desc_supplier_col = "description" + join_suffix[1]
+                        combined["Popis"] = combined.get(desc_master_col).combine_first(
+                            combined.get(desc_supplier_col)
+                        )
+
+                        drop_columns = [
+                            "__join_key__",
+                            "__desc_key__" + join_suffix[0],
+                            "__desc_key__" + join_suffix[1],
+                            "__desc_order__" + join_suffix[0],
+                            "__desc_order__" + join_suffix[1],
+                            sort_master_col,
+                            sort_supplier_col,
+                            "__sort_order__",
+                        ]
+                        combined.drop(columns=drop_columns, inplace=True, errors="ignore")
+                        combined.drop(
+                            columns=[c for c in (desc_master_col, desc_supplier_col) if c in combined],
+                            inplace=True,
+                            errors="ignore",
+                        )
+
+                        master_cols = [
+                            col
+                            for col in master_table.columns
+                            if isinstance(col, str) and not col.startswith("__")
+                        ]
+                        supplier_cols = [
+                            col
+                            for col in supplier_table.columns
+                            if isinstance(col, str) and not col.startswith("__")
+                        ]
+
+                        column_labels = {
+                            "code": "Kód",
+                            "item_id": "ID položky",
+                            "unit": "Jednotka",
+                            "quantity": "Množství",
+                            "quantity_supplier": "Množství dodavatel",
+                            "unit_price": "Jednotková cena",
+                            "unit_price_material": "Jednotková cena materiál",
+                            "unit_price_install": "Jednotková cena montáž",
+                            "total_price": "Cena celkem",
+                            "price": "Cena",
+                            "subtotal": "Mezisoučet",
+                        }
+
+                        rename_map: Dict[str, str] = {}
+                        for col in list(combined.columns):
+                            if col == "Popis":
+                                continue
+                            if col.endswith(join_suffix[0]):
+                                base = col[: -len(join_suffix[0])]
+                                base_label = column_labels.get(
+                                    base, base.replace("_", " ").strip().capitalize()
+                                )
+                                rename_map[col] = f"{base_label}{join_suffix[0]}"
+                            elif col.endswith(join_suffix[1]):
+                                base = col[: -len(join_suffix[1])]
+                                base_label = column_labels.get(
+                                    base, base.replace("_", " ").strip().capitalize()
+                                )
+                                rename_map[col] = f"{base_label}{join_suffix[1]}"
+                            elif col.startswith("__"):
+                                combined.drop(columns=[col], inplace=True)
+                            else:
+                                base_label = column_labels.get(
+                                    col, col.replace("_", " ").strip().capitalize()
+                                )
+                                rename_map[col] = base_label
+
+                        if rename_map:
+                            combined.rename(columns=rename_map, inplace=True)
+
+                        display_order: List[str] = []
+                        if "Popis" in combined.columns:
+                            display_order.append("Popis")
+
+                        for col in master_cols:
+                            if col == "description":
+                                continue
+                            base_label = column_labels.get(
+                                col, col.replace("_", " ").strip().capitalize()
                             )
-                            + ".csv",
-                            mime="text/csv",
-                            key=make_widget_key(
-                                "compare2_csv", selected_sheet, selected_supplier
-                            ),
-                        )
-                        export_cols[1].download_button(
-                            "⬇️ Export XLSX",
-                            data=excel_bytes,
-                            file_name=sanitize_filename(
-                                f"porovnani2_{selected_sheet}_{selected_supplier}"
+                            display_col = f"{base_label}{join_suffix[0]}"
+                            if display_col in combined.columns and display_col not in display_order:
+                                display_order.append(display_col)
+
+                        for col in supplier_cols:
+                            if col == "description":
+                                continue
+                            base_label = column_labels.get(
+                                col, col.replace("_", " ").strip().capitalize()
                             )
-                            + ".xlsx",
-                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                            key=make_widget_key(
-                                "compare2_xlsx", selected_sheet, selected_supplier
-                            ),
-                        )
+                            display_col = f"{base_label}{join_suffix[1]}"
+                            if display_col in combined.columns and display_col not in display_order:
+                                display_order.append(display_col)
+
+                        for col in combined.columns:
+                            if col not in display_order:
+                                display_order.append(col)
+
+                        table_df = combined.reindex(columns=display_order)
+
+                        if table_df.empty:
+                            st.warning(
+                                "Nebyly nalezeny spárované položky se stejným popisem pro Master i dodavatele."
+                            )
+                        else:
+                            st.caption(
+                                "Tabulka páruje Master a vybraného dodavatele podle shodného popisu položky bez dalších přepočtů."
+                            )
+                            st.dataframe(table_df, use_container_width=True, hide_index=True)
+                            export_cols = st.columns(2)
+                            csv_bytes = table_df.to_csv(index=False).encode("utf-8-sig")
+                            excel_bytes = dataframe_to_excel_bytes(
+                                table_df, f"Porovnání — {selected_sheet}"
+                            )
+                            export_cols[0].download_button(
+                                "⬇️ Export CSV",
+                                data=csv_bytes,
+                                file_name=sanitize_filename(
+                                    f"porovnani2_{selected_sheet}_{selected_supplier}"
+                                )
+                                + ".csv",
+                                mime="text/csv",
+                                key=make_widget_key(
+                                    "compare2_csv", selected_sheet, selected_supplier
+                                ),
+                            )
+                            export_cols[1].download_button(
+                                "⬇️ Export XLSX",
+                                data=excel_bytes,
+                                file_name=sanitize_filename(
+                                    f"porovnani2_{selected_sheet}_{selected_supplier}"
+                                )
+                                + ".xlsx",
+                                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                key=make_widget_key(
+                                    "compare2_xlsx", selected_sheet, selected_supplier
+                                ),
+                            )
 with tab_summary:
     if not bids_dict:
         st.info("Nahraj alespoň jednu nabídku dodavatele v levém panelu.")
