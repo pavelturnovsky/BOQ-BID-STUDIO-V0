@@ -402,6 +402,48 @@ def test_compare_transfers_supplier_quantity_and_unit() -> None:
     assert master_row["unit"] == "m"
 
 
+def test_compare_falls_back_to_quantity_when_quantity_supplier_unmapped() -> None:
+    master_table = module.build_normalized_table(
+        pd.DataFrame(
+            {
+                "code": ["1"],
+                "description": ["Item"],
+                "quantity": ["5"],
+                "total price": ["50"],
+            }
+        ),
+        {"code": 0, "description": 1, "quantity": 2, "total_price": 3},
+    )
+    supplier_table = module.build_normalized_table(
+        pd.DataFrame(
+            {
+                "code": ["1"],
+                "description": ["Item"],
+                "quantity": ["5"],
+                "total price": ["55"],
+            }
+        ),
+        {"code": 0, "description": 1, "quantity": 2, "total_price": 3},
+    )
+
+    master = WorkbookData(name="Master", sheets={"Sheet": {"table": master_table}})
+    supplier = WorkbookData(
+        name="Sup",
+        sheets={
+            "Sheet": {
+                "table": supplier_table,
+                "mapping": {"quantity_supplier": -1},
+            }
+        },
+    )
+
+    results = module.compare(master, {"Supplier": supplier})
+    df = results["Sheet"]
+
+    assert np.isclose(df.loc[df.index[0], "Supplier quantity"], 5.0)
+    assert np.isclose(df.loc[df.index[0], "Supplier total"], 55.0)
+
+
 def test_compare_falls_back_when_supplier_lacks_item_ids() -> None:
     master_table = module.build_normalized_table(
         pd.DataFrame(
