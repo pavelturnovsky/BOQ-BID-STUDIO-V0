@@ -709,6 +709,26 @@ def build_comparison_datasets(results: Dict[str, pd.DataFrame]) -> Dict[str, Com
     return datasets
 
 
+def _series_or_default(df: pd.DataFrame, names: Any, default: Any) -> pd.Series:
+    """Return the first matching column from ``df`` or a default-filled series."""
+
+    if not isinstance(df, pd.DataFrame):
+        return pd.Series(dtype=type(default) if default is not None else float)
+
+    if not isinstance(names, (list, tuple, set)):
+        names = [names]
+
+    for name in names:
+        if name and name in df.columns:
+            series = df[name]
+            if isinstance(series, pd.Series):
+                return series
+
+    if default is None:
+        default = np.nan
+    return pd.Series([default] * len(df), index=df.index)
+
+
 def build_side_by_side_view(
     dataset: ComparisonDataset, supplier_alias: str
 ) -> pd.DataFrame:
@@ -734,32 +754,32 @@ def build_side_by_side_view(
 
     working = dataset.analysis_df.copy()
 
-    def _series_or_default(names: Any, default: Any) -> pd.Series:
-        if not isinstance(names, (list, tuple)):
-            names = [names]
-        for name in names:
-            if name and name in working.columns:
-                return working[name]
-        return pd.Series([default] * len(working), index=working.index)
-
-    code_series = _series_or_default("code", "")
-    description_series = _series_or_default("description", "")
-    unit_series = _series_or_default("unit", "")
+    code_series = _series_or_default(working, "code", "")
+    description_series = _series_or_default(working, "description", "")
+    unit_series = _series_or_default(working, "unit", "")
     master_total_series = _series_or_default(
-        [dataset.master_column, "Master total"], np.nan
+        working, [dataset.master_column, "Master total"], np.nan
     )
-    supplier_total_series = _series_or_default(f"{supplier_alias} total", np.nan)
-    master_install_series = _series_or_default("Master unit_price_install", np.nan)
+    supplier_total_series = _series_or_default(
+        working, f"{supplier_alias} total", np.nan
+    )
+    master_install_series = _series_or_default(
+        working, "Master unit_price_install", np.nan
+    )
     supplier_install_series = _series_or_default(
-        f"{supplier_alias} unit_price_install", np.nan
+        working, f"{supplier_alias} unit_price_install", np.nan
     )
-    master_material_series = _series_or_default("Master unit_price_material", np.nan)
+    master_material_series = _series_or_default(
+        working, "Master unit_price_material", np.nan
+    )
     supplier_material_series = _series_or_default(
-        f"{supplier_alias} unit_price_material", np.nan
+        working, f"{supplier_alias} unit_price_material", np.nan
     )
-    master_quantity_series = _series_or_default(["Master quantity", "quantity"], np.nan)
+    master_quantity_series = _series_or_default(
+        working, ["Master quantity", "quantity"], np.nan
+    )
     supplier_quantity_series = _series_or_default(
-        f"{supplier_alias} quantity", np.nan
+        working, f"{supplier_alias} quantity", np.nan
     )
 
     description_clean = description_series.astype(str).str.strip()
@@ -831,6 +851,123 @@ def build_side_by_side_view(
         }
     )
     return result
+
+
+def build_master_supplier_table(
+    dataset: ComparisonDataset, supplier_alias: str
+) -> pd.DataFrame:
+    """Return a combined view of Master and the selected supplier values."""
+
+    if dataset is None or dataset.analysis_df.empty or not supplier_alias:
+        return pd.DataFrame()
+
+    working = dataset.analysis_df.copy()
+
+    code_series = _series_or_default(working, "code", "")
+    description_series = _series_or_default(working, "description", "")
+    section_series = _series_or_default(working, "Oddíl", "")
+    master_unit_series = _series_or_default(working, ["unit", "Master unit"], "")
+    supplier_unit_series = _series_or_default(
+        working, f"{supplier_alias} unit", ""
+    )
+    master_quantity_series = _series_or_default(
+        working, ["Master quantity", "quantity"], np.nan
+    )
+    supplier_quantity_series = _series_or_default(
+        working, f"{supplier_alias} quantity", np.nan
+    )
+    master_unit_price_series = _series_or_default(
+        working, "Master unit_price", np.nan
+    )
+    supplier_unit_price_series = _series_or_default(
+        working, f"{supplier_alias} unit_price", np.nan
+    )
+    master_unit_price_material_series = _series_or_default(
+        working, "Master unit_price_material", np.nan
+    )
+    supplier_unit_price_material_series = _series_or_default(
+        working, f"{supplier_alias} unit_price_material", np.nan
+    )
+    master_unit_price_install_series = _series_or_default(
+        working, "Master unit_price_install", np.nan
+    )
+    supplier_unit_price_install_series = _series_or_default(
+        working, f"{supplier_alias} unit_price_install", np.nan
+    )
+    master_total_series = _series_or_default(
+        working, [dataset.master_column, "Master total"], np.nan
+    )
+    supplier_total_series = _series_or_default(
+        working, f"{supplier_alias} total", np.nan
+    )
+
+    numeric_master_total = pd.to_numeric(master_total_series, errors="coerce")
+    numeric_supplier_total = pd.to_numeric(supplier_total_series, errors="coerce")
+    numeric_master_qty = pd.to_numeric(master_quantity_series, errors="coerce")
+    numeric_supplier_qty = pd.to_numeric(supplier_quantity_series, errors="coerce")
+
+    difference_series = numeric_supplier_total - numeric_master_total
+    percent_series = compute_percent_difference(
+        numeric_supplier_total, numeric_master_total
+    )
+
+    column_map: Dict[str, pd.Series] = {
+        "Kód": code_series,
+        "Popis": description_series,
+        "Oddíl": section_series,
+        "Jednotka — Master": master_unit_series,
+        f"Jednotka — {supplier_alias}": supplier_unit_series,
+        "Množství — Master": master_quantity_series,
+        f"Množství — {supplier_alias}": supplier_quantity_series,
+    }
+
+    if not master_unit_price_series.isna().all():
+        column_map["Jednotková cena — Master"] = master_unit_price_series
+    if not supplier_unit_price_series.isna().all():
+        column_map[f"Jednotková cena — {supplier_alias}"] = (
+            supplier_unit_price_series
+        )
+    if not master_unit_price_material_series.isna().all():
+        column_map["Jednotková cena materiál — Master"] = (
+            master_unit_price_material_series
+        )
+    if not supplier_unit_price_material_series.isna().all():
+        column_map[
+            f"Jednotková cena materiál — {supplier_alias}"
+        ] = supplier_unit_price_material_series
+    if not master_unit_price_install_series.isna().all():
+        column_map["Jednotková cena montáž — Master"] = (
+            master_unit_price_install_series
+        )
+    if not supplier_unit_price_install_series.isna().all():
+        column_map[
+            f"Jednotková cena montáž — {supplier_alias}"
+        ] = supplier_unit_price_install_series
+
+    column_map["Cena — Master"] = master_total_series
+    column_map[f"Cena — {supplier_alias}"] = supplier_total_series
+
+    if not difference_series.isna().all():
+        column_map[f"Rozdíl {supplier_alias} vs Master"] = difference_series
+    if not percent_series.isna().all():
+        column_map[f"Δ (%) {supplier_alias} vs Master"] = percent_series
+
+    combined_df = pd.DataFrame(column_map)
+
+    description_clean = description_series.astype(str).str.strip()
+    has_description = description_clean.ne("") & ~description_clean.str.contains(
+        UNMAPPED_ROW_LABEL, case=False, na=False
+    )
+
+    value_presence = (
+        numeric_master_total.notna()
+        | numeric_supplier_total.notna()
+        | numeric_master_qty.notna()
+        | numeric_supplier_qty.notna()
+    )
+
+    filtered_df = combined_df[has_description & value_presence]
+    return filtered_df.reset_index(drop=True)
 
 
 def natural_sort_key(value: str) -> Tuple[Any, ...]:
@@ -5713,16 +5850,45 @@ with tab_compare2:
                         index=supplier_index,
                         key=make_widget_key("compare2_supplier_select", selected_sheet),
                     )
-                    table_df = build_side_by_side_view(dataset, selected_supplier)
+                    table_df = build_master_supplier_table(dataset, selected_supplier)
                     if table_df.empty:
                         st.warning(
                             "Nebyly nalezeny spárované položky se současnými hodnotami pro Master i dodavatele."
                         )
                     else:
                         st.caption(
-                            "Položky jsou párovány dle popisu. Zobrazují se pouze řádky s dostupnými hodnotami u Master i vybraného dodavatele."
+                            "Tabulka kombinuje hodnoty z Master a vybraného dodavatele do jednoho řádku podle spárovaných položek."
                         )
                         st.dataframe(table_df, use_container_width=True, hide_index=True)
+                        export_cols = st.columns(2)
+                        csv_bytes = table_df.to_csv(index=False).encode("utf-8-sig")
+                        excel_bytes = dataframe_to_excel_bytes(
+                            table_df, f"Porovnání — {selected_sheet}"
+                        )
+                        export_cols[0].download_button(
+                            "⬇️ Export CSV",
+                            data=csv_bytes,
+                            file_name=sanitize_filename(
+                                f"porovnani2_{selected_sheet}_{selected_supplier}"
+                            )
+                            + ".csv",
+                            mime="text/csv",
+                            key=make_widget_key(
+                                "compare2_csv", selected_sheet, selected_supplier
+                            ),
+                        )
+                        export_cols[1].download_button(
+                            "⬇️ Export XLSX",
+                            data=excel_bytes,
+                            file_name=sanitize_filename(
+                                f"porovnani2_{selected_sheet}_{selected_supplier}"
+                            )
+                            + ".xlsx",
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                            key=make_widget_key(
+                                "compare2_xlsx", selected_sheet, selected_supplier
+                            ),
+                        )
 with tab_summary:
     if not bids_dict:
         st.info("Nahraj alespoň jednu nabídku dodavatele v levém panelu.")
