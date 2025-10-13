@@ -5911,10 +5911,20 @@ with tab_compare2:
                             suffixes=join_suffix,
                         )
 
-                        sort_master_col = "__sort_order" + join_suffix[0]
-                        sort_supplier_col = "__sort_order" + join_suffix[1]
-                        combined["__sort_order__"] = combined.get(sort_master_col).combine_first(
-                            combined.get(sort_supplier_col)
+                        sort_master_col = "__sort_order__" + join_suffix[0]
+                        sort_supplier_col = "__sort_order__" + join_suffix[1]
+
+                        def _ensure_series(series: Optional[pd.Series]) -> pd.Series:
+                            if series is None:
+                                return pd.Series(
+                                    [pd.NA] * len(combined), index=combined.index
+                                )
+                            return series
+
+                        combined["__sort_order__"] = _ensure_series(
+                            combined.get(sort_master_col)
+                        ).combine_first(
+                            _ensure_series(combined.get(sort_supplier_col))
                         )
                         combined.sort_values(
                             by="__sort_order__", inplace=True, kind="stable"
