@@ -709,6 +709,130 @@ def build_comparison_datasets(results: Dict[str, pd.DataFrame]) -> Dict[str, Com
     return datasets
 
 
+def build_side_by_side_view(
+    dataset: ComparisonDataset, supplier_alias: str
+) -> pd.DataFrame:
+    """Return a two-column comparison table for the provided supplier."""
+
+    if dataset is None or dataset.analysis_df.empty or not supplier_alias:
+        return pd.DataFrame(
+            columns=
+            [
+                "Kód",
+                "Popis",
+                "Jednotka",
+                "Cena master",
+                "Cena dodavatel",
+                "Jednotková cena montáž master",
+                "Jednotková cena montáž dodavatel",
+                "Jednotková cena materiál master",
+                "Jednotková cena materiál dodavatel",
+                "Množství master",
+                "Množství dodavatel",
+            ]
+        )
+
+    working = dataset.analysis_df.copy()
+
+    def _series_or_default(names: Any, default: Any) -> pd.Series:
+        if not isinstance(names, (list, tuple)):
+            names = [names]
+        for name in names:
+            if name and name in working.columns:
+                return working[name]
+        return pd.Series([default] * len(working), index=working.index)
+
+    code_series = _series_or_default("code", "")
+    description_series = _series_or_default("description", "")
+    unit_series = _series_or_default("unit", "")
+    master_total_series = _series_or_default(
+        [dataset.master_column, "Master total"], np.nan
+    )
+    supplier_total_series = _series_or_default(f"{supplier_alias} total", np.nan)
+    master_install_series = _series_or_default("Master unit_price_install", np.nan)
+    supplier_install_series = _series_or_default(
+        f"{supplier_alias} unit_price_install", np.nan
+    )
+    master_material_series = _series_or_default("Master unit_price_material", np.nan)
+    supplier_material_series = _series_or_default(
+        f"{supplier_alias} unit_price_material", np.nan
+    )
+    master_quantity_series = _series_or_default(["Master quantity", "quantity"], np.nan)
+    supplier_quantity_series = _series_or_default(
+        f"{supplier_alias} quantity", np.nan
+    )
+
+    description_clean = description_series.astype(str).str.strip()
+    has_description = description_clean.ne("") & ~description_clean.str.contains(
+        UNMAPPED_ROW_LABEL, case=False, na=False
+    )
+
+    supplier_numeric_presence = pd.to_numeric(
+        supplier_total_series, errors="coerce"
+    ).notna()
+    supplier_numeric_presence |= pd.to_numeric(
+        supplier_quantity_series, errors="coerce"
+    ).notna()
+    supplier_numeric_presence |= pd.to_numeric(
+        supplier_install_series, errors="coerce"
+    ).notna()
+    supplier_numeric_presence |= pd.to_numeric(
+        supplier_material_series, errors="coerce"
+    ).notna()
+
+    valid_rows = has_description & supplier_numeric_presence
+    if not valid_rows.any():
+        return pd.DataFrame(
+            columns=
+            [
+                "Kód",
+                "Popis",
+                "Jednotka",
+                "Cena master",
+                "Cena dodavatel",
+                "Jednotková cena montáž master",
+                "Jednotková cena montáž dodavatel",
+                "Jednotková cena materiál master",
+                "Jednotková cena materiál dodavatel",
+                "Množství master",
+                "Množství dodavatel",
+            ]
+        )
+
+    filtered_index = working.index[valid_rows]
+
+    result = pd.DataFrame(
+        {
+            "Kód": code_series.loc[filtered_index].reset_index(drop=True),
+            "Popis": description_series.loc[filtered_index].reset_index(drop=True),
+            "Jednotka": unit_series.loc[filtered_index].reset_index(drop=True),
+            "Cena master": master_total_series.loc[filtered_index].reset_index(drop=True),
+            "Cena dodavatel": supplier_total_series.loc[filtered_index].reset_index(
+                drop=True
+            ),
+            "Jednotková cena montáž master": master_install_series.loc[
+                filtered_index
+            ].reset_index(drop=True),
+            "Jednotková cena montáž dodavatel": supplier_install_series.loc[
+                filtered_index
+            ].reset_index(drop=True),
+            "Jednotková cena materiál master": master_material_series.loc[
+                filtered_index
+            ].reset_index(drop=True),
+            "Jednotková cena materiál dodavatel": supplier_material_series.loc[
+                filtered_index
+            ].reset_index(drop=True),
+            "Množství master": master_quantity_series.loc[filtered_index].reset_index(
+                drop=True
+            ),
+            "Množství dodavatel": supplier_quantity_series.loc[
+                filtered_index
+            ].reset_index(drop=True),
+        }
+    )
+    return result
+
+
 def natural_sort_key(value: str) -> Tuple[Any, ...]:
     """Return a tuple usable for natural sorting of alphanumeric codes."""
 
@@ -4286,10 +4410,11 @@ chart_color_map.setdefault("Master", "#636EFA")
 ensure_exchange_rate_state()
 
 # ------------- Tabs -------------
-tab_data, tab_preview, tab_compare, tab_summary, tab_rekap, tab_dashboard, tab_qa = st.tabs([
+tab_data, tab_preview, tab_compare, tab_compare2, tab_summary, tab_rekap, tab_dashboard, tab_qa = st.tabs([
     "📑 Mapování",
     "🧾 Kontrola dat",
     "⚖️ Porovnání",
+    "⚖️ Porovnání 2",
     "📋 Celkový přehled",
     "📊 Rekapitulace",
     "📈 Dashboard",
@@ -5519,6 +5644,57 @@ with tab_compare:
                                                 chart_source.set_index("Dodavatel"),
                                                 use_container_width=True,
                                             )
+with tab_compare2:
+    if not bids_dict:
+        st.info("Nahraj alespoň jednu nabídku dodavatele v levém panelu.")
+    elif not comparison_datasets:
+        st.info("Nebyla nalezena data pro porovnání. Zkontroluj mapování nebo vyber jiné listy.")
+    else:
+        available_sheets = [
+            sheet
+            for sheet, dataset in comparison_datasets.items()
+            if dataset is not None and not dataset.analysis_df.empty
+        ]
+        if not available_sheets:
+            st.info("Listy určené k porovnání jsou prázdné. Zkontroluj zdrojová data.")
+        else:
+            default_sheet = available_sheets[0]
+            sheet_index = (
+                available_sheets.index(default_sheet)
+                if default_sheet in available_sheets
+                else 0
+            )
+            selected_sheet = st.selectbox(
+                "Vyber list pro zobrazení",
+                available_sheets,
+                index=sheet_index,
+                key="compare2_sheet_select",
+            )
+            dataset = comparison_datasets.get(selected_sheet)
+            if dataset is None or dataset.analysis_df.empty:
+                st.warning("Vybraný list neobsahuje žádné položky k zobrazení.")
+            else:
+                supplier_aliases = [alias for alias in dataset.suppliers if alias]
+                if not supplier_aliases:
+                    st.info("Žádný z dodavatelů neobsahuje data pro vybraný list.")
+                else:
+                    supplier_index = 0 if len(supplier_aliases) else None
+                    selected_supplier = st.selectbox(
+                        "Vyber dodavatele",
+                        supplier_aliases,
+                        index=supplier_index,
+                        key=make_widget_key("compare2_supplier_select", selected_sheet),
+                    )
+                    table_df = build_side_by_side_view(dataset, selected_supplier)
+                    if table_df.empty:
+                        st.warning(
+                            "Nebyly nalezeny spárované položky se současnými hodnotami pro Master i dodavatele."
+                        )
+                    else:
+                        st.caption(
+                            "Položky jsou párovány dle popisu. Zobrazují se pouze řádky s dostupnými hodnotami u Master i vybraného dodavatele."
+                        )
+                        st.dataframe(table_df, use_container_width=True, hide_index=True)
 with tab_summary:
     if not bids_dict:
         st.info("Nahraj alespoň jednu nabídku dodavatele v levém panelu.")
