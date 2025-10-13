@@ -2911,6 +2911,33 @@ def _choose_join_columns(
     return master_series, supplier_series
 
 
+def _has_valid_mapping_index(mapping: Dict[str, Any], key: str) -> bool:
+    """Return ``True`` if mapping ``key`` points to a usable column index."""
+
+    if not isinstance(mapping, dict) or key not in mapping:
+        return False
+
+    value = mapping.get(key)
+
+    if isinstance(value, (int, np.integer)):
+        return int(value) >= 0
+    if isinstance(value, (float, np.floating)):
+        if math.isnan(float(value)):
+            return False
+        return int(value) == value and int(value) >= 0
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return False
+        try:
+            numeric = int(float(stripped))
+        except ValueError:
+            return False
+        return numeric >= 0
+
+    return False
+
+
 def compare(master: WorkbookData, bids: Dict[str, WorkbookData], join_mode: str = "auto") -> Dict[str, pd.DataFrame]:
     """
     join_mode: "auto" (Item ID if detekováno, jinak code+description), nebo "code+description".
@@ -3040,7 +3067,10 @@ def compare(master: WorkbookData, bids: Dict[str, WorkbookData], join_mode: str 
                 isinstance(qty_supplier_series, pd.Series)
                 and qty_supplier_series.notna().any()
             )
-            if supplier_qty_has_data or "quantity_supplier" in supplier_mapping:
+            has_quantity_supplier_mapping = _has_valid_mapping_index(
+                supplier_mapping, "quantity_supplier"
+            )
+            if supplier_qty_has_data or has_quantity_supplier_mapping:
                 sup_qty_col = "quantity_supplier"
             else:
                 sup_qty_col = "quantity"
