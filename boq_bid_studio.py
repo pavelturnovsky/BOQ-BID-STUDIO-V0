@@ -5399,7 +5399,7 @@ with tab_compare:
                             if key in selected_metrics_raw
                         ]
                         st.caption(
-                            "Porovnání se provádí pouze na položkách s dostupnými a nenulovými hodnotami u Master i dodavatele."
+                            "Porovnání zahrnuje položky, u kterých je alespoň jedna hodnota dostupná u Master nebo dodavatele."
                         )
 
                         supplier_aliases = [alias for alias in dataset.suppliers if alias]
@@ -5469,8 +5469,7 @@ with tab_compare:
                                     cols = metric_column_map[metric_key]
                                     master_vals = coerce_numeric(display_df[cols["master"]])
                                     supplier_vals = coerce_numeric(display_df[cols["supplier"]])
-                                    has_data = ~(master_vals.fillna(0).eq(0) & supplier_vals.fillna(0).eq(0))
-                                    has_data &= ~(master_vals.isna() & supplier_vals.isna())
+                                    has_data = master_vals.notna() | supplier_vals.notna()
                                     relevant_mask |= has_data
                                     diff_vals = coerce_numeric(display_df[cols["diff"]])
                                     diff_mask |= diff_vals.fillna(0).abs() > 1e-9
@@ -6006,6 +6005,55 @@ with tab_compare2:
                         if rename_map:
                             combined.rename(columns=rename_map, inplace=True)
 
+                        metric_pairs: Dict[str, Dict[str, str]] = {}
+                        metric_options: List[Tuple[str, str]] = []
+                        metric_candidates: List[Tuple[str, str]] = [
+                            ("total", column_labels.get("total_price", "Cena celkem")),
+                            ("quantity", column_labels.get("quantity", "Množství")),
+                            (
+                                "unit_price_material",
+                                column_labels.get(
+                                    "unit_price_material", "Jednotková cena materiál"
+                                ),
+                            ),
+                            (
+                                "unit_price_install",
+                                column_labels.get(
+                                    "unit_price_install", "Jednotková cena montáž"
+                                ),
+                            ),
+                        ]
+                        for metric_key, base_label in metric_candidates:
+                            if not base_label:
+                                continue
+                            master_col = f"{base_label}{join_suffix[0]}"
+                            supplier_col = f"{base_label}{join_suffix[1]}"
+                            if (
+                                master_col in combined.columns
+                                and supplier_col in combined.columns
+                            ):
+                                master_vals = coerce_numeric(combined[master_col])
+                                supplier_vals = coerce_numeric(combined[supplier_col])
+                                diff_col = f"{base_label} — Rozdíl"
+                                pct_col = f"{base_label} — Δ (%)"
+                                combined[diff_col] = supplier_vals - master_vals
+                                combined[pct_col] = compute_percent_difference(
+                                    supplier_vals, master_vals
+                                )
+                                metric_pairs[metric_key] = {
+                                    "label": base_label,
+                                    "master": master_col,
+                                    "supplier": supplier_col,
+                                    "diff": diff_col,
+                                    "pct": pct_col,
+                                }
+                                metric_options.append((metric_key, base_label))
+
+                        supplier_to_metric: Dict[str, str] = {
+                            details["supplier"]: key
+                            for key, details in metric_pairs.items()
+                        }
+
                         display_order: List[str] = []
                         if "Popis" in combined.columns:
                             display_order.append("Popis")
@@ -6029,12 +6077,245 @@ with tab_compare2:
                             display_col = f"{base_label}{join_suffix[1]}"
                             if display_col in combined.columns and display_col not in display_order:
                                 display_order.append(display_col)
+                                metric_key = supplier_to_metric.get(display_col)
+                                if metric_key:
+                                    metric_info = metric_pairs.get(metric_key, {})
+                                    for extra_col in (
+                                        metric_info.get("diff"),
+                                        metric_info.get("pct"),
+                                    ):
+                                        if (
+                                            extra_col
+                                            and extra_col in combined.columns
+                                            and extra_col not in display_order
+                                        ):
+                                            display_order.append(extra_col)
 
                         for col in combined.columns:
                             if col not in display_order:
                                 display_order.append(col)
 
                         table_df = combined.reindex(columns=display_order)
+
+                        comparison_df = table_df.copy()
+                        if metric_pairs:
+                            st.markdown("#### Filtrování rozdílů")
+
+                            metric_labels_map = {
+                                key: label for key, label in metric_options if key in metric_pairs
+                            }
+                            metric_choices = list(metric_labels_map.keys())
+                            default_metric_key = metric_choices[0]
+                            selected_metric_key = st.selectbox(
+                                "Parametr pro filtr",
+                                metric_choices,
+                                index=metric_choices.index(default_metric_key),
+                                format_func=lambda key: metric_labels_map.get(key, key),
+                                key=make_widget_key(
+                                    "compare2_filter_metric",
+                                    selected_sheet,
+                                    selected_supplier,
+                                ),
+                            )
+
+                            threshold_col, direction_col = st.columns([1, 2])
+                            with threshold_col:
+                                threshold_value = st.slider(
+                                    "Minimální rozdíl (%)",
+                                    min_value=0.0,
+                                    max_value=200.0,
+                                    value=5.0,
+                                    step=0.5,
+                                    help="Vyber mezní hodnotu pro filtrování odchylek vůči Master.",
+                                    key=make_widget_key(
+                                        "compare2_filter_threshold",
+                                        selected_sheet,
+                                        selected_supplier,
+                                    ),
+                                )
+                            with direction_col:
+                                direction_mode = st.radio(
+                                    "Směr odchylky",
+                                    options=[
+                                        "Všechny položky",
+                                        "Vyšší než Master",
+                                        "Nižší než Master",
+                                        "Obě strany (mimo toleranci)",
+                                    ],
+                                    index=0,
+                                    horizontal=True,
+                                    key=make_widget_key(
+                                        "compare2_filter_direction",
+                                        selected_sheet,
+                                        selected_supplier,
+                                    ),
+                                )
+
+                            metric_info = metric_pairs[selected_metric_key]
+                            pct_series = coerce_numeric(
+                                comparison_df.get(metric_info["pct"], pd.Series(dtype=float))
+                            )
+                            diff_series = coerce_numeric(
+                                comparison_df.get(metric_info["diff"], pd.Series(dtype=float))
+                            )
+
+                            available_mask = diff_series.notna() | pct_series.notna()
+                            base_mask = available_mask.copy()
+                            filtered_df = pd.DataFrame()
+                            available_count = int(available_mask.sum())
+                            show_empty_hint = True
+
+                            if not available_mask.any():
+                                st.info(
+                                    "Dodavatel neobsahuje hodnoty pro zvolený parametr."
+                                )
+                                filtered_df = pd.DataFrame(columns=[
+                                    col
+                                    for col in [
+                                        metric_info["master"],
+                                        metric_info["supplier"],
+                                        metric_info["diff"],
+                                        metric_info["pct"],
+                                    ]
+                                    if col in comparison_df.columns
+                                ])
+                                show_empty_hint = False
+                            else:
+
+                                pct_abs = pct_series.abs()
+                                pct_missing = pct_series.isna()
+                                diff_positive = diff_series > 0
+                                diff_negative = diff_series < 0
+                                diff_nonzero = diff_series != 0
+
+                                if direction_mode == "Všechny položky":
+                                    if threshold_value > 0:
+                                        meets_threshold = pct_abs >= threshold_value
+                                        fallback = pct_missing & diff_nonzero
+                                        base_mask &= meets_threshold | fallback
+                                elif direction_mode == "Vyšší než Master":
+                                    if threshold_value > 0:
+                                        meets_threshold = pct_series >= threshold_value
+                                        fallback = pct_missing & diff_positive
+                                        base_mask &= diff_positive & (meets_threshold | fallback)
+                                    else:
+                                        base_mask &= diff_positive
+                                elif direction_mode == "Nižší než Master":
+                                    if threshold_value > 0:
+                                        meets_threshold = pct_series <= -threshold_value
+                                        fallback = pct_missing & diff_negative
+                                        base_mask &= diff_negative & (meets_threshold | fallback)
+                                    else:
+                                        base_mask &= diff_negative
+                                else:
+                                    if threshold_value > 0:
+                                        meets_threshold = pct_abs >= threshold_value
+                                        fallback = pct_missing & diff_nonzero
+                                        base_mask &= diff_nonzero & (meets_threshold | fallback)
+                                    else:
+                                        base_mask &= diff_nonzero
+
+                                context_columns = [
+                                    col
+                                    for col in ["Kód", "Jednotka", "Oddíl"]
+                                    if col in comparison_df.columns
+                                ]
+                                base_columns = [
+                                    col for col in ["Popis"] if col in comparison_df.columns
+                                ]
+                                selected_columns = (
+                                    base_columns
+                                    + context_columns
+                                    + [
+                                        metric_info["master"],
+                                        metric_info["supplier"],
+                                        metric_info["diff"],
+                                        metric_info["pct"],
+                                    ]
+                                )
+                                filtered_df = comparison_df.loc[
+                                    base_mask, selected_columns
+                                ].copy()
+                                if (
+                                    not filtered_df.empty
+                                    and metric_info["pct"] in filtered_df.columns
+                                ):
+                                    filtered_df["__abs_pct__"] = filtered_df[
+                                        metric_info["pct"]
+                                    ].abs()
+                                    filtered_df.sort_values(
+                                        by="__abs_pct__",
+                                        ascending=False,
+                                        inplace=True,
+                                        kind="stable",
+                                    )
+                                    filtered_df.drop(columns=["__abs_pct__"], inplace=True)
+
+                            metric_config = COMPARISON_METRICS_CONFIG.get(
+                                selected_metric_key, {}
+                            )
+                            number_format = metric_config.get("number_format", "number")
+                            value_format = "%.2f" if number_format == "currency" else "%.3f"
+                            pct_format = metric_config.get("pct_format", "%.2f %%")
+                            if "%." not in pct_format:
+                                pct_format = "%.2f %%"
+
+                            column_config = {
+                                metric_info["master"]: st.column_config.NumberColumn(
+                                    format=value_format
+                                ),
+                                metric_info["supplier"]: st.column_config.NumberColumn(
+                                    format=value_format
+                                ),
+                                metric_info["diff"]: st.column_config.NumberColumn(
+                                    format=value_format
+                                ),
+                                metric_info["pct"]: st.column_config.NumberColumn(
+                                    format=pct_format
+                                ),
+                            }
+
+                            if filtered_df.empty:
+                                if show_empty_hint:
+                                    st.info(
+                                        "Žádné položky neodpovídají aktuálnímu nastavení filtru.",
+                                    )
+                            else:
+                                visible_count = len(filtered_df)
+                                total_candidates = available_count
+                                if total_candidates:
+                                    st.caption(
+                                        f"Filtrované položky: {visible_count} z {total_candidates} dostupných hodnot."
+                                    )
+                                else:
+                                    st.caption(
+                                        "Filtrované položky: 0 z 0 dostupných hodnot."
+                                    )
+                                st.dataframe(
+                                    filtered_df,
+                                    use_container_width=True,
+                                    hide_index=True,
+                                    column_config=column_config,
+                                )
+                                export_filtered = dataframe_to_excel_bytes(
+                                    filtered_df,
+                                    f"Porovnání — {selected_supplier} — {metric_info['label']}",
+                                )
+                                st.download_button(
+                                    "⬇️ Export filtrovaných položek XLSX",
+                                    data=export_filtered,
+                                    file_name=sanitize_filename(
+                                        f"porovnani2_{selected_sheet}_{selected_supplier}_{selected_metric_key}"
+                                    )
+                                    + ".xlsx",
+                                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                    key=make_widget_key(
+                                        "compare2_filter_export",
+                                        selected_sheet,
+                                        selected_supplier,
+                                        selected_metric_key,
+                                    ),
+                                )
 
                         if table_df.empty:
                             st.warning(
