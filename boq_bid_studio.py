@@ -47,6 +47,22 @@ st.caption("Jedna aplikace pro nahrání, mapování, porovnání nabídek a viz
 
 # ------------- Helpers -------------
 
+
+def trigger_rerun() -> None:
+    """Trigger a Streamlit rerun with backwards compatibility."""
+
+    rerun = getattr(st, "rerun", None)
+    if callable(rerun):
+        rerun()
+        return
+
+    experimental_rerun = getattr(st, "experimental_rerun", None)
+    if callable(experimental_rerun):
+        experimental_rerun()
+        return
+
+    raise AttributeError("Streamlit rerun function is not available")
+
 HEADER_HINTS = {
     "code": [
         "code",
@@ -4885,7 +4901,7 @@ with st.sidebar.expander("Správa uložených souborů"):
                 key=make_widget_key("delete_master", label),
             ):
                 offer_storage.delete_master(label)
-                st.experimental_rerun()
+                trigger_rerun()
     else:
         st.caption("Žádný uložený Master soubor.")
 
@@ -4902,7 +4918,7 @@ with st.sidebar.expander("Správa uložených souborů"):
                 key=make_widget_key("delete_bid", label),
             ):
                 offer_storage.delete_bid(label)
-                st.experimental_rerun()
+                trigger_rerun()
     else:
         st.caption("Žádné uložené nabídky.")
 
@@ -5288,7 +5304,7 @@ with tab_preview:
                                 outline_state[str(raw_key)] = desired == "➕"
                                 state_changed = True
                         if state_changed:
-                            st.experimental_rerun()
+                            trigger_rerun()
 
                         if highlight_positions:
                             css_rules = [
