@@ -2225,6 +2225,7 @@ def _attach_outline_metadata(
     header_row: Optional[int],
     row_outline_map: Optional[Dict[int, Dict[str, Any]]],
     *,
+    row_outline_nodes: Optional[Iterable[Any]] = None,
     source_index: Optional[pd.Index] = None,
 ) -> Any:
     """Return ``table`` with outline helper columns based on stored metadata."""
@@ -2257,9 +2258,43 @@ def _attach_outline_metadata(
             lambda idx: bool(outline_map.get(int(idx), {}).get("hidden", False))
         )
     else:
+        excel_rows = pd.Series([pd.NA] * len(effective_index), index=effective_index, dtype="Int64")
         row_refs = pd.Series([None] * len(effective_index), index=effective_index, dtype=object)
         row_levels = pd.Series([0] * len(effective_index), index=effective_index, dtype="Int64")
         row_hidden = pd.Series([False] * len(effective_index), index=effective_index, dtype=bool)
+
+    node_lookup: Dict[int, Any] = {}
+
+    def _flatten_nodes(nodes: Optional[Iterable[Any]]) -> Iterable[Any]:
+        if not nodes:
+            return []
+        stack = list(nodes)
+        while stack:
+            node = stack.pop()
+            if node is None:
+                continue
+            yield node
+            children = getattr(node, "children", None) or []
+            if children:
+                stack.extend(children)
+
+    for node in _flatten_nodes(row_outline_nodes):
+        try:
+            start = int(getattr(node, "start", None))
+        except (TypeError, ValueError):  # pragma: no cover - defensive
+            continue
+        if start not in node_lookup:
+            node_lookup[start] = node
+            continue
+        existing = node_lookup[start]
+        existing_level = int(getattr(existing, "level", 0) or 0)
+        new_level = int(getattr(node, "level", 0) or 0)
+        if new_level >= existing_level:
+            node_lookup[start] = node
+
+    row_nodes = excel_rows.map(
+        lambda idx: node_lookup.get(int(idx)) if pd.notna(idx) else None
+    )
 
     result = table.copy()
     result["row_ref"] = row_refs.reindex(result.index)
@@ -2267,6 +2302,57 @@ def _attach_outline_metadata(
     result["row_outline_level"] = level_values.astype("Int64")
     hidden_values = row_hidden.reindex(result.index).fillna(False)
     result["row_collapsed"] = hidden_values.astype(bool)
+
+    node_series = row_nodes.reindex(result.index)
+
+    node_key_series = node_series.map(
+        lambda node: _outline_node_key(
+            int(getattr(node, "level", 0) or 0),
+            int(getattr(node, "start", 0) or 0),
+            int(getattr(node, "end", getattr(node, "start", 0)) or getattr(node, "start", 0)),
+        )
+        if node is not None
+        else None
+    )
+    result["row_outline_node_key"] = node_key_series
+
+    def _node_range_end(node: Any) -> Optional[int]:
+        if node is None:
+            return None
+        try:
+            end = int(getattr(node, "end", getattr(node, "start", None)))
+        except (TypeError, ValueError):
+            return None
+        return end
+
+    range_end_series = node_series.map(_node_range_end)
+    if not range_end_series.isna().all():
+        result["row_outline_range_end"] = (
+            pd.Series(range_end_series, index=result.index, dtype="Int64")
+        )
+    else:
+        result["row_outline_range_end"] = pd.Series(
+            [pd.NA] * len(result), index=result.index, dtype="Int64"
+        )
+
+    def _has_children(node: Any) -> bool:
+        if node is None:
+            return False
+        try:
+            start = int(getattr(node, "start", 0) or 0)
+            end = int(getattr(node, "end", start) or start)
+        except (TypeError, ValueError):
+            start = int(getattr(node, "start", 0) or 0)
+            end = start
+        if end > start:
+            return True
+        children = getattr(node, "children", None)
+        if not children:
+            return False
+        return len(children) > 0
+
+    has_children_series = node_series.map(_has_children)
+    result["row_outline_has_children"] = has_children_series.fillna(False).astype(bool)
     return result
 
 
@@ -2953,6 +3039,9 @@ def read_workbook(upload, limit_sheets: Optional[List[str]] = None) -> WorkbookD
 
             row_outline_map = outline_levels.get(s, {}).get("rows", {}) if outline_levels else {}
             col_outline_map = outline_levels.get(s, {}).get("cols", {}) if outline_levels else {}
+            row_outline_nodes = (
+                outline_tree.get(s, {}).get("rows", []) if outline_tree else []
+            )
 
             source_index = body.index if isinstance(body, pd.DataFrame) else None
             tbl = _attach_outline_metadata(
@@ -2960,6 +3049,7 @@ def read_workbook(upload, limit_sheets: Optional[List[str]] = None) -> WorkbookD
                 s,
                 header_row,
                 row_outline_map,
+                row_outline_nodes=row_outline_nodes,
                 source_index=source_index,
             )
 
@@ -3129,6 +3219,9 @@ def apply_master_mapping(master: WorkbookData, target: WorkbookData) -> None:
             sheet,
             target_header_row,
             target_sheet.get("row_outline_map"),
+            row_outline_nodes=(
+                (target_sheet.get("outline_tree") or {}).get("rows", [])
+            ),
             source_index=body.index if isinstance(body, pd.DataFrame) else None,
         )
 
@@ -3413,6 +3506,9 @@ def mapping_ui(
                     sheet,
                     header_row,
                     obj.get("row_outline_map"),
+                    row_outline_nodes=(
+                        (obj.get("outline_tree") or {}).get("rows", [])
+                    ),
                     source_index=body.index,
                 )
             else:
@@ -5026,6 +5122,7 @@ with tab_preview:
             summary_title: Optional[str] = None,
             original_df: Optional[pd.DataFrame] = None,
             allow_export_full: bool = True,
+            outline_state: Optional[Dict[str, bool]] = None,
         ) -> str:
             prepared = prepare_preview_table(df)
             wrapper_id = f"preview-wrapper-{widget_suffix}"
@@ -5085,29 +5182,155 @@ with tab_preview:
                 if highlight_keys:
                     highlight_set = {str(key).strip() for key in highlight_keys if str(key).strip()}
 
+                highlight_positions: List[int] = []
+                if not display_df.empty and highlight_set and row_keys:
+                    row_index = pd.Series(row_keys[: len(display_df)], index=display_df.index)
+                    highlight_mask = row_index.isin(highlight_set)
+                    highlight_positions = [
+                        idx + 1 for idx, flag in enumerate(highlight_mask.tolist()) if flag
+                    ]
+
+                outline_column_name = "Outline"
+                outline_icons = pd.Series(["" for _ in range(len(display_df))], index=display_df.index)
+                outline_enabled = False
+                node_keys_series: Optional[pd.Series] = None
+
+                if (
+                    outline_state is not None
+                    and isinstance(prepared, pd.DataFrame)
+                    and "row_outline_node_key" in prepared.columns
+                ):
+                    node_keys_series = prepared["row_outline_node_key"].reindex(display_df.index)
+                    has_children_series = (
+                        prepared["row_outline_has_children"]
+                        if "row_outline_has_children" in prepared.columns
+                        else pd.Series([False] * len(prepared), index=prepared.index)
+                    )
+                    has_children_series = has_children_series.reindex(display_df.index).fillna(False)
+
+                    icons: List[str] = []
+                    for pos in range(len(display_df)):
+                        raw_key = (
+                            node_keys_series.iloc[pos]
+                            if node_keys_series is not None
+                            else None
+                        )
+                        if raw_key is None or pd.isna(raw_key):
+                            icons.append("")
+                            continue
+                        key_text = str(raw_key).strip()
+                        if not key_text:
+                            icons.append("")
+                            continue
+                        has_children = bool(has_children_series.iloc[pos])
+                        if not has_children:
+                            icons.append("")
+                            continue
+                        collapsed = bool(outline_state.get(key_text, False))
+                        icons.append("➕" if collapsed else "➖")
+                    outline_icons = pd.Series(icons, index=display_df.index, dtype=object)
+                    outline_enabled = outline_icons.replace("", pd.NA).notna().any()
+
                 if not display_df.empty:
-                    if highlight_set and row_keys:
-                        row_index = pd.Series(row_keys[: len(display_df)], index=display_df.index)
-                        highlight_mask = row_index.isin(highlight_set)
-                        if highlight_mask.any():
-                            highlight_styles = pd.DataFrame(
-                                "",
-                                index=display_df.index,
-                                columns=display_df.columns,
-                            )
-                            highlight_styles.loc[highlight_mask, :] = (
-                                f"background-color: {highlight_color}"
-                            )
+                    if outline_enabled:
+                        combined_df = display_df.copy()
+                        combined_df.insert(0, outline_column_name, outline_icons)
 
-                            def apply_styles(_: pd.DataFrame) -> pd.DataFrame:
-                                return highlight_styles
+                        column_config: Dict[str, Any] = {}
+                        for col in combined_df.columns:
+                            if col == outline_column_name:
+                                column_config[col] = st.column_config.SelectboxColumn(
+                                    "Outline",
+                                    options=["", "➖", "➕"],
+                                    help="Klikni na ikonu pro sbalení nebo rozbalení outline skupiny.",
+                                    width=80,
+                                    pinned=True,
+                                )
+                            else:
+                                column_config[col] = st.column_config.Column(label=str(col), disabled=True)
 
-                            styler = display_df.style.apply(apply_styles, axis=None)
+                        editor_key = f"preview_editor_{widget_suffix}"
+                        edited_df = st.data_editor(
+                            combined_df,
+                            column_config=column_config,
+                            hide_index=True,
+                            use_container_width=True,
+                            height=height,
+                            key=editor_key,
+                        )
+
+                        if isinstance(edited_df, pd.DataFrame):
+                            new_icons = edited_df[outline_column_name]
                         else:
-                            styler = display_df.style
-                        st.dataframe(styler, use_container_width=True, height=height)
+                            new_icons = pd.DataFrame(edited_df)[outline_column_name]
+
+                        state_changed = False
+                        if node_keys_series is not None:
+                            for pos in range(len(combined_df)):
+                                previous = (
+                                    str(outline_icons.iloc[pos])
+                                    if pos < len(outline_icons)
+                                    else ""
+                                )
+                                updated = (
+                                    str(new_icons.iloc[pos])
+                                    if pos < len(new_icons)
+                                    else previous
+                                )
+                                if previous == updated:
+                                    continue
+                                raw_key = node_keys_series.iloc[pos]
+                                if raw_key is None or pd.isna(raw_key):
+                                    continue
+                                desired = updated.strip()
+                                if desired not in {"➖", "➕"}:
+                                    continue
+                                outline_state[str(raw_key)] = desired == "➕"
+                                state_changed = True
+                        if state_changed:
+                            st.experimental_rerun()
+
+                        if highlight_positions:
+                            css_rules = [
+                                (
+                                    f"#{wrapper_id} .ag-theme-streamlit .ag-center-cols-container "
+                                    f".ag-row[aria-rowindex='{pos - 1}'] .ag-cell"
+                                )
+                                for pos in highlight_positions
+                            ]
+                            if css_rules:
+                                st.markdown(
+                                    "<style>"
+                                    + "\n".join(
+                                        f"{selector} {{ background-color: {highlight_color} !important; }}"
+                                        for selector in css_rules
+                                    )
+                                    + "</style>",
+                                    unsafe_allow_html=True,
+                                )
                     else:
-                        st.dataframe(display_df, use_container_width=True, height=height)
+                        if highlight_set and row_keys:
+                            row_index = pd.Series(row_keys[: len(display_df)], index=display_df.index)
+                            highlight_mask = row_index.isin(highlight_set)
+                            if highlight_mask.any():
+                                highlight_styles = pd.DataFrame(
+                                    "",
+                                    index=display_df.index,
+                                    columns=display_df.columns,
+                                )
+                                highlight_styles.loc[highlight_mask, :] = (
+                                    f"background-color: {highlight_color}"
+                                )
+
+                                def apply_styles(_: pd.DataFrame) -> pd.DataFrame:
+                                    return highlight_styles
+
+                                styler = display_df.style.apply(apply_styles, axis=None)
+                            else:
+                                styler = display_df.style
+                            st.dataframe(styler, use_container_width=True, height=height)
+                        else:
+                            st.dataframe(display_df, use_container_width=True, height=height)
                 else:
                     st.dataframe(display_df, use_container_width=True, height=height)
 
@@ -5464,6 +5687,7 @@ with tab_preview:
         )
 
         supplier_outline_views: Dict[str, pd.DataFrame] = {}
+        supplier_outline_states: Dict[str, Dict[str, bool]] = {}
 
         outline_sources: List[Tuple[str, str, WorkbookData]] = [("Master", "master", master_wb)]
         for sup_name, wb in bids_dict.items():
@@ -5733,6 +5957,7 @@ with tab_preview:
                     collapsed_state=supplier_state,
                 )
                 supplier_outline_views[sup_name] = supplier_display
+                supplier_outline_states[sup_name] = supplier_state
                 supplier_keys = extract_preview_key_set(supplier_table)
                 missing_keys = master_keys_set - supplier_keys
                 extra_keys = supplier_keys - master_keys_set
@@ -5771,6 +5996,7 @@ with tab_preview:
                     currency_label=currency,
                     summary_title="Součty — Master",
                     original_df=master_table,
+                    outline_state=master_outline_state,
                 )
                 if master_highlight_keys:
                     missing_lines = []
@@ -5815,6 +6041,7 @@ with tab_preview:
                                 currency_label=currency,
                                 summary_title=f"Součty — {alias}",
                                 original_df=supplier_table,
+                                outline_state=supplier_outline_states.get(sup_name),
                             )
                             missing_keys = supplier_missing_map.get(alias, set())
                             extra_keys = supplier_extra_map.get(alias, set())
