@@ -2219,6 +2219,57 @@ def prepare_preview_table(table: Any) -> pd.DataFrame:
     return display
 
 
+def _attach_outline_metadata(
+    table: Any,
+    sheet_name: str,
+    header_row: Optional[int],
+    row_outline_map: Optional[Dict[int, Dict[str, Any]]],
+    *,
+    source_index: Optional[pd.Index] = None,
+) -> Any:
+    """Return ``table`` with outline helper columns based on stored metadata."""
+
+    if not isinstance(table, pd.DataFrame):
+        return table
+
+    effective_index: pd.Index
+    if source_index is not None and isinstance(source_index, pd.Index):
+        effective_index = source_index
+    elif source_index is not None:
+        effective_index = pd.Index(source_index)
+    else:
+        effective_index = table.index if isinstance(table.index, pd.Index) else pd.Index([])
+
+    outline_map = row_outline_map or {}
+
+    if header_row is not None and isinstance(header_row, (int, np.integer)) and header_row >= 0:
+        start_row = int(header_row) + 2
+        excel_rows = pd.Series(
+            np.arange(start_row, start_row + len(effective_index)),
+            index=effective_index,
+            dtype="Int64",
+        )
+        row_refs = excel_rows.map(lambda idx: f"{sheet_name}!{int(idx)}")
+        row_levels = excel_rows.map(
+            lambda idx: outline_map.get(int(idx), {}).get("level", 0)
+        )
+        row_hidden = excel_rows.map(
+            lambda idx: bool(outline_map.get(int(idx), {}).get("hidden", False))
+        )
+    else:
+        row_refs = pd.Series([None] * len(effective_index), index=effective_index, dtype=object)
+        row_levels = pd.Series([0] * len(effective_index), index=effective_index, dtype="Int64")
+        row_hidden = pd.Series([False] * len(effective_index), index=effective_index, dtype=bool)
+
+    result = table.copy()
+    result["row_ref"] = row_refs.reindex(result.index)
+    level_values = row_levels.reindex(result.index).fillna(0)
+    result["row_outline_level"] = level_values.astype("Int64")
+    hidden_values = row_hidden.reindex(result.index).fillna(False)
+    result["row_collapsed"] = hidden_values.astype(bool)
+    return result
+
+
 def _normalize_preview_value(value: Any) -> str:
     if pd.isna(value):
         return ""
@@ -2728,37 +2779,14 @@ def read_workbook(upload, limit_sheets: Optional[List[str]] = None) -> WorkbookD
             row_outline_map = outline_levels.get(s, {}).get("rows", {}) if outline_levels else {}
             col_outline_map = outline_levels.get(s, {}).get("cols", {}) if outline_levels else {}
 
-            if isinstance(body, pd.DataFrame):
-                body_index = body.index
-                if header_row is not None and header_row >= 0:
-                    start_row = int(header_row) + 2
-                    excel_rows = pd.Series(
-                        np.arange(start_row, start_row + len(body)),
-                        index=body_index,
-                        dtype="Int64",
-                    )
-                    row_refs = excel_rows.map(lambda idx: f"{s}!{int(idx)}")
-                    row_levels = excel_rows.map(
-                        lambda idx: row_outline_map.get(int(idx), {}).get("level", 0)
-                    )
-                    row_hidden = excel_rows.map(
-                        lambda idx: bool(row_outline_map.get(int(idx), {}).get("hidden", False))
-                    )
-                else:
-                    row_refs = pd.Series([None] * len(body), index=body_index, dtype=object)
-                    row_levels = pd.Series([0] * len(body), index=body_index, dtype="Int64")
-                    row_hidden = pd.Series([False] * len(body), index=body_index, dtype=bool)
-            else:
-                row_refs = pd.Series(dtype=object)
-                row_levels = pd.Series(dtype="Int64")
-                row_hidden = pd.Series(dtype=bool)
-
-            if isinstance(tbl, pd.DataFrame):
-                tbl["row_ref"] = row_refs.reindex(tbl.index)
-                level_values = row_levels.reindex(tbl.index).fillna(0)
-                tbl["row_outline_level"] = level_values.astype("Int64")
-                hidden_values = row_hidden.reindex(tbl.index).fillna(False)
-                tbl["row_collapsed"] = hidden_values.astype(bool)
+            source_index = body.index if isinstance(body, pd.DataFrame) else None
+            tbl = _attach_outline_metadata(
+                tbl,
+                s,
+                header_row,
+                row_outline_map,
+                source_index=source_index,
+            )
 
             wb.sheets[s] = {
                 "raw": raw,
@@ -2920,6 +2948,14 @@ def apply_master_mapping(master: WorkbookData, target: WorkbookData) -> None:
             )
         except Exception:
             continue
+
+        table = _attach_outline_metadata(
+            table,
+            sheet,
+            target_header_row,
+            target_sheet.get("row_outline_map"),
+            source_index=body.index if isinstance(body, pd.DataFrame) else None,
+        )
 
         target_sheet.update(
             {
@@ -3196,6 +3232,13 @@ def mapping_ui(
                     body,
                     ui_mapping,
                     preserve_summary_totals=use_minimal,
+                )
+                table = _attach_outline_metadata(
+                    table,
+                    sheet,
+                    header_row,
+                    obj.get("row_outline_map"),
+                    source_index=body.index,
                 )
             else:
                 table = pd.DataFrame()
