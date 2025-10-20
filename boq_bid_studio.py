@@ -2270,6 +2270,181 @@ def _attach_outline_metadata(
     return result
 
 
+def _outline_node_key(level: int, start: int, end: int) -> str:
+    return f"{int(level)}:{int(start)}:{int(end)}"
+
+
+def _ensure_outline_state(
+    dataset_key: str,
+    sheet_name: str,
+    axis: str,
+    nodes: Iterable[Any],
+) -> Dict[str, bool]:
+    """Return mutable collapse state seeded from outline ``nodes``."""
+
+    store: Dict[str, Dict[str, Dict[str, Dict[str, bool]]]] = st.session_state.setdefault(
+        "_outline_state",
+        {},
+    )
+    dataset_state = store.setdefault(dataset_key, {})
+    sheet_state = dataset_state.setdefault(sheet_name, {})
+    axis_state = sheet_state.setdefault(axis, {})
+
+    def seed(items: Iterable[Any]) -> None:
+        for node in items or []:
+            key = _outline_node_key(getattr(node, "level", 0), getattr(node, "start", 0), getattr(node, "end", 0))
+            if key not in axis_state:
+                axis_state[key] = bool(getattr(node, "collapsed", False))
+            if getattr(node, "children", None):
+                seed(node.children)
+
+    seed(nodes)
+    sheet_state[axis] = axis_state
+    dataset_state[sheet_name] = sheet_state
+    st.session_state["_outline_state"] = store
+    return axis_state
+
+
+def _collect_collapsed_ranges(
+    nodes: Iterable[Any],
+    collapsed_state: Dict[str, bool],
+) -> List[Tuple[int, int]]:
+    """Return list of row index ranges that should be hidden for collapsed nodes."""
+
+    ranges: List[Tuple[int, int]] = []
+
+    def traverse(items: Iterable[Any]) -> None:
+        for node in items or []:
+            level = int(getattr(node, "level", 0))
+            start = int(getattr(node, "start", 0))
+            end = int(getattr(node, "end", start))
+            key = _outline_node_key(level, start, end)
+            is_collapsed = collapsed_state.get(key, bool(getattr(node, "collapsed", False)))
+            if is_collapsed:
+                ranges.append((start, end))
+                # No need to recurse into children when collapsed
+                continue
+            if getattr(node, "children", None):
+                traverse(node.children)
+
+    traverse(nodes)
+    return ranges
+
+
+def _filter_table_by_outline(
+    table: Any,
+    *,
+    nodes: Iterable[Any],
+    collapsed_state: Dict[str, bool],
+) -> Any:
+    """Return ``table`` filtered to exclude rows hidden by outline state."""
+
+    if not isinstance(table, pd.DataFrame) or table.empty:
+        return table if isinstance(table, pd.DataFrame) else table
+
+    ranges = _collect_collapsed_ranges(nodes, collapsed_state)
+    if not ranges:
+        return table.copy()
+
+    def parse_row_ref(value: Any) -> Optional[int]:
+        if value is None or (isinstance(value, float) and math.isnan(value)):
+            return None
+        text = str(value).strip()
+        if not text:
+            return None
+        if "!" in text:
+            _, _, row_part = text.rpartition("!")
+        else:
+            row_part = text
+        try:
+            return int(float(row_part))
+        except (TypeError, ValueError):
+            return None
+
+    row_refs = table.get("row_ref")
+    if row_refs is None:
+        return table.copy()
+
+    row_numbers = row_refs.map(parse_row_ref)
+    if row_numbers.isna().all():
+        return table.copy()
+
+    def is_hidden(row_number: Optional[int]) -> bool:
+        if row_number is None:
+            return False
+        return any(start <= row_number <= end for start, end in ranges)
+
+    hidden_mask = row_numbers.map(is_hidden)
+    if not hidden_mask.any():
+        return table.copy()
+
+    return table.loc[~hidden_mask].copy()
+
+
+def _apply_outline_indentation(table: Any) -> Any:
+    """Return ``table`` with visual indentation applied to outline-aware rows."""
+
+    if not isinstance(table, pd.DataFrame) or table.empty:
+        return table if isinstance(table, pd.DataFrame) else table
+
+    if "row_outline_level" not in table.columns:
+        return table.copy()
+
+    levels = pd.to_numeric(table["row_outline_level"], errors="coerce").fillna(0).astype(int)
+    indent_map = levels.map(lambda lvl: "\u00A0\u00A0\u00A0" * max(lvl - 1, 0))
+    if indent_map.str.len().sum() == 0:
+        return table.copy()
+
+    result = table.copy()
+    preferred = [
+        col
+        for col in result.columns
+        if str(col).strip().lower() in {"description", "popis", "název", "nazev"}
+        and pd.api.types.is_object_dtype(result[col])
+    ]
+    text_columns = preferred or [
+        col
+        for col in result.columns
+        if not str(col).startswith("__") and pd.api.types.is_object_dtype(result[col])
+    ]
+    if not text_columns:
+        return result
+
+    def indent_value(value: Any, indent: str) -> Any:
+        if value is None:
+            return value
+        if isinstance(value, float) and math.isnan(value):
+            return value
+        text = str(value)
+        if not text:
+            return value
+        return f"{indent}{text}"
+
+    for col in text_columns:
+        series = result[col].astype(object)
+        result[col] = series.combine(indent_map, indent_value)
+
+    return result
+
+
+def _prepare_outline_view(
+    table: Any,
+    *,
+    nodes: Iterable[Any],
+    collapsed_state: Dict[str, bool],
+) -> Tuple[pd.DataFrame, int]:
+    """Return outline-filtered/indented table and count of hidden rows."""
+
+    if not isinstance(table, pd.DataFrame):
+        return pd.DataFrame(), 0
+
+    filtered = _filter_table_by_outline(table, nodes=nodes, collapsed_state=collapsed_state)
+    filtered = filtered if isinstance(filtered, pd.DataFrame) else pd.DataFrame()
+    indented = _apply_outline_indentation(filtered)
+    hidden = max(len(table) - len(filtered), 0)
+    return indented, hidden
+
+
 def _normalize_preview_value(value: Any) -> str:
     if pd.isna(value):
         return ""
@@ -4849,6 +5024,8 @@ with tab_preview:
             highlight_color: str = "#FFE8CC",
             currency_label: Optional[str] = None,
             summary_title: Optional[str] = None,
+            original_df: Optional[pd.DataFrame] = None,
+            allow_export_full: bool = True,
         ) -> str:
             prepared = prepare_preview_table(df)
             wrapper_id = f"preview-wrapper-{widget_suffix}"
@@ -4866,6 +5043,12 @@ with tab_preview:
                 row_count = len(prepared)
                 if row_count == 0:
                     st.info("Tabulka je prázdná nebo list neobsahuje položky.")
+
+                total_rows: Optional[int] = None
+                hidden_rows: Optional[int] = None
+                if isinstance(original_df, pd.DataFrame):
+                    total_rows = len(original_df)
+                    hidden_rows = max((total_rows or 0) - row_count, 0)
 
                 height = min(900, 220 + max(row_count, 1) * 28)
 
@@ -4928,7 +5111,10 @@ with tab_preview:
                 else:
                     st.dataframe(display_df, use_container_width=True, height=height)
 
-                st.caption(f"{row_count} řádků")
+                if hidden_rows and hidden_rows > 0 and total_rows:
+                    st.caption(f"{row_count} z {total_rows} řádků zobrazeno (skryto {hidden_rows}).")
+                else:
+                    st.caption(f"{row_count} řádků")
 
                 summary_df = build_preview_summary(numeric_source, numeric_cols)
                 if not summary_df.empty:
@@ -4940,8 +5126,21 @@ with tab_preview:
                     st.dataframe(summary_df, use_container_width=True, height=160)
 
                 file_stub = sanitize_filename(f"{table_label}_{sheet_label}")
-                csv_bytes = prepared.to_csv(index=False).encode("utf-8-sig")
-                excel_bytes = dataframe_to_excel_bytes(prepared, sheet_label)
+                export_df = prepared
+                export_caption_parts: List[str] = []
+                if allow_export_full and isinstance(original_df, pd.DataFrame):
+                    export_all = st.checkbox(
+                        "Exportovat všechny řádky (včetně skrytých)",
+                        value=False,
+                        key=f"{widget_suffix}_export_full",
+                    )
+                    if export_all:
+                        export_df = prepare_preview_table(original_df)
+                        export_caption_parts.append("všechny řádky")
+                    elif hidden_rows and hidden_rows > 0:
+                        export_caption_parts.append("pouze zobrazené řádky")
+                csv_bytes = export_df.to_csv(index=False).encode("utf-8-sig")
+                excel_bytes = dataframe_to_excel_bytes(export_df, sheet_label)
                 export_cols = st.columns(2)
                 export_cols[0].download_button(
                     "⬇️ Export CSV",
@@ -4957,6 +5156,8 @@ with tab_preview:
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     key=f"{widget_suffix}_xlsx",
                 )
+                if export_caption_parts:
+                    st.caption("Export: " + ", ".join(export_caption_parts))
 
                 st.markdown("</div>", unsafe_allow_html=True)
 
@@ -5248,6 +5449,21 @@ with tab_preview:
 
         master_sheet = master_wb.sheets.get(selected_preview_sheet, {})
         master_table = master_sheet.get("table", pd.DataFrame())
+        master_outline_tree = master_sheet.get("outline_tree", {"rows": [], "cols": []})
+        master_row_nodes = (master_outline_tree or {}).get("rows", [])
+        master_outline_state = _ensure_outline_state(
+            "master",
+            selected_preview_sheet,
+            "rows",
+            master_row_nodes,
+        )
+        master_display_table, _ = _prepare_outline_view(
+            master_table,
+            nodes=master_row_nodes,
+            collapsed_state=master_outline_state,
+        )
+
+        supplier_outline_views: Dict[str, pd.DataFrame] = {}
 
         outline_sources: List[Tuple[str, str, WorkbookData]] = [("Master", "master", master_wb)]
         for sup_name, wb in bids_dict.items():
@@ -5301,6 +5517,12 @@ with tab_preview:
                     if not nodes:
                         st.info("Outline pro zvolenou osu není k dispozici.")
                     else:
+                        state_map = _ensure_outline_state(
+                            dataset_key,
+                            selected_preview_sheet,
+                            axis_key,
+                            nodes,
+                        )
                         st.markdown("**Strom outline**")
                         selection_state_key = make_widget_key(
                             "outline",
@@ -5313,11 +5535,19 @@ with tab_preview:
                         def _render_outline(nodes_list: List[Any], depth: int = 0) -> None:
                             for node in nodes_list:
                                 indent = "\u2003" * depth
-                                label = (
-                                    f"{indent}• Úroveň {node.level}: {node.start}–{node.end}"
-                                    f"{' (sbaleno)' if node.collapsed else ''}"
+                                node_key = _outline_node_key(
+                                    getattr(node, "level", 0),
+                                    getattr(node, "start", 0),
+                                    getattr(node, "end", 0),
                                 )
-                                button_key = make_widget_key(
+                                collapsed_default = state_map.get(
+                                    node_key, bool(getattr(node, "collapsed", False))
+                                )
+                                icon = "▸" if collapsed_default else "▾"
+                                toggle_label = (
+                                    f"{indent}{icon} Úroveň {node.level}: {node.start}–{node.end}"
+                                )
+                                toggle_key = make_widget_key(
                                     "outline",
                                     dataset_key,
                                     selected_preview_sheet,
@@ -5325,17 +5555,37 @@ with tab_preview:
                                     node.level,
                                     node.start,
                                     node.end,
+                                    "toggle",
                                 )
-                                if st.button(label, key=button_key):
-                                    st.session_state[selection_state_key] = {
-                                        "level": node.level,
-                                        "start": node.start,
-                                        "end": node.end,
-                                        "collapsed": node.collapsed,
-                                        "axis": axis_key,
-                                        "sheet": selected_preview_sheet,
-                                    }
-                                if node.children:
+                                row_cols = st.columns([0.8, 0.2])
+                                with row_cols[0]:
+                                    expanded = st.checkbox(
+                                        toggle_label,
+                                        value=not collapsed_default,
+                                        key=toggle_key,
+                                    )
+                                state_map[node_key] = not expanded
+                                select_key = make_widget_key(
+                                    "outline",
+                                    dataset_key,
+                                    selected_preview_sheet,
+                                    axis_key,
+                                    node.level,
+                                    node.start,
+                                    node.end,
+                                    "select",
+                                )
+                                with row_cols[1]:
+                                    if st.button("Vybrat", key=select_key):
+                                        st.session_state[selection_state_key] = {
+                                            "level": node.level,
+                                            "start": node.start,
+                                            "end": node.end,
+                                            "collapsed": state_map.get(node_key, False),
+                                            "axis": axis_key,
+                                            "sheet": selected_preview_sheet,
+                                        }
+                                if expanded and getattr(node, "children", None):
                                     _render_outline(node.children, depth + 1)
 
                         _render_outline(nodes)
@@ -5469,6 +5719,20 @@ with tab_preview:
                 if sheet_obj is None:
                     continue
                 supplier_table = sheet_obj.get("table", pd.DataFrame())
+                supplier_outline_tree = sheet_obj.get("outline_tree", {"rows": [], "cols": []})
+                supplier_row_nodes = (supplier_outline_tree or {}).get("rows", [])
+                supplier_state = _ensure_outline_state(
+                    f"supplier_{sup_name}",
+                    selected_preview_sheet,
+                    "rows",
+                    supplier_row_nodes,
+                )
+                supplier_display, _ = _prepare_outline_view(
+                    supplier_table,
+                    nodes=supplier_row_nodes,
+                    collapsed_state=supplier_state,
+                )
+                supplier_outline_views[sup_name] = supplier_display
                 supplier_keys = extract_preview_key_set(supplier_table)
                 missing_keys = master_keys_set - supplier_keys
                 extra_keys = supplier_keys - master_keys_set
@@ -5498,7 +5762,7 @@ with tab_preview:
                     "preview", selected_preview_sheet, "master"
                 )
                 master_wrapper_id = render_preview_table(
-                    master_table,
+                    master_display_table,
                     selected_preview_sheet,
                     "master",
                     master_widget_suffix,
@@ -5506,6 +5770,7 @@ with tab_preview:
                     highlight_color="#FFE3E3",
                     currency_label=currency,
                     summary_title="Součty — Master",
+                    original_df=master_table,
                 )
                 if master_highlight_keys:
                     missing_lines = []
@@ -5534,13 +5799,14 @@ with tab_preview:
                             continue
                         else:
                             supplier_table = sheet_obj.get("table", pd.DataFrame())
+                            display_table = supplier_outline_views.get(sup_name, supplier_table)
                             supplier_widget_suffix = make_widget_key(
                                 "preview",
                                 selected_preview_sheet,
                                 alias,
                             )
                             supplier_wrapper_id = render_preview_table(
-                                supplier_table,
+                                display_table,
                                 selected_preview_sheet,
                                 alias,
                                 supplier_widget_suffix,
@@ -5548,6 +5814,7 @@ with tab_preview:
                                 highlight_color="#FFF0D6",
                                 currency_label=currency,
                                 summary_title=f"Součty — {alias}",
+                                original_df=supplier_table,
                             )
                             missing_keys = supplier_missing_map.get(alias, set())
                             extra_keys = supplier_extra_map.get(alias, set())
