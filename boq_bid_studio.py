@@ -5,6 +5,7 @@ import io
 import math
 import re
 import json
+import tempfile
 import time
 import unicodedata
 from dataclasses import dataclass
@@ -35,6 +36,9 @@ from reportlab.platypus import (
 )
 from workbook import WorkbookData
 from embedded_fonts import get_noto_sans_bold, get_noto_sans_regular
+from core.aggregate import collect_outline_rollups, rollup_by_outline
+from core.excel_outline import build_outline_nodes, read_outline_levels
+from core.export import dataframe_to_excel_bytes_with_outline
 
 # ------------- App Config -------------
 st.set_page_config(page_title="BoQ Bid Studio V.04", layout="wide")
@@ -2440,8 +2444,21 @@ def describe_preview_rows(table: Any, keys: Set[str], max_items: int = 10) -> st
     return "\n".join(lines)
 
 
-def dataframe_to_excel_bytes(df: pd.DataFrame, sheet_name: str) -> bytes:
+def dataframe_to_excel_bytes(
+    df: pd.DataFrame,
+    sheet_name: str,
+    *,
+    with_outline: bool = False,
+    outline: Optional[Dict[str, Iterable]] = None,
+) -> bytes:
     """Serialize a dataframe into XLSX bytes for download widgets."""
+
+    if with_outline and outline:
+        return dataframe_to_excel_bytes_with_outline(
+            df,
+            sheet_name,
+            outline=outline,
+        )
 
     buffer = io.BytesIO()
     safe_sheet = sheet_name[:31] or "Data"
@@ -2625,21 +2642,124 @@ def show_df(df: pd.DataFrame) -> None:
 
 @st.cache_data
 def read_workbook(upload, limit_sheets: Optional[List[str]] = None) -> WorkbookData:
-    xl = pd.ExcelFile(upload)
-    sheet_names = xl.sheet_names if limit_sheets is None else [s for s in xl.sheet_names if s in limit_sheets]
-    wb = WorkbookData(name=getattr(upload, "name", "workbook"))
+    file_name = getattr(upload, "name", "workbook")
+    suffix = Path(file_name).suffix.lower()
+    data_bytes: Optional[bytes] = None
+    source_for_pandas: Any = upload
+    temp_path: Optional[Path] = None
+    cleanup_path: Optional[Path] = None
+
+    if isinstance(upload, (bytes, bytearray)):
+        data_bytes = bytes(upload)
+    elif hasattr(upload, "getvalue"):
+        try:
+            data_bytes = upload.getvalue()
+        except Exception:
+            data_bytes = None
+    elif hasattr(upload, "read"):
+        try:
+            data_bytes = upload.read()
+        except Exception:
+            data_bytes = None
+        else:
+            try:
+                upload.seek(0)
+            except Exception:
+                pass
+    elif isinstance(upload, (str, Path)):
+        path_obj = Path(upload)
+        if path_obj.exists():
+            data_bytes = path_obj.read_bytes()
+            temp_path = path_obj
+
+    if data_bytes is not None:
+        source_for_pandas = io.BytesIO(data_bytes)
+        source_for_pandas.seek(0)
+        if suffix in {".xlsx", ".xlsm"}:
+            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+                tmp.write(data_bytes)
+                tmp.flush()
+                temp_path = Path(tmp.name)
+                cleanup_path = Path(tmp.name)
+    elif isinstance(upload, (str, Path)):
+        path_obj = Path(upload)
+        if path_obj.exists():
+            temp_path = path_obj
+
+    xl = pd.ExcelFile(source_for_pandas)
+    sheet_names = (
+        xl.sheet_names
+        if limit_sheets is None
+        else [s for s in xl.sheet_names if s in limit_sheets]
+    )
+
+    outline_levels: Dict[str, Dict[str, Dict[int, dict]]] = {}
+    outline_tree: Dict[str, Dict[str, List[Any]]] = {}
+    if temp_path and temp_path.exists() and suffix in {".xlsx", ".xlsm"}:
+        try:
+            outline_levels = read_outline_levels(str(temp_path))
+        except Exception:
+            outline_levels = {}
+        if outline_levels:
+            outline_tree = {
+                sheet: {
+                    "rows": build_outline_nodes(maps.get("rows", {}), axis="row", sheet=sheet),
+                    "cols": build_outline_nodes(maps.get("cols", {}), axis="col", sheet=sheet),
+                }
+                for sheet, maps in outline_levels.items()
+            }
+
+    wb = WorkbookData(name=file_name)
     for s in sheet_names:
         try:
             raw = xl.parse(s, header=None)
             mapping, header_row, body = try_autodetect_mapping(raw)
             if not mapping:
-                # fallback try: header=0
                 fallback = xl.parse(s)
-                composed = pd.concat([fallback.columns.to_frame().T, fallback], ignore_index=True)
+                composed = pd.concat(
+                    [fallback.columns.to_frame().T, fallback], ignore_index=True
+                )
                 mapping, header_row, body = try_autodetect_mapping(composed)
                 if not mapping:
                     body = fallback.copy()
+
             tbl = build_normalized_table(body, mapping) if mapping else pd.DataFrame()
+
+            row_outline_map = outline_levels.get(s, {}).get("rows", {}) if outline_levels else {}
+            col_outline_map = outline_levels.get(s, {}).get("cols", {}) if outline_levels else {}
+
+            if isinstance(body, pd.DataFrame):
+                body_index = body.index
+                if header_row is not None and header_row >= 0:
+                    start_row = int(header_row) + 2
+                    excel_rows = pd.Series(
+                        np.arange(start_row, start_row + len(body)),
+                        index=body_index,
+                        dtype="Int64",
+                    )
+                    row_refs = excel_rows.map(lambda idx: f"{s}!{int(idx)}")
+                    row_levels = excel_rows.map(
+                        lambda idx: row_outline_map.get(int(idx), {}).get("level", 0)
+                    )
+                    row_hidden = excel_rows.map(
+                        lambda idx: bool(row_outline_map.get(int(idx), {}).get("hidden", False))
+                    )
+                else:
+                    row_refs = pd.Series([None] * len(body), index=body_index, dtype=object)
+                    row_levels = pd.Series([0] * len(body), index=body_index, dtype="Int64")
+                    row_hidden = pd.Series([False] * len(body), index=body_index, dtype=bool)
+            else:
+                row_refs = pd.Series(dtype=object)
+                row_levels = pd.Series(dtype="Int64")
+                row_hidden = pd.Series(dtype=bool)
+
+            if isinstance(tbl, pd.DataFrame):
+                tbl["row_ref"] = row_refs.reindex(tbl.index)
+                level_values = row_levels.reindex(tbl.index).fillna(0)
+                tbl["row_outline_level"] = level_values.astype("Int64")
+                hidden_values = row_hidden.reindex(tbl.index).fillna(False)
+                tbl["row_collapsed"] = hidden_values.astype(bool)
+
             wb.sheets[s] = {
                 "raw": raw,
                 "mapping": mapping,
@@ -2647,6 +2767,9 @@ def read_workbook(upload, limit_sheets: Optional[List[str]] = None) -> WorkbookD
                 "table": tbl,
                 "header_names": list(body.columns) if hasattr(body, "columns") else [],
                 "preserve_summary_totals": False,
+                "row_outline_map": row_outline_map,
+                "col_outline_map": col_outline_map,
+                "outline_tree": outline_tree.get(s, {"rows": [], "cols": []}),
             }
         except Exception as e:
             wb.sheets[s] = {
@@ -2657,7 +2780,17 @@ def read_workbook(upload, limit_sheets: Optional[List[str]] = None) -> WorkbookD
                 "error": str(e),
                 "header_names": [],
                 "preserve_summary_totals": False,
+                "row_outline_map": {},
+                "col_outline_map": {},
+                "outline_tree": {"rows": [], "cols": []},
             }
+
+    if cleanup_path and cleanup_path.exists():
+        try:
+            cleanup_path.unlink()
+        except OSError:
+            pass
+
     return wb
 
 def apply_master_mapping(master: WorkbookData, target: WorkbookData) -> None:
@@ -5072,6 +5205,176 @@ with tab_preview:
 
         master_sheet = master_wb.sheets.get(selected_preview_sheet, {})
         master_table = master_sheet.get("table", pd.DataFrame())
+
+        outline_sources: List[Tuple[str, str, WorkbookData]] = [("Master", "master", master_wb)]
+        for sup_name, wb in bids_dict.items():
+            label = display_names.get(sup_name, sup_name)
+            outline_sources.append((label, f"supplier_{sup_name}", wb))
+
+        with st.expander("Outline", expanded=False):
+            st.caption(
+                "Prozkoumej strukturu Excel outline (skupiny řádků/sloupců) a rychle spočítej součty pro vybraný uzel."
+            )
+            dataset_labels = [label for label, _, _ in outline_sources]
+            if not dataset_labels:
+                st.info("Outline metadata není k dispozici.")
+            else:
+                dataset_choice = st.selectbox(
+                    "Sešit",
+                    dataset_labels,
+                    key=make_widget_key("outline", selected_preview_sheet, "dataset"),
+                )
+                selected_label, dataset_key, dataset_wb = next(
+                    (label, key, wb)
+                    for label, key, wb in outline_sources
+                    if label == dataset_choice
+                )
+                sheet_meta = dataset_wb.sheets.get(selected_preview_sheet)
+                if not sheet_meta:
+                    st.info("Vybraný list v tomto sešitu není dostupný.")
+                else:
+                    axis_choice = st.selectbox(
+                        "Osa",
+                        ["Řádky", "Sloupce"],
+                        key=make_widget_key("outline", selected_preview_sheet, dataset_key, "axis"),
+                    )
+                    axis_key = "rows" if axis_choice == "Řádky" else "cols"
+                    outline_tree = sheet_meta.get("outline_tree", {"rows": [], "cols": []})
+                    nodes = outline_tree.get(axis_key, []) or []
+                    table_df = sheet_meta.get("table", pd.DataFrame())
+                    include_columns = [
+                        col
+                        for col in [
+                            "quantity",
+                            "quantity_supplier",
+                            "total_price",
+                            "calc_total",
+                            "summary_total",
+                            "section_total",
+                        ]
+                        if isinstance(table_df, pd.DataFrame) and col in table_df.columns
+                    ]
+
+                    if not nodes:
+                        st.info("Outline pro zvolenou osu není k dispozici.")
+                    else:
+                        st.markdown("**Strom outline**")
+                        selection_state_key = make_widget_key(
+                            "outline",
+                            dataset_key,
+                            selected_preview_sheet,
+                            axis_key,
+                            "selection",
+                        )
+
+                        def _render_outline(nodes_list: List[Any], depth: int = 0) -> None:
+                            for node in nodes_list:
+                                indent = "\u2003" * depth
+                                label = (
+                                    f"{indent}• Úroveň {node.level}: {node.start}–{node.end}"
+                                    f"{' (sbaleno)' if node.collapsed else ''}"
+                                )
+                                button_key = make_widget_key(
+                                    "outline",
+                                    dataset_key,
+                                    selected_preview_sheet,
+                                    axis_key,
+                                    node.level,
+                                    node.start,
+                                    node.end,
+                                )
+                                if st.button(label, key=button_key):
+                                    st.session_state[selection_state_key] = {
+                                        "level": node.level,
+                                        "start": node.start,
+                                        "end": node.end,
+                                        "collapsed": node.collapsed,
+                                        "axis": axis_key,
+                                        "sheet": selected_preview_sheet,
+                                    }
+                                if node.children:
+                                    _render_outline(node.children, depth + 1)
+
+                        _render_outline(nodes)
+
+                        selection = st.session_state.get(selection_state_key)
+                        if selection and axis_key == "rows":
+                            metrics = rollup_by_outline(
+                                table_df,
+                                sheet=selection.get("sheet", selected_preview_sheet),
+                                axis="row",
+                                level=selection.get("level", 0),
+                                start=selection.get("start", 0),
+                                end=selection.get("end", 0),
+                                include_columns=include_columns,
+                            )
+                            if not metrics.empty:
+                                preferred_order = [
+                                    "__row_count__",
+                                    "quantity",
+                                    "quantity_supplier",
+                                    "total_price",
+                                    "calc_total",
+                                    "summary_total",
+                                    "section_total",
+                                ]
+                                ordered_index = [
+                                    idx
+                                    for idx in preferred_order
+                                    if idx in metrics.index
+                                ] + [idx for idx in metrics.index if idx not in preferred_order]
+                                metrics_display = metrics.reindex(ordered_index)
+                                st.markdown("**Roll-up vybraného uzlu**")
+                                st.dataframe(
+                                    metrics_display.to_frame(name="Hodnota"),
+                                    use_container_width=True,
+                                )
+                        if axis_key == "rows":
+                            rollup_table = collect_outline_rollups(
+                                table_df,
+                                nodes,
+                                include_columns=include_columns,
+                            )
+                            if not rollup_table.empty:
+                                column_order = [
+                                    "level",
+                                    "range_start",
+                                    "range_end",
+                                    "collapsed",
+                                    "__row_count__",
+                                ] + include_columns
+                                column_order = [
+                                    col for col in column_order if col in rollup_table.columns
+                                ]
+                                st.markdown("**Souhrny pro všechny uzly**")
+                                st.dataframe(
+                                    rollup_table.reindex(columns=column_order),
+                                    use_container_width=True,
+                                )
+
+                        export_df = table_df if isinstance(table_df, pd.DataFrame) else pd.DataFrame()
+                        export_outline = outline_tree
+                        export_bytes = dataframe_to_excel_bytes(
+                            export_df,
+                            selected_preview_sheet,
+                            with_outline=True,
+                            outline=export_outline,
+                        )
+                        download_name = (
+                            f"{sanitize_filename(selected_label)}_{sanitize_filename(selected_preview_sheet)}_outline.xlsx"
+                        )
+                        st.download_button(
+                            "Export s outline",
+                            data=export_bytes,
+                            file_name=download_name,
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                            key=make_widget_key(
+                                "outline",
+                                dataset_key,
+                                selected_preview_sheet,
+                                "export",
+                            ),
+                        )
 
         sync_scroll_enabled = st.checkbox(
             "🔒 Zamknout společné rolování tabulek",
