@@ -5038,15 +5038,13 @@ chart_color_map.setdefault("Master", "#636EFA")
 ensure_exchange_rate_state()
 
 # ------------- Tabs -------------
-tab_data, tab_preview, tab_compare, tab_compare2, tab_summary, tab_rekap, tab_dashboard, tab_qa = st.tabs([
+tab_data, tab_preview, tab_compare, tab_compare2, tab_summary, tab_rekap = st.tabs([
     "📑 Mapování",
     "🧾 Kontrola dat",
     "⚖️ Porovnání",
     "⚖️ Porovnání 2",
     "📋 Celkový přehled",
     "📊 Rekapitulace",
-    "📈 Dashboard",
-    "🧪 QA kontroly",
 ])
 
 with tab_data:
@@ -8173,114 +8171,6 @@ with tab_rekap:
                 show_df(
                     rename_value_columns_for_display(added_df.copy(), f" — {base_currency}")
                 )
-
-with tab_dashboard:
-    if not bids_dict:
-        st.info("Nejdřív nahraj nabídky.")
-    else:
-        results = compare_results
-
-        # Choose a sheet for detailed variance chart
-        sheet_choices = list(results.keys())
-        if sheet_choices:
-            sel_sheet = st.selectbox("Vyber list pro detailní grafy", sheet_choices, index=0)
-            df = results[sel_sheet]
-            total_cols = [c for c in df.columns if c.endswith(" total")]
-            if total_cols:
-                st.markdown("**Součet za list (včetně Master):**")
-                totals_chart_df = pd.DataFrame({"supplier": [c.replace(" total", "") for c in total_cols], "total": [df[c].sum() for c in total_cols]})
-                try:
-                    fig_tot = px.bar(
-                        totals_chart_df,
-                        x="supplier",
-                        y="total",
-                        color="supplier",
-                        color_discrete_map=chart_color_map,
-                        title=f"Součet za list: {sel_sheet} ({currency})",
-                    )
-                    fig_tot.update_layout(showlegend=False)
-                    st.plotly_chart(fig_tot, use_container_width=True)
-                except Exception:
-                    show_df(totals_chart_df)
-
-            # Heatmap-like chart: Δ vs LOWEST per supplier
-            delta_cols = [c for c in df.columns if c.endswith(" Δ vs LOWEST")]
-            if delta_cols:
-                heat_df = df[["__key__"] + delta_cols].copy().set_index("__key__")
-                # Rename columns to supplier names only
-                heat_df.columns = [c.replace(" Δ vs LOWEST", "") for c in heat_df.columns]
-                # aggregate top N worst deltas by sum
-                sum_deltas = heat_df.sum().sort_values(ascending=False)
-                sum_deltas_df = sum_deltas.rename_axis("supplier").reset_index(name="value")
-                st.markdown("**Součet odchylek vs. nejnižší (vyšší = horší):**")
-                try:
-                    fig = px.bar(
-                        sum_deltas_df,
-                        x="supplier",
-                        y="value",
-                        color="supplier",
-                        color_discrete_map=chart_color_map,
-                        title="Součet Δ vs. nejnižší nabídku (po dodavatelích)",
-                    )
-                    fig.update_layout(showlegend=False)
-                    st.plotly_chart(fig, use_container_width=True)
-                except Exception:
-                    show_df(sum_deltas_df)
-
-                # Top položky podle rozdílu mezi nejlepší a vybraným dodavatelem
-                st.markdown("**Top 20 položek s nejvyšší odchylkou od nejnižší ceny (součet přes dodavatele):**")
-                item_abs = heat_df.abs()
-                item_deltas = item_abs.sum(axis=1).sort_values(ascending=False).head(20)
-                leading_supplier = item_abs.loc[item_deltas.index].idxmax(axis=1)
-                item_chart_df = (
-                    item_deltas.rename("value")
-                    .rename_axis("item")
-                    .to_frame()
-                    .join(leading_supplier.rename("supplier"), how="left")
-                    .reset_index()
-                )
-                try:
-                    fig2 = px.bar(
-                        item_chart_df,
-                        x="item",
-                        y="value",
-                        color="supplier",
-                        color_discrete_map=chart_color_map,
-                        title="Top 20 položek podle absolutní Δ",
-                    )
-                    st.plotly_chart(fig2, use_container_width=True)
-                except Exception:
-                    show_df(item_chart_df)
-            else:
-                st.info("Pro zvolený list zatím nejsou k dispozici delty (nahraj nabídky a ověř mapování).")
-
-with tab_qa:
-    if not bids_dict:
-        st.info("Nahraj nabídky, ať můžeme spustit kontroly.")
-    else:
-        qa = qa_checks(master_wb, bids_dict)
-        for sheet, per_sup in qa.items():
-            st.subheader(f"List: {sheet}")
-            for sup, d in per_sup.items():
-                alias = display_names.get(sup, sup)
-                st.markdown(f"**Dodavatel:** {alias}")
-                c1, c2, c3, c4 = st.columns(4)
-                with c1:
-                    st.markdown("**Chybějící položky**")
-                    show_df(d["missing"].head(50))
-                with c2:
-                    st.markdown("**Nad rámec (navíc)**")
-                    show_df(d["extras"].head(50))
-                with c3:
-                    st.markdown("**Duplicitní položky**")
-                    show_df(d["duplicates"].head(50))
-                with c4:
-                    st.markdown("**Δ součtu vs. souhrn**")
-                    diff = d.get("total_diff")
-                    if diff is None or pd.isna(diff):
-                        st.write("n/a")
-                    else:
-                        st.write(format_number(diff))
 
 st.markdown("---")
 st.caption("© 2025 BoQ Bid Studio — MVP. Doporučení: používat jednotné Item ID pro precizní párování.")
