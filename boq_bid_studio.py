@@ -5038,11 +5038,12 @@ chart_color_map.setdefault("Master", "#636EFA")
 ensure_exchange_rate_state()
 
 # ------------- Tabs -------------
-tab_data, tab_preview, tab_compare, tab_compare2, tab_summary, tab_rekap = st.tabs([
+tab_data, tab_preview, tab_compare, tab_compare2, tab_curve, tab_summary, tab_rekap = st.tabs([
     "📑 Mapování",
     "🧾 Kontrola dat",
     "⚖️ Porovnání",
     "⚖️ Porovnání 2",
+    "📈 Spojitá nabídková křivka",
     "📋 Celkový přehled",
     "📊 Rekapitulace",
 ])
@@ -7209,6 +7210,321 @@ with tab_compare2:
                                     "compare2_xlsx", selected_sheet, selected_supplier
                                 ),
                             )
+with tab_curve:
+    if not bids_dict:
+        st.info("Nahraj alespoň jednu nabídku dodavatele v levém panelu.")
+    elif not comparison_datasets:
+        st.info(
+            "Nebyla nalezena data pro porovnání. Zkontroluj mapování nebo vyber jiné listy."
+        )
+    else:
+        available_sheets = [
+            sheet
+            for sheet, dataset in comparison_datasets.items()
+            if dataset is not None and not dataset.analysis_df.empty
+        ]
+        if not available_sheets:
+            st.info("Listy určené k porovnání jsou prázdné. Zkontroluj zdrojová data.")
+        else:
+            default_sheet = available_sheets[0]
+            sheet_index = (
+                available_sheets.index(default_sheet)
+                if default_sheet in available_sheets
+                else 0
+            )
+            selected_sheet = st.selectbox(
+                "Vyber list pro graf",
+                available_sheets,
+                index=sheet_index,
+                key=make_widget_key("curve_sheet_select", "curve"),
+            )
+            dataset = comparison_datasets.get(selected_sheet)
+            if dataset is None or dataset.analysis_df.empty:
+                st.warning("Vybraný list neobsahuje žádné položky k zobrazení.")
+            else:
+                supplier_options = [alias for alias in dataset.supplier_order if alias]
+                if not supplier_options:
+                    st.info("Žádný z dodavatelů neobsahuje data pro vybraný list.")
+                else:
+                    selected_suppliers = st.multiselect(
+                        "Dodavatelé v grafu",
+                        options=supplier_options,
+                        default=supplier_options,
+                        key=make_widget_key("curve_supplier_select", selected_sheet),
+                    )
+                    if not selected_suppliers:
+                        st.info("Vyber alespoň jednoho dodavatele pro vykreslení grafu.")
+                    else:
+                        analysis_df = dataset.analysis_df.copy()
+                        if analysis_df.empty:
+                            st.warning("Vybraný list neobsahuje žádné položky k zobrazení.")
+                        else:
+                            if "__row_order__" in analysis_df.columns:
+                                analysis_df = analysis_df.sort_values("__row_order__")
+                            analysis_df = analysis_df.reset_index(drop=True)
+                            if "__key__" not in analysis_df.columns:
+                                analysis_df["__key__"] = np.arange(len(analysis_df))
+                            analysis_df["__curve_position__"] = np.arange(
+                                1, len(analysis_df) + 1
+                            )
+                            position_map = analysis_df[
+                                ["__key__", "__curve_position__"]
+                            ].dropna(subset=["__key__"])
+
+                            curve_df = dataset.long_df.copy()
+                            if curve_df.empty:
+                                st.info(
+                                    "Pro vybraná data nejsou k dispozici žádné hodnoty."
+                                )
+                            else:
+                                curve_df = curve_df.merge(
+                                    position_map, on="__key__", how="left"
+                                )
+                                curve_df = curve_df[
+                                    curve_df["__curve_position__"].notna()
+                                ].copy()
+                                if curve_df.empty:
+                                    st.info(
+                                        "Vybrané nastavení neobsahuje data pro zobrazení grafu."
+                                    )
+                                else:
+                                    curve_df["__curve_position__"] = curve_df[
+                                        "__curve_position__"
+                                    ].astype(int)
+                                    curve_df["total"] = pd.to_numeric(
+                                        curve_df["total"], errors="coerce"
+                                    )
+                                    curve_df = curve_df[
+                                        curve_df["total"].notna()
+                                    ]
+                                    curve_df = curve_df[
+                                        curve_df["supplier"].isin(selected_suppliers)
+                                    ]
+                                    if curve_df.empty:
+                                        st.info(
+                                            "Vybrané nastavení neobsahuje data pro zobrazení grafu."
+                                        )
+                                    else:
+
+                                        def _to_excel_row(value: Any) -> Optional[int]:
+                                            if value is None:
+                                                return None
+                                            if isinstance(value, (int, np.integer)):
+                                                return int(value)
+                                            if isinstance(value, (float, np.floating)):
+                                                if not math.isfinite(value) or math.isnan(value):
+                                                    return None
+                                                return int(value)
+                                            text = str(value).strip()
+                                            if not text:
+                                                return None
+                                            if "!" in text:
+                                                text = text.split("!", 1)[1]
+                                            text = text.replace("$", "")
+                                            try:
+                                                return int(float(text))
+                                            except (TypeError, ValueError):
+                                                return None
+
+                                        analysis_positions: Dict[int, int] = {}
+                                        if "row_ref" in analysis_df.columns:
+                                            row_numbers = analysis_df["row_ref"].map(
+                                                _to_excel_row
+                                            )
+                                        else:
+                                            row_numbers = pd.Series(
+                                                [None] * len(analysis_df),
+                                                index=analysis_df.index,
+                                            )
+                                        for idx, pos in zip(
+                                            analysis_df.index,
+                                            analysis_df["__curve_position__"],
+                                        ):
+                                            row_number = row_numbers.loc[idx]
+                                            if pd.isna(row_number):
+                                                continue
+                                            row_int = int(row_number)
+                                            if row_int not in analysis_positions:
+                                                analysis_positions[row_int] = int(pos)
+
+                                        sorted_positions = sorted(
+                                            analysis_positions.items()
+                                        )
+                                        tick_entries: List[Tuple[int, str]] = []
+
+                                        master_sheet = master_wb.sheets.get(
+                                            selected_sheet
+                                        )
+                                        master_table = (
+                                            master_sheet.get("table")
+                                            if isinstance(master_sheet, dict)
+                                            else pd.DataFrame()
+                                        )
+                                        if (
+                                            isinstance(master_table, pd.DataFrame)
+                                            and not master_table.empty
+                                            and "row_outline_level" in master_table.columns
+                                        ):
+                                            level_series = pd.to_numeric(
+                                                master_table["row_outline_level"],
+                                                errors="coerce",
+                                            ).fillna(0)
+                                            row_refs_master = (
+                                                master_table["row_ref"]
+                                                if "row_ref" in master_table.columns
+                                                else pd.Series(
+                                                    [None] * len(master_table),
+                                                    index=master_table.index,
+                                                )
+                                            )
+                                            range_end_series = (
+                                                master_table["row_outline_range_end"]
+                                                if "row_outline_range_end" in master_table.columns
+                                                else pd.Series(
+                                                    [None] * len(master_table),
+                                                    index=master_table.index,
+                                                )
+                                            )
+                                            top_mask = level_series.astype(int) == 1
+                                            for idx in master_table.index[top_mask]:
+                                                start_row = _to_excel_row(
+                                                    row_refs_master.loc[idx]
+                                                )
+                                                end_row = _to_excel_row(
+                                                    range_end_series.loc[idx]
+                                                )
+                                                if start_row is None:
+                                                    continue
+                                                if end_row is None:
+                                                    end_row = start_row
+                                                position_candidate: Optional[int] = None
+                                                for row_number, position in sorted_positions:
+                                                    if row_number < start_row:
+                                                        continue
+                                                    if row_number > end_row:
+                                                        break
+                                                    position_candidate = position
+                                                    break
+                                                if (
+                                                    position_candidate is None
+                                                    and sorted_positions
+                                                ):
+                                                    for row_number, position in sorted_positions:
+                                                        if row_number >= start_row:
+                                                            position_candidate = position
+                                                            break
+                                                if position_candidate is None:
+                                                    continue
+                                                label_value = ""
+                                                for col in ("description", "code", "Oddíl", "section"):
+                                                    if col in master_table.columns:
+                                                        raw_label = master_table.at[idx, col]
+                                                        if pd.notna(raw_label):
+                                                            text_label = str(raw_label).strip()
+                                                            if text_label:
+                                                                label_value = text_label
+                                                                break
+                                                if not label_value:
+                                                    label_value = f"Řádek {start_row}"
+                                                tick_entries.append(
+                                                    (position_candidate, label_value)
+                                                )
+
+                                        if not tick_entries and "__section_token__" in analysis_df.columns:
+                                            section_helper = analysis_df[
+                                                [
+                                                    "__section_token__",
+                                                    "Oddíl",
+                                                    "__curve_position__",
+                                                ]
+                                            ].dropna(subset=["__curve_position__"])
+                                            if not section_helper.empty:
+                                                section_helper = section_helper.drop_duplicates(
+                                                    "__section_token__", keep="first"
+                                                )
+                                                section_helper = section_helper.sort_values(
+                                                    "__curve_position__"
+                                                )
+                                                for _, row in section_helper.iterrows():
+                                                    label_value = str(
+                                                        row.get("Oddíl")
+                                                        or row.get("__section_token__")
+                                                        or ""
+                                                    ).strip()
+                                                    if not label_value:
+                                                        continue
+                                                    tick_entries.append(
+                                                        (int(row["__curve_position__"]), label_value)
+                                                    )
+
+                                        tick_entries = sorted(
+                                            tick_entries, key=lambda item: item[0]
+                                        )
+                                        seen_positions: Set[int] = set()
+                                        tickvals: List[int] = []
+                                        ticktext: List[str] = []
+                                        for position, label in tick_entries:
+                                            if position in seen_positions:
+                                                continue
+                                            seen_positions.add(position)
+                                            tickvals.append(int(position))
+                                            ticktext.append(label)
+
+                                        color_mapping = {
+                                            name: color
+                                            for name, color in chart_color_map.items()
+                                            if name in selected_suppliers
+                                            and isinstance(color, str)
+                                            and color
+                                        }
+
+                                        fig = px.line(
+                                            curve_df,
+                                            x="__curve_position__",
+                                            y="total",
+                                            color="supplier",
+                                            markers=True,
+                                            hover_data={
+                                                "code": True,
+                                                "description": True,
+                                                "supplier": True,
+                                                "__curve_position__": False,
+                                            },
+                                            color_discrete_map=color_mapping,
+                                        )
+                                        fig.update_traces(
+                                            marker=dict(size=5), line=dict(width=1.5)
+                                        )
+
+                                        xaxis_config = dict(
+                                            title="Pořadí položek",
+                                            rangeslider=dict(visible=False),
+                                        )
+                                        if tickvals and ticktext:
+                                            xaxis_config.update(
+                                                tickmode="array",
+                                                tickvals=tickvals,
+                                                ticktext=ticktext,
+                                                tickangle=-45 if len(tickvals) > 3 else 0,
+                                            )
+
+                                        fig.update_layout(
+                                            xaxis=xaxis_config,
+                                            yaxis=dict(
+                                                title=f"Celková cena ({currency})"
+                                            ),
+                                            legend_title="Dodavatel",
+                                            hovermode="x unified",
+                                            margin=dict(t=50, b=80, l=40, r=20),
+                                        )
+                                        fig.update_yaxes(tickformat=".0f")
+
+                                        st.plotly_chart(
+                                            fig, use_container_width=True
+                                        )
+                                        st.caption(
+                                            "Graf zobrazuje spojitou nabídkovou křivku v pořadí položek z tabulky."
+                                        )
 with tab_summary:
     if not bids_dict:
         st.info("Nahraj alespoň jednu nabídku dodavatele v levém panelu.")
