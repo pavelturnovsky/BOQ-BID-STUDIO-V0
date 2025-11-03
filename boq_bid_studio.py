@@ -237,6 +237,139 @@ def aggregate_weighted_average_by_key(
     return aggregated
 
 
+CURVE_OUTPUT_COLUMNS = [
+    "supplier",
+    "__curve_position__",
+    "total",
+    "code",
+    "description",
+    "__sort_order__",
+]
+
+
+def _prepare_table_for_join(source_df: Any) -> pd.DataFrame:
+    if not isinstance(source_df, pd.DataFrame) or source_df.empty:
+        return pd.DataFrame()
+    if "description" not in source_df.columns:
+        return pd.DataFrame()
+    working = source_df.copy()
+    working["description"] = working["description"].astype(str)
+    working = working[working["description"].str.strip() != ""].copy()
+    if working.empty:
+        return pd.DataFrame()
+    working["__desc_key__"] = working["description"].map(normalize_text)
+    working["__desc_key__"] = working["__desc_key__"].fillna("")
+    working["__desc_order__"] = working.groupby("__desc_key__").cumcount()
+    working["__join_key__"] = (
+        working["__desc_key__"].astype(str) + "#" + working["__desc_order__"].astype(str)
+    )
+    if "__row_order__" in working.columns:
+        working["__sort_order__"] = working["__row_order__"]
+    else:
+        working["__sort_order__"] = np.arange(len(working))
+    return working
+
+
+def _build_master_curve_points(master_prepared: pd.DataFrame) -> pd.DataFrame:
+    if not isinstance(master_prepared, pd.DataFrame) or master_prepared.empty:
+        return pd.DataFrame(columns=CURVE_OUTPUT_COLUMNS)
+    if "__sort_order__" not in master_prepared.columns:
+        return pd.DataFrame(columns=CURVE_OUTPUT_COLUMNS)
+
+    working = master_prepared.copy()
+    working["__sort_order__"] = pd.to_numeric(
+        working["__sort_order__"], errors="coerce"
+    )
+    working = working[working["__sort_order__"].notna()].copy()
+    if working.empty:
+        return pd.DataFrame(columns=CURVE_OUTPUT_COLUMNS)
+
+    total_series = working.get("total_price")
+    if total_series is None:
+        return pd.DataFrame(columns=CURVE_OUTPUT_COLUMNS)
+    working["total"] = pd.to_numeric(total_series, errors="coerce")
+    working = working[working["total"].notna()].copy()
+    if working.empty:
+        return pd.DataFrame(columns=CURVE_OUTPUT_COLUMNS)
+
+    working.sort_values(by="__sort_order__", inplace=True, kind="stable")
+    working["__curve_position__"] = (working["__sort_order__"] + 1).astype(int)
+    working["supplier"] = "Master"
+    working["code"] = working.get("code")
+    working["description"] = working.get("description")
+
+    return working[CURVE_OUTPUT_COLUMNS].reset_index(drop=True)
+
+
+def _build_supplier_curve_points(
+    master_prepared: pd.DataFrame,
+    supplier_prepared: pd.DataFrame,
+    supplier_label: str,
+) -> pd.DataFrame:
+    if not isinstance(master_prepared, pd.DataFrame) or master_prepared.empty:
+        return pd.DataFrame(columns=CURVE_OUTPUT_COLUMNS)
+    if not isinstance(supplier_prepared, pd.DataFrame) or supplier_prepared.empty:
+        return pd.DataFrame(columns=CURVE_OUTPUT_COLUMNS)
+    if "__join_key__" not in master_prepared.columns:
+        return pd.DataFrame(columns=CURVE_OUTPUT_COLUMNS)
+    if "__join_key__" not in supplier_prepared.columns:
+        return pd.DataFrame(columns=CURVE_OUTPUT_COLUMNS)
+
+    join_suffix = (" — Master", " — Dodavatel")
+    combined = pd.merge(
+        master_prepared,
+        supplier_prepared,
+        on="__join_key__",
+        how="outer",
+        suffixes=join_suffix,
+    )
+
+    sort_master_col = "__sort_order__" + join_suffix[0]
+    sort_supplier_col = "__sort_order__" + join_suffix[1]
+
+    def _ensure_series(series: Optional[pd.Series]) -> pd.Series:
+        if series is None:
+            return pd.Series([pd.NA] * len(combined), index=combined.index)
+        return series
+
+    combined["__sort_order__"] = _ensure_series(combined.get(sort_master_col)).combine_first(
+        _ensure_series(combined.get(sort_supplier_col))
+    )
+    combined["__sort_order__"] = pd.to_numeric(
+        combined["__sort_order__"], errors="coerce"
+    )
+    combined = combined[combined["__sort_order__"].notna()].copy()
+    if combined.empty:
+        return pd.DataFrame(columns=CURVE_OUTPUT_COLUMNS)
+
+    total_col = f"total_price{join_suffix[1]}"
+    supplier_totals = combined.get(total_col)
+    if supplier_totals is None:
+        return pd.DataFrame(columns=CURVE_OUTPUT_COLUMNS)
+    combined["total"] = pd.to_numeric(supplier_totals, errors="coerce")
+    combined = combined[combined["total"].notna()].copy()
+    if combined.empty:
+        return pd.DataFrame(columns=CURVE_OUTPUT_COLUMNS)
+
+    code_master_col = f"code{join_suffix[0]}"
+    code_supplier_col = f"code{join_suffix[1]}"
+    desc_master_col = f"description{join_suffix[0]}"
+    desc_supplier_col = f"description{join_suffix[1]}"
+
+    combined["code"] = combined.get(code_supplier_col).combine_first(
+        combined.get(code_master_col)
+    )
+    combined["description"] = combined.get(desc_supplier_col).combine_first(
+        combined.get(desc_master_col)
+    )
+
+    combined.sort_values(by="__sort_order__", inplace=True, kind="stable")
+    combined["__curve_position__"] = (combined["__sort_order__"] + 1).astype(int)
+    combined["supplier"] = supplier_label
+
+    return combined[CURVE_OUTPUT_COLUMNS].reset_index(drop=True)
+
+
 def first_non_missing(series: pd.Series) -> Any:
     """Return the first non-missing/non-empty value from ``series``."""
 
@@ -6707,30 +6840,6 @@ with tab_compare2:
                     alias_lookup = {alias: raw for raw, alias in display_names.items()}
                     raw_supplier_name = alias_lookup.get(selected_supplier, selected_supplier)
 
-                    def prepare_table_for_join(source_df: Any) -> pd.DataFrame:
-                        if not isinstance(source_df, pd.DataFrame) or source_df.empty:
-                            return pd.DataFrame()
-                        if "description" not in source_df.columns:
-                            return pd.DataFrame()
-                        working = source_df.copy()
-                        working["description"] = working["description"].astype(str)
-                        working = working[working["description"].str.strip() != ""].copy()
-                        if working.empty:
-                            return pd.DataFrame()
-                        working["__desc_key__"] = working["description"].map(normalize_text)
-                        working["__desc_key__"] = working["__desc_key__"].fillna("")
-                        working["__desc_order__"] = working.groupby("__desc_key__").cumcount()
-                        working["__join_key__"] = (
-                            working["__desc_key__"].astype(str)
-                            + "#"
-                            + working["__desc_order__"].astype(str)
-                        )
-                        if "__row_order__" in working.columns:
-                            working["__sort_order__"] = working["__row_order__"]
-                        else:
-                            working["__sort_order__"] = np.arange(len(working))
-                        return working
-
                     master_source = master_wb.sheets.get(selected_sheet, {}).get(
                         "table", pd.DataFrame()
                     )
@@ -6748,8 +6857,8 @@ with tab_compare2:
                         if isinstance(supplier_source, pd.DataFrame):
                             supplier_table = supplier_source.copy()
 
-                    master_prepared = prepare_table_for_join(master_table)
-                    supplier_prepared = prepare_table_for_join(supplier_table)
+                    master_prepared = _prepare_table_for_join(master_table)
+                    supplier_prepared = _prepare_table_for_join(supplier_table)
 
                     if master_prepared.empty and supplier_prepared.empty:
                         st.warning(
@@ -7267,44 +7376,75 @@ with tab_curve:
                             analysis_df["__curve_position__"] = np.arange(
                                 1, len(analysis_df) + 1
                             )
-                            position_map = analysis_df[
-                                ["__key__", "__curve_position__"]
-                            ].dropna(subset=["__key__"])
+                            alias_lookup = {
+                                alias: raw for raw, alias in display_names.items()
+                            }
+                            master_sheet = master_wb.sheets.get(selected_sheet)
+                            master_table = (
+                                master_sheet.get("table")
+                                if isinstance(master_sheet, dict)
+                                else pd.DataFrame()
+                            )
+                            if isinstance(master_table, pd.DataFrame):
+                                master_table = master_table.copy()
+                            else:
+                                master_table = pd.DataFrame()
 
-                            curve_df = dataset.long_df.copy()
-                            if curve_df.empty:
-                                st.info(
-                                    "Pro vybraná data nejsou k dispozici žádné hodnoty."
+                            master_prepared = _prepare_table_for_join(master_table)
+
+                            curve_frames: List[pd.DataFrame] = []
+                            if "Master" in selected_suppliers:
+                                master_curve = _build_master_curve_points(master_prepared)
+                                if not master_curve.empty:
+                                    curve_frames.append(master_curve)
+
+                            for supplier_alias in selected_suppliers:
+                                if supplier_alias == "Master":
+                                    continue
+                                raw_supplier = alias_lookup.get(
+                                    supplier_alias, supplier_alias
+                                )
+                                supplier_wb = bids_dict.get(raw_supplier)
+                                if supplier_wb is None:
+                                    continue
+                                supplier_sheet = supplier_wb.sheets.get(
+                                    selected_sheet, {}
+                                )
+                                supplier_table = (
+                                    supplier_sheet.get("table")
+                                    if isinstance(supplier_sheet, dict)
+                                    else pd.DataFrame()
+                                )
+                                if isinstance(supplier_table, pd.DataFrame):
+                                    supplier_table = supplier_table.copy()
+                                else:
+                                    supplier_table = pd.DataFrame()
+                                supplier_prepared = _prepare_table_for_join(
+                                    supplier_table
+                                )
+                                supplier_curve = _build_supplier_curve_points(
+                                    master_prepared, supplier_prepared, supplier_alias
+                                )
+                                if not supplier_curve.empty:
+                                    curve_frames.append(supplier_curve)
+
+                            if curve_frames:
+                                curve_df = pd.concat(
+                                    curve_frames, axis=0, ignore_index=True
+                                )
+                                curve_df.sort_values(
+                                    by=["supplier", "__curve_position__"],
+                                    inplace=True,
+                                    kind="stable",
                                 )
                             else:
-                                curve_df = curve_df.merge(
-                                    position_map, on="__key__", how="left"
+                                curve_df = pd.DataFrame(columns=CURVE_OUTPUT_COLUMNS)
+
+                            if curve_df.empty:
+                                st.info(
+                                    "Vybrané nastavení neobsahuje data pro zobrazení grafu."
                                 )
-                                curve_df = curve_df[
-                                    curve_df["__curve_position__"].notna()
-                                ].copy()
-                                if curve_df.empty:
-                                    st.info(
-                                        "Vybrané nastavení neobsahuje data pro zobrazení grafu."
-                                    )
-                                else:
-                                    curve_df["__curve_position__"] = curve_df[
-                                        "__curve_position__"
-                                    ].astype(int)
-                                    curve_df["total"] = pd.to_numeric(
-                                        curve_df["total"], errors="coerce"
-                                    )
-                                    curve_df = curve_df[
-                                        curve_df["total"].notna()
-                                    ]
-                                    curve_df = curve_df[
-                                        curve_df["supplier"].isin(selected_suppliers)
-                                    ]
-                                    if curve_df.empty:
-                                        st.info(
-                                            "Vybrané nastavení neobsahuje data pro zobrazení grafu."
-                                        )
-                                    else:
+                            else:
 
                                         def _to_excel_row(value: Any) -> Optional[int]:
                                             if value is None:
