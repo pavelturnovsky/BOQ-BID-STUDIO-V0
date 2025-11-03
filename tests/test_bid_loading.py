@@ -3,6 +3,7 @@ import os
 import sys
 import types
 from pathlib import Path
+from typing import Optional
 import pandas as pd
 import numpy as np
 import pytest
@@ -1047,3 +1048,94 @@ def test_overview_comparison_marks_added_and_removed_rows() -> None:
 
     supplier_total = sections.set_index("code")["Supplier total"]
     assert np.isclose(supplier_total["C"], 30.0)
+
+
+def test_curve_matches_compare2_for_duplicate_descriptions() -> None:
+    master_raw = pd.DataFrame(
+        {
+            "code": ["10", "11", "12", "13"],
+            "description": [
+                "Opakovaná položka",
+                "Unikát",
+                "Opakovaná položka",
+                "Další",
+            ],
+            "unit": ["m", "m", "m", "m"],
+            "quantity": ["1", "2", "3", "4"],
+            "total price": ["100", "200", "150", "300"],
+        }
+    )
+    supplier_raw = pd.DataFrame(
+        {
+            "code": ["S10", "S11", "S12", "S13"],
+            "description": [
+                "Opakovaná položka",
+                "Unikát",
+                "Opakovaná položka",
+                "Další",
+            ],
+            "unit": ["m", "m", "m", "m"],
+            "quantity": ["1", "2", "3", "4"],
+            "total price": ["110", "195", "140", "305"],
+        }
+    )
+
+    mapping = {
+        "code": 0,
+        "description": 1,
+        "unit": 2,
+        "quantity": 3,
+        "total_price": 4,
+    }
+
+    master_table = module.build_normalized_table(master_raw, mapping)
+    supplier_table = module.build_normalized_table(supplier_raw, mapping)
+
+    master_prepared = module._prepare_table_for_join(master_table)
+    supplier_prepared = module._prepare_table_for_join(supplier_table)
+
+    supplier_curve = module._build_supplier_curve_points(
+        master_prepared, supplier_prepared, "Dodavatel"
+    )
+    assert not supplier_curve.empty
+
+    join_suffix = (" — Master", " — Supplier")
+    combined = pd.merge(
+        master_prepared,
+        supplier_prepared,
+        on="__join_key__",
+        how="outer",
+        suffixes=join_suffix,
+    )
+
+    sort_master_col = "__sort_order__" + join_suffix[0]
+    sort_supplier_col = "__sort_order__" + join_suffix[1]
+
+    def _ensure_series(series: Optional[pd.Series]) -> pd.Series:
+        if series is None:
+            return pd.Series([pd.NA] * len(combined), index=combined.index)
+        return series
+
+    combined["__sort_order__"] = _ensure_series(combined.get(sort_master_col)).combine_first(
+        _ensure_series(combined.get(sort_supplier_col))
+    )
+    combined["__sort_order__"] = pd.to_numeric(
+        combined["__sort_order__"], errors="coerce"
+    )
+    combined = combined[combined["__sort_order__"].notna()].copy()
+    combined.sort_values("__sort_order__", inplace=True, kind="stable")
+    combined["__curve_position__"] = (combined["__sort_order__"] + 1).astype(int)
+
+    supplier_total_col = f"total_price{join_suffix[1]}"
+    combined["expected_total"] = pd.to_numeric(
+        combined[supplier_total_col], errors="coerce"
+    )
+    combined = combined[combined["expected_total"].notna()].copy()
+    combined.reset_index(drop=True, inplace=True)
+
+    supplier_curve = supplier_curve.reset_index(drop=True)
+
+    assert list(supplier_curve["__curve_position__"]) == list(
+        combined["__curve_position__"]
+    )
+    assert np.allclose(supplier_curve["total"], combined["expected_total"])
