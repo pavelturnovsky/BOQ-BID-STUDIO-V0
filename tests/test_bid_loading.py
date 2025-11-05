@@ -1139,3 +1139,90 @@ def test_curve_matches_compare2_for_duplicate_descriptions() -> None:
         combined["__curve_position__"]
     )
     assert np.allclose(supplier_curve["total"], combined["expected_total"])
+
+
+def test_curve_alignment_uses_preserved_item_ids() -> None:
+    master_raw = pd.DataFrame(
+        {
+            "item id": ["ITEM-1", "ITEM-2"],
+            "code": ["10", "20"],
+            "description": ["Master první", "Master druhý"],
+            "total price": ["100", "200"],
+        }
+    )
+    supplier_raw = pd.DataFrame(
+        {
+            "item id": ["ITEM-1", "ITEM-2"],
+            "code": ["S10", "S20"],
+            "description": ["Dodavatel první", "Dodavatel druhý"],
+            "total price": ["105", "195"],
+        }
+    )
+
+    mapping = {"item_id": 0, "code": 1, "description": 2, "total_price": 3}
+
+    master_table = module.build_normalized_table(master_raw, mapping)
+    supplier_table = module.build_normalized_table(supplier_raw, mapping)
+
+    master_wb = WorkbookData(name="Master", sheets={"Sheet": {"table": master_table}})
+    supplier_wb = WorkbookData(name="Supplier", sheets={"Sheet": {"table": supplier_table}})
+
+    compare_results = module.compare(master_wb, {"Supplier": supplier_wb})
+
+    sheet_df = compare_results["Sheet"]
+    join_column = "__join_key__::Supplier"
+    assert join_column in sheet_df.columns
+
+    dataset = module.build_comparison_dataset("Sheet", sheet_df)
+
+    master_join_map = dataset.master_join_key_map.get("Supplier")
+    supplier_join_map = dataset.supplier_join_key_map.get("Supplier")
+
+    assert isinstance(master_join_map, pd.Series)
+    assert isinstance(supplier_join_map, pd.Series)
+    master_keys = master_table["__key__"].astype(str).map(master_join_map).tolist()
+    supplier_keys = supplier_table["__key__"].astype(str).map(supplier_join_map).tolist()
+    expected_keys = master_table["item_id"].astype(str).tolist()
+
+    assert master_keys == expected_keys
+    assert supplier_keys == expected_keys
+
+    master_prepared = module._prepare_table_for_join(
+        master_table, join_keys=master_join_map
+    )
+    supplier_prepared = module._prepare_table_for_join(
+        supplier_table, join_keys=supplier_join_map
+    )
+
+    supplier_curve = module._build_supplier_curve_points(
+        master_prepared, supplier_prepared, "Supplier"
+    )
+    assert not supplier_curve.empty
+
+    combined = supplier_curve.merge(
+        master_prepared[["__sort_order__", "__join_key__"]],
+        on="__sort_order__",
+        how="left",
+    )
+    assert combined["__join_key__"].notna().all()
+
+    comparison_join_map = (
+        sheet_df[[join_column, "Supplier total"]]
+        .dropna(subset=[join_column, "Supplier total"])
+        .set_index(join_column)["Supplier total"]
+        .astype(float)
+    )
+    curve_join_map = (
+        combined[["__join_key__", "total"]]
+        .dropna(subset=["__join_key__", "total"])
+        .set_index("__join_key__")["total"]
+        .astype(float)
+    )
+
+    comparison_index = comparison_join_map.index.astype(str)
+    curve_join_map.index = curve_join_map.index.astype(str)
+    comparison_join_map.index = comparison_index
+
+    assert set(curve_join_map.index) == set(comparison_index)
+    aligned_curve = curve_join_map.loc[comparison_index]
+    assert np.allclose(aligned_curve.values, comparison_join_map.values)
