@@ -5392,10 +5392,6 @@ if len(bid_files) > 7:
     st.sidebar.warning("Bylo vybráno více než 7 nabídek, zpracuje se prvních 7.")
     bid_files = bid_files[:7]
 
-currency = st.sidebar.text_input("Popisek měny", value="CZK")
-project_country = st.sidebar.text_input(
-    "Země projektu (volitelné)", value="", help="Například CZ, SK, PL."
-)
 project_identifier = st.sidebar.text_input(
     "Identifikátor projektu (volitelné)", value=""
 )
@@ -5465,8 +5461,6 @@ overview_sheet = st.sidebar.selectbox(
 # Read master only for selected comparison sheets
 master_file.seek(0)
 material_context = {
-    "currency": currency,
-    "country": project_country,
     "project_name": project_identifier,
     "limit_sheets": compare_sheets,
 }
