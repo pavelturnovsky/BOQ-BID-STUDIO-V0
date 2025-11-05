@@ -3,6 +3,7 @@ import hashlib
 import logging
 import io
 import math
+import os
 import re
 import json
 import tempfile
@@ -39,6 +40,7 @@ from embedded_fonts import get_noto_sans_bold, get_noto_sans_regular
 from core.aggregate import collect_outline_rollups, rollup_by_outline
 from core.excel_outline import build_outline_nodes, read_outline_levels
 from core.export import dataframe_to_excel_bytes_with_outline
+from core.material_store import MaterialCollector
 
 # ------------- App Config -------------
 st.set_page_config(page_title="BoQ Bid Studio V.04", layout="wide")
@@ -118,6 +120,11 @@ EXCHANGE_RATE_WIDGET_KEYS = {
 }
 RESERVED_ALIAS_NAMES = {"Master", "LOWEST"}
 DEFAULT_STORAGE_DIR = Path.home() / ".boq_bid_studio"
+MATERIAL_COLLECTION_DISABLED = (
+    os.environ.get("BOQ_DISABLE_MATERIAL_COLLECTION", "").strip().lower()
+    in {"1", "true", "yes"}
+)
+_MATERIAL_COLLECTOR: Optional[MaterialCollector] = None
 
 try:
     MODULE_DIR = Path(__file__).resolve().parent
@@ -127,6 +134,223 @@ except NameError:
 PDF_FONT_REGULAR = "NotoSans"
 PDF_FONT_BOLD = "NotoSans-Bold"
 _PDF_FONT_STATE: Optional[Tuple[str, str]] = None
+
+
+def get_material_collector() -> MaterialCollector:
+    global _MATERIAL_COLLECTOR
+    if _MATERIAL_COLLECTOR is None:
+        _MATERIAL_COLLECTOR = MaterialCollector()
+    return _MATERIAL_COLLECTOR
+
+
+def _resolve_material_db_token() -> str:
+    """Return the configured admin token for the material database."""
+
+    for key in (
+        "BOQ_MATERIAL_DB_ADMIN_KEY",
+        "BOQ_MATERIAL_DB_TOKEN",
+        "MATERIAL_DB_ADMIN_KEY",
+    ):
+        value = os.environ.get(key)
+        if value:
+            return value.strip()
+
+    secrets_obj = getattr(st, "secrets", None)
+    if secrets_obj:
+        for key in ("material_db_admin_key", "material_db_token"):
+            value = secrets_obj.get(key)
+            if value:
+                return str(value).strip()
+    return ""
+
+
+def _format_metadata_blob(blob: Any) -> str:
+    if not blob:
+        return ""
+    if isinstance(blob, Mapping):
+        try:
+            return json.dumps(blob, ensure_ascii=False, sort_keys=True)
+        except (TypeError, ValueError):
+            return str(blob)
+    if isinstance(blob, str):
+        return blob
+    try:
+        return json.dumps(blob, ensure_ascii=False, sort_keys=True)
+    except (TypeError, ValueError):
+        return str(blob)
+
+
+def render_material_database_tab(
+    *, default_country: str = "", default_project: str = ""
+) -> None:
+    """Render the admin-facing material database interface."""
+
+    st.subheader("💾 Databáze materiálů")
+    if MATERIAL_COLLECTION_DISABLED:
+        st.warning(
+            "Sběr nových dat je aktuálně vypnutý (proměnná BOQ_DISABLE_MATERIAL_COLLECTION)."
+        )
+
+    token = _resolve_material_db_token()
+    authorized = st.session_state.get("material_db_authorized", False)
+    if token and not authorized:
+        st.info("Rozhraní databáze je přístupné pouze vývojářům a správcům aplikace.")
+        with st.form("material_db_login"):
+            password = st.text_input("Přístupové heslo", type="password")
+            submitted = st.form_submit_button("Ověřit přístup")
+        if submitted:
+            if password.strip() == token:
+                st.session_state["material_db_authorized"] = True
+                st.success("Přístup povolen.")
+                trigger_rerun()
+            else:
+                st.error("Neplatné heslo.")
+        if not st.session_state.get("material_db_authorized"):
+            return
+    elif not token:
+        st.caption(
+            "Nebyl nastaven žádný přístupový klíč. Rozhraní je dostupné v režimu vývoje."
+        )
+
+    collector = get_material_collector()
+    database = collector.database
+
+    stats = database.stats()
+    stat_cols = st.columns(3)
+    stat_cols[0].metric("Záznamy", format_number(stats.get("entries", 0)))
+    stat_cols[1].metric("Unikátní řádky", format_number(stats.get("unique_rows", 0)))
+    stat_cols[2].metric("Zdrojové soubory", format_number(stats.get("sources", 0)))
+
+    filters = database.available_filters()
+    default_country = (default_country or "").strip()
+    default_project = (default_project or "").strip()
+
+    filter_cols = st.columns([2, 2, 2, 1])
+    search_value = filter_cols[0].text_input(
+        "Hledat podle názvu nebo kódu",
+        value="",
+        placeholder="např. kabel, A1…",
+        key=make_widget_key("material_db", "search"),
+    )
+    selected_countries = filter_cols[1].multiselect(
+        "Země",
+        options=filters.get("countries", []),
+        default=[default_country]
+        if default_country and default_country in filters.get("countries", [])
+        else [],
+        key=make_widget_key("material_db", "countries"),
+    )
+    selected_projects = filter_cols[2].multiselect(
+        "Projekt",
+        options=filters.get("projects", []),
+        default=[default_project]
+        if default_project and default_project in filters.get("projects", [])
+        else [],
+        key=make_widget_key("material_db", "projects"),
+    )
+    result_limit = int(
+        filter_cols[3].number_input(
+            "Limit",
+            min_value=50,
+            max_value=2000,
+            step=50,
+            value=500,
+            key=make_widget_key("material_db", "limit"),
+        )
+    )
+
+    selected_sheets = st.multiselect(
+        "List (sešit)",
+        options=filters.get("sheets", []),
+        key=make_widget_key("material_db", "sheets"),
+    )
+
+    materials_df = database.fetch_materials(
+        search=search_value or None,
+        countries=selected_countries or None,
+        projects=selected_projects or None,
+        sheets=selected_sheets or None,
+        limit=result_limit,
+    )
+
+    if materials_df.empty:
+        st.info("Pro zvolené filtry nejsou dostupná žádná data.")
+    else:
+        display_df = materials_df.copy()
+        fallback_total = (
+            display_df["unit_price_material"].fillna(0)
+            + display_df["unit_price_install"].fillna(0)
+        )
+        fallback_total = fallback_total.mask(fallback_total <= 0, pd.NA)
+        price_total = display_df["unit_price_total"].where(
+            display_df["unit_price_total"].notna(), fallback_total
+        )
+
+        captured = pd.to_datetime(display_df["captured_at"], errors="coerce", utc=True)
+        captured_local = captured.dt.tz_convert("Europe/Prague").dt.tz_localize(None)
+        view_df = pd.DataFrame(
+            {
+                "Zachyceno": captured_local.dt.strftime("%Y-%m-%d %H:%M"),
+                "Země": display_df["country"].fillna(""),
+                "Projekt": display_df["project_name"].fillna(""),
+                "Měna": display_df["currency"].fillna(""),
+                "Sešit": display_df["workbook_name"].fillna(""),
+                "List": display_df["sheet_name"].fillna(""),
+                "Kód": display_df["item_code"].fillna(""),
+                "Popis": display_df["description"],
+                "Jednotka": display_df["unit"].fillna(""),
+                "Množství": display_df["quantity"],
+                "Jedn. cena materiál": display_df["unit_price_material"],
+                "Jedn. cena montáž": display_df["unit_price_install"],
+                "Jedn. cena celkem": price_total,
+                "Cena celkem": display_df["total_price"],
+                "Odkaz na řádek": display_df["row_ref"].fillna(""),
+                "Metadata položky": display_df["row_metadata"].apply(_format_metadata_blob),
+                "Metadata zdroje": display_df["source_metadata"].apply(
+                    _format_metadata_blob
+                ),
+            }
+        )
+
+        st.dataframe(
+            view_df,
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        csv_bytes = view_df.to_csv(index=False).encode("utf-8-sig")
+        st.download_button(
+            "Stáhnout vyfiltrovaná data (CSV)",
+            data=csv_bytes,
+            file_name="material_database_export.csv",
+            mime="text/csv",
+        )
+
+    with st.expander("Poslední zdrojové soubory"):
+        sources_df = database.list_sources(limit=200)
+        if sources_df.empty:
+            st.caption("Zatím nejsou dostupné žádné zdrojové sešity.")
+        else:
+            sources_view = sources_df.copy()
+            captured = pd.to_datetime(sources_view["captured_at"], errors="coerce", utc=True)
+            sources_view["captured_at"] = (
+                captured.dt.tz_convert("Europe/Prague").dt.tz_localize(None)
+            )
+            sources_view["metadata"] = sources_view["metadata"].apply(
+                _format_metadata_blob
+            )
+            sources_view = sources_view.rename(
+                columns={
+                    "captured_at": "Zachyceno",
+                    "workbook_name": "Sešit",
+                    "sheet_name": "List",
+                    "country": "Země",
+                    "currency": "Měna",
+                    "project_name": "Projekt",
+                    "metadata": "Metadata",
+                }
+            )
+            st.dataframe(sources_view, use_container_width=True, hide_index=True)
 
 RECAP_CATEGORY_CONFIG = [
     {
@@ -3155,13 +3379,22 @@ def show_df(df: pd.DataFrame) -> None:
     st.dataframe(styler, **display_kwargs)
 
 @st.cache_data
-def read_workbook(upload, limit_sheets: Optional[List[str]] = None) -> WorkbookData:
+def read_workbook(
+    upload,
+    limit_sheets: Optional[List[str]] = None,
+    *,
+    collect_materials: bool = False,
+    material_context: Optional[Dict[str, Any]] = None,
+    material_collector: Optional[MaterialCollector] = None,
+) -> WorkbookData:
     file_name = getattr(upload, "name", "workbook")
     suffix = Path(file_name).suffix.lower()
     data_bytes: Optional[bytes] = None
     source_for_pandas: Any = upload
     temp_path: Optional[Path] = None
     cleanup_path: Optional[Path] = None
+    file_hash: str = ""
+    context_info: Dict[str, Any] = dict(material_context or {})
 
     if isinstance(upload, (bytes, bytearray)):
         data_bytes = bytes(upload)
@@ -3189,6 +3422,7 @@ def read_workbook(upload, limit_sheets: Optional[List[str]] = None) -> WorkbookD
     if data_bytes is not None:
         source_for_pandas = io.BytesIO(data_bytes)
         source_for_pandas.seek(0)
+        file_hash = hashlib.sha1(data_bytes).hexdigest()
         if suffix in {".xlsx", ".xlsm"}:
             with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
                 tmp.write(data_bytes)
@@ -3199,6 +3433,10 @@ def read_workbook(upload, limit_sheets: Optional[List[str]] = None) -> WorkbookD
         path_obj = Path(upload)
         if path_obj.exists():
             temp_path = path_obj
+            try:
+                file_hash = hashlib.sha1(path_obj.read_bytes()).hexdigest()
+            except OSError:
+                file_hash = ""
 
     xl = pd.ExcelFile(source_for_pandas)
     sheet_names = (
@@ -3279,6 +3517,40 @@ def read_workbook(upload, limit_sheets: Optional[List[str]] = None) -> WorkbookD
                 "col_outline_map": {},
                 "outline_tree": {"rows": [], "cols": []},
             }
+
+    if (
+        collect_materials
+        and not MATERIAL_COLLECTION_DISABLED
+        and file_hash
+    ):
+        collector = material_collector or get_material_collector()
+        whitelist_raw = context_info.get("limit_sheets")
+        whitelist: Optional[Iterable[str]]
+        if whitelist_raw is None:
+            whitelist_raw = limit_sheets
+        if isinstance(whitelist_raw, (list, tuple, set)):
+            whitelist = list(whitelist_raw)
+        else:
+            whitelist = None
+        metadata_payload = {
+            key: value
+            for key, value in context_info.items()
+            if key not in {"country", "currency", "project_name", "limit_sheets"}
+        }
+        try:
+            collector.collect_from_workbook(
+                wb,
+                file_hash=file_hash,
+                country=context_info.get("country"),
+                currency=context_info.get("currency"),
+                project_name=context_info.get("project_name"),
+                metadata=metadata_payload or None,
+                sheet_whitelist=whitelist,
+            )
+        except Exception:
+            logging.getLogger(__name__).exception(
+                "Failed to collect material data for workbook %s", file_name
+            )
 
     if cleanup_path and cleanup_path.exists():
         try:
@@ -5121,6 +5393,12 @@ if len(bid_files) > 7:
     bid_files = bid_files[:7]
 
 currency = st.sidebar.text_input("Popisek měny", value="CZK")
+project_country = st.sidebar.text_input(
+    "Země projektu (volitelné)", value="", help="Například CZ, SK, PL."
+)
+project_identifier = st.sidebar.text_input(
+    "Identifikátor projektu (volitelné)", value=""
+)
 
 stored_master_entries = offer_storage.list_master()
 stored_bid_entries = offer_storage.list_bids()
@@ -5186,7 +5464,18 @@ overview_sheet = st.sidebar.selectbox(
 
 # Read master only for selected comparison sheets
 master_file.seek(0)
-master_wb = read_workbook(master_file, limit_sheets=compare_sheets)
+material_context = {
+    "currency": currency,
+    "country": project_country,
+    "project_name": project_identifier,
+    "limit_sheets": compare_sheets,
+}
+master_wb = read_workbook(
+    master_file,
+    limit_sheets=compare_sheets,
+    collect_materials=True,
+    material_context=material_context,
+)
 
 # If overview sheet not among comparison sheets, load separately
 if overview_sheet in compare_sheets:
@@ -5279,7 +5568,7 @@ chart_color_map.setdefault("Master", "#636EFA")
 ensure_exchange_rate_state()
 
 # ------------- Tabs -------------
-tab_data, tab_preview, tab_compare, tab_compare2, tab_curve, tab_summary, tab_rekap = st.tabs([
+tab_data, tab_preview, tab_compare, tab_compare2, tab_curve, tab_summary, tab_rekap, tab_database = st.tabs([
     "📑 Mapování",
     "🧾 Kontrola dat",
     "⚖️ Porovnání",
@@ -5287,6 +5576,7 @@ tab_data, tab_preview, tab_compare, tab_compare2, tab_curve, tab_summary, tab_re
     "📈 Spojitá nabídková křivka",
     "📋 Celkový přehled",
     "📊 Rekapitulace",
+    "💾 Databáze materiálů",
 ])
 
 with tab_data:
@@ -8750,6 +9040,12 @@ with tab_rekap:
                 show_df(
                     rename_value_columns_for_display(added_df.copy(), f" — {base_currency}")
                 )
+
+with tab_database:
+    render_material_database_tab(
+        default_country=project_country,
+        default_project=project_identifier,
+    )
 
 st.markdown("---")
 st.caption("© 2025 BoQ Bid Studio — MVP. Doporučení: používat jednotné Item ID pro precizní párování.")
