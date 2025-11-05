@@ -3,6 +3,7 @@ import hashlib
 import logging
 import io
 import math
+import os
 import re
 import json
 import tempfile
@@ -39,6 +40,7 @@ from embedded_fonts import get_noto_sans_bold, get_noto_sans_regular
 from core.aggregate import collect_outline_rollups, rollup_by_outline
 from core.excel_outline import build_outline_nodes, read_outline_levels
 from core.export import dataframe_to_excel_bytes_with_outline
+from core.material_store import MaterialCollector
 
 # ------------- App Config -------------
 st.set_page_config(page_title="BoQ Bid Studio V.04", layout="wide")
@@ -118,6 +120,11 @@ EXCHANGE_RATE_WIDGET_KEYS = {
 }
 RESERVED_ALIAS_NAMES = {"Master", "LOWEST"}
 DEFAULT_STORAGE_DIR = Path.home() / ".boq_bid_studio"
+MATERIAL_COLLECTION_DISABLED = (
+    os.environ.get("BOQ_DISABLE_MATERIAL_COLLECTION", "").strip().lower()
+    in {"1", "true", "yes"}
+)
+_MATERIAL_COLLECTOR: Optional[MaterialCollector] = None
 
 try:
     MODULE_DIR = Path(__file__).resolve().parent
@@ -127,6 +134,13 @@ except NameError:
 PDF_FONT_REGULAR = "NotoSans"
 PDF_FONT_BOLD = "NotoSans-Bold"
 _PDF_FONT_STATE: Optional[Tuple[str, str]] = None
+
+
+def get_material_collector() -> MaterialCollector:
+    global _MATERIAL_COLLECTOR
+    if _MATERIAL_COLLECTOR is None:
+        _MATERIAL_COLLECTOR = MaterialCollector()
+    return _MATERIAL_COLLECTOR
 
 RECAP_CATEGORY_CONFIG = [
     {
@@ -3155,13 +3169,22 @@ def show_df(df: pd.DataFrame) -> None:
     st.dataframe(styler, **display_kwargs)
 
 @st.cache_data
-def read_workbook(upload, limit_sheets: Optional[List[str]] = None) -> WorkbookData:
+def read_workbook(
+    upload,
+    limit_sheets: Optional[List[str]] = None,
+    *,
+    collect_materials: bool = False,
+    material_context: Optional[Dict[str, Any]] = None,
+    material_collector: Optional[MaterialCollector] = None,
+) -> WorkbookData:
     file_name = getattr(upload, "name", "workbook")
     suffix = Path(file_name).suffix.lower()
     data_bytes: Optional[bytes] = None
     source_for_pandas: Any = upload
     temp_path: Optional[Path] = None
     cleanup_path: Optional[Path] = None
+    file_hash: str = ""
+    context_info: Dict[str, Any] = dict(material_context or {})
 
     if isinstance(upload, (bytes, bytearray)):
         data_bytes = bytes(upload)
@@ -3189,6 +3212,7 @@ def read_workbook(upload, limit_sheets: Optional[List[str]] = None) -> WorkbookD
     if data_bytes is not None:
         source_for_pandas = io.BytesIO(data_bytes)
         source_for_pandas.seek(0)
+        file_hash = hashlib.sha1(data_bytes).hexdigest()
         if suffix in {".xlsx", ".xlsm"}:
             with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
                 tmp.write(data_bytes)
@@ -3199,6 +3223,10 @@ def read_workbook(upload, limit_sheets: Optional[List[str]] = None) -> WorkbookD
         path_obj = Path(upload)
         if path_obj.exists():
             temp_path = path_obj
+            try:
+                file_hash = hashlib.sha1(path_obj.read_bytes()).hexdigest()
+            except OSError:
+                file_hash = ""
 
     xl = pd.ExcelFile(source_for_pandas)
     sheet_names = (
@@ -3279,6 +3307,40 @@ def read_workbook(upload, limit_sheets: Optional[List[str]] = None) -> WorkbookD
                 "col_outline_map": {},
                 "outline_tree": {"rows": [], "cols": []},
             }
+
+    if (
+        collect_materials
+        and not MATERIAL_COLLECTION_DISABLED
+        and file_hash
+    ):
+        collector = material_collector or get_material_collector()
+        whitelist_raw = context_info.get("limit_sheets")
+        whitelist: Optional[Iterable[str]]
+        if whitelist_raw is None:
+            whitelist_raw = limit_sheets
+        if isinstance(whitelist_raw, (list, tuple, set)):
+            whitelist = list(whitelist_raw)
+        else:
+            whitelist = None
+        metadata_payload = {
+            key: value
+            for key, value in context_info.items()
+            if key not in {"country", "currency", "project_name", "limit_sheets"}
+        }
+        try:
+            collector.collect_from_workbook(
+                wb,
+                file_hash=file_hash,
+                country=context_info.get("country"),
+                currency=context_info.get("currency"),
+                project_name=context_info.get("project_name"),
+                metadata=metadata_payload or None,
+                sheet_whitelist=whitelist,
+            )
+        except Exception:
+            logging.getLogger(__name__).exception(
+                "Failed to collect material data for workbook %s", file_name
+            )
 
     if cleanup_path and cleanup_path.exists():
         try:
@@ -5121,6 +5183,12 @@ if len(bid_files) > 7:
     bid_files = bid_files[:7]
 
 currency = st.sidebar.text_input("Popisek měny", value="CZK")
+project_country = st.sidebar.text_input(
+    "Země projektu (volitelné)", value="", help="Například CZ, SK, PL."
+)
+project_identifier = st.sidebar.text_input(
+    "Identifikátor projektu (volitelné)", value=""
+)
 
 stored_master_entries = offer_storage.list_master()
 stored_bid_entries = offer_storage.list_bids()
@@ -5186,7 +5254,18 @@ overview_sheet = st.sidebar.selectbox(
 
 # Read master only for selected comparison sheets
 master_file.seek(0)
-master_wb = read_workbook(master_file, limit_sheets=compare_sheets)
+material_context = {
+    "currency": currency,
+    "country": project_country,
+    "project_name": project_identifier,
+    "limit_sheets": compare_sheets,
+}
+master_wb = read_workbook(
+    master_file,
+    limit_sheets=compare_sheets,
+    collect_materials=True,
+    material_context=material_context,
+)
 
 # If overview sheet not among comparison sheets, load separately
 if overview_sheet in compare_sheets:
