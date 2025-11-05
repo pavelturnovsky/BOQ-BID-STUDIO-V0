@@ -11,7 +11,7 @@ import unicodedata
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Set, Tuple, Union
 from string import Template
 
 import numpy as np
@@ -247,7 +247,10 @@ CURVE_OUTPUT_COLUMNS = [
 ]
 
 
-def _prepare_table_for_join(source_df: Any) -> pd.DataFrame:
+def _prepare_table_for_join(
+    source_df: Any,
+    join_keys: Optional[Union[pd.Series, Mapping[str, Any]]] = None,
+) -> pd.DataFrame:
     if not isinstance(source_df, pd.DataFrame) or source_df.empty:
         return pd.DataFrame()
     if "description" not in source_df.columns:
@@ -260,9 +263,34 @@ def _prepare_table_for_join(source_df: Any) -> pd.DataFrame:
     working["__desc_key__"] = working["description"].map(normalize_text)
     working["__desc_key__"] = working["__desc_key__"].fillna("")
     working["__desc_order__"] = working.groupby("__desc_key__").cumcount()
-    working["__join_key__"] = (
+    fallback_join = (
         working["__desc_key__"].astype(str) + "#" + working["__desc_order__"].astype(str)
     )
+
+    join_series: Optional[pd.Series]
+    if join_keys is None:
+        join_series = None
+    elif isinstance(join_keys, pd.Series):
+        join_series = join_keys.copy()
+    else:
+        join_series = pd.Series(join_keys, dtype=object)
+
+    if join_series is not None and not join_series.empty:
+        join_series.index = join_series.index.astype(str)
+        key_source = working.get("__key__")
+        if key_source is None:
+            mapped = pd.Series([pd.NA] * len(working), index=working.index)
+        else:
+            mapped = key_source.astype(str).map(join_series)
+        working["__join_key__"] = mapped
+        missing_mask = working["__join_key__"].isna() | (
+            working["__join_key__"].astype(str).str.strip() == ""
+        )
+        if missing_mask.any():
+            working.loc[missing_mask, "__join_key__"] = fallback_join.loc[missing_mask]
+        working["__join_key__"] = working["__join_key__"].astype(str)
+    else:
+        working["__join_key__"] = fallback_join.astype(str)
     if "__row_order__" in working.columns:
         working["__sort_order__"] = working["__row_order__"]
     else:
@@ -447,6 +475,8 @@ class ComparisonDataset:
     section_labels: List[str]
     master_column: Optional[str]
     long_df: pd.DataFrame
+    master_join_key_map: Dict[str, pd.Series]
+    supplier_join_key_map: Dict[str, pd.Series]
 
 
 def is_master_column(column_name: str) -> bool:
@@ -666,11 +696,32 @@ def build_comparison_dataset(sheet: str, df: pd.DataFrame) -> ComparisonDataset:
             section_labels=[],
             master_column=None,
             long_df=empty,
+            master_join_key_map={},
+            supplier_join_key_map={},
         )
 
     analysis_df = df.copy()
     if "__key__" not in analysis_df.columns:
         analysis_df["__key__"] = np.arange(len(analysis_df))
+
+    raw_join_attr = df.attrs.get("comparison_join_keys")
+    master_join_key_map: Dict[str, pd.Series] = {}
+    supplier_join_key_map: Dict[str, pd.Series] = {}
+    if isinstance(raw_join_attr, dict):
+        for supplier, join_dict in raw_join_attr.items():
+            master_series = None
+            supplier_series = None
+            if isinstance(join_dict, dict):
+                master_series = join_dict.get("master")
+                supplier_series = join_dict.get("supplier")
+            if isinstance(master_series, pd.Series):
+                master_join_key_map[supplier] = master_series.copy()
+            else:
+                master_join_key_map[supplier] = pd.Series(dtype=object)
+            if isinstance(supplier_series, pd.Series):
+                supplier_join_key_map[supplier] = supplier_series.copy()
+            else:
+                supplier_join_key_map[supplier] = pd.Series(dtype=object)
 
     for master_helper in (
         "Master quantity",
@@ -852,6 +903,8 @@ def build_comparison_dataset(sheet: str, df: pd.DataFrame) -> ComparisonDataset:
         section_labels=section_labels_unique,
         master_column=master_column,
         long_df=long_df,
+        master_join_key_map=master_join_key_map,
+        supplier_join_key_map=supplier_join_key_map,
     )
 
 
@@ -3902,12 +3955,26 @@ def compare(master: WorkbookData, bids: Dict[str, WorkbookData], join_mode: str 
             comp["Master quantity"] = comp["quantity"]
 
         supplier_totals: Dict[str, float] = {}
+        join_metadata: Dict[str, Dict[str, pd.Series]]
+        existing_join_metadata = comp.attrs.get("comparison_join_keys")
+        if isinstance(existing_join_metadata, dict):
+            join_metadata = {key: value for key, value in existing_join_metadata.items()}
+        else:
+            join_metadata = {}
+        comp.attrs["comparison_join_keys"] = join_metadata
         for sup_name, wb in bids.items():
             tobj = wb.sheets.get(sheet, {})
             ttab = tobj.get("table", pd.DataFrame())
             if ttab is None or ttab.empty:
                 comp[f"{sup_name} quantity"] = np.nan
                 comp[f"{sup_name} total"] = np.nan
+                join_column = f"__join_key__::{sup_name}"
+                comp[join_column] = pd.NA
+                join_metadata[sup_name] = {
+                    "master": pd.Series(dtype=object),
+                    "supplier": pd.Series(dtype=object),
+                }
+                comp.attrs["comparison_join_keys"] = join_metadata
                 continue
             summary_mask_supplier = is_summary_like_row(ttab)
             if summary_mask_supplier.any():
@@ -3999,11 +4066,20 @@ def compare(master: WorkbookData, bids: Dict[str, WorkbookData], join_mode: str 
             master_join_series, supplier_join_series = _choose_join_columns(
                 master_lookup, supplier_lookup, join_mode
             )
+            master_join_series = master_join_series.copy()
+            supplier_join_series = supplier_join_series.copy()
+            if not master_join_series.empty:
+                master_join_series.index = master_join_series.index.astype(str)
+            if not supplier_join_series.empty:
+                supplier_join_series.index = supplier_join_series.index.astype(str)
+
             comp_join_keys = comp["__key__"].astype(str).map(master_join_series)
+            join_column = f"__join_key__::{sup_name}"
+            comp[join_column] = comp_join_keys
+            comp["__join_key__"] = comp_join_keys
             tt_grouped["__join_key__"] = tt_grouped["__key__"].astype(str).map(
                 supplier_join_series
             )
-            comp["__join_key__"] = comp_join_keys
 
             qty_merge_col = sup_qty_col
             if sup_qty_col == "quantity":
@@ -4029,6 +4105,12 @@ def compare(master: WorkbookData, bids: Dict[str, WorkbookData], join_mode: str 
 
             comp = comp.merge(tt_grouped[merge_cols], on="__join_key__", how="left")
             comp.drop(columns=["__join_key__"], inplace=True, errors="ignore")
+
+            join_metadata[sup_name] = {
+                "master": master_join_series,
+                "supplier": supplier_join_series,
+            }
+            comp.attrs["comparison_join_keys"] = join_metadata
 
             rename_map: Dict[str, str] = {}
             if qty_merge_col in comp.columns:
@@ -4151,12 +4233,38 @@ def rename_comparison_columns(df: pd.DataFrame, mapping: Dict[str, str]) -> pd.D
         rename_map[f"{raw} total"] = f"{alias} total"
         rename_map[f"{raw} Δ qty"] = f"{alias} Δ qty"
         rename_map[f"{raw} Δ vs LOWEST"] = f"{alias} Δ vs LOWEST"
+        join_key_col = f"__join_key__::{raw}"
+        if join_key_col in df.columns:
+            rename_map[join_key_col] = f"__join_key__::{alias}"
     renamed = df.rename(columns=rename_map).copy()
     if "supplier_totals" in df.attrs:
         renamed_totals = {
             mapping.get(raw, raw): total for raw, total in df.attrs.get("supplier_totals", {}).items()
         }
         renamed.attrs["supplier_totals"] = renamed_totals
+    join_attr = df.attrs.get("comparison_join_keys")
+    if isinstance(join_attr, dict):
+        renamed_join_attr: Dict[str, Dict[str, pd.Series]] = {}
+        for raw, join_dict in join_attr.items():
+            alias = mapping.get(raw, raw)
+            master_series = None
+            supplier_series = None
+            if isinstance(join_dict, dict):
+                master_series = join_dict.get("master")
+                supplier_series = join_dict.get("supplier")
+            if isinstance(master_series, pd.Series):
+                master_copy = master_series.copy()
+            else:
+                master_copy = pd.Series(dtype=object)
+            if isinstance(supplier_series, pd.Series):
+                supplier_copy = supplier_series.copy()
+            else:
+                supplier_copy = pd.Series(dtype=object)
+            renamed_join_attr[alias] = {
+                "master": master_copy,
+                "supplier": supplier_copy,
+            }
+        renamed.attrs["comparison_join_keys"] = renamed_join_attr
     if "LOWEST supplier" in renamed.columns or "MIDRANGE supplier range" in renamed.columns:
 
         def _map_supplier_name(value: Any) -> Any:
@@ -7390,11 +7498,13 @@ with tab_curve:
                             else:
                                 master_table = pd.DataFrame()
 
-                            master_prepared = _prepare_table_for_join(master_table)
+                            master_prepared_base = _prepare_table_for_join(master_table)
 
                             curve_frames: List[pd.DataFrame] = []
                             if "Master" in selected_suppliers:
-                                master_curve = _build_master_curve_points(master_prepared)
+                                master_curve = _build_master_curve_points(
+                                    master_prepared_base
+                                )
                                 if not master_curve.empty:
                                     curve_frames.append(master_curve)
 
@@ -7419,8 +7529,21 @@ with tab_curve:
                                     supplier_table = supplier_table.copy()
                                 else:
                                     supplier_table = pd.DataFrame()
+                                master_join_keys = (
+                                    dataset.master_join_key_map.get(supplier_alias)
+                                    if isinstance(dataset.master_join_key_map, dict)
+                                    else None
+                                )
+                                supplier_join_keys = (
+                                    dataset.supplier_join_key_map.get(supplier_alias)
+                                    if isinstance(dataset.supplier_join_key_map, dict)
+                                    else None
+                                )
+                                master_prepared = _prepare_table_for_join(
+                                    master_table, join_keys=master_join_keys
+                                )
                                 supplier_prepared = _prepare_table_for_join(
-                                    supplier_table
+                                    supplier_table, join_keys=supplier_join_keys
                                 )
                                 supplier_curve = _build_supplier_curve_points(
                                     master_prepared, supplier_prepared, supplier_alias
