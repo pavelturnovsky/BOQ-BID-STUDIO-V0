@@ -5369,6 +5369,15 @@ def run_supplier_only_comparison(offer_storage: OfferStorage) -> None:
         ),
         compare_sheets[0],
     )
+
+    fallback_sheet = (
+        default_sheet if default_sheet in compare_sheets else compare_sheets[0]
+    )
+    if "supplier_only_sheet" in st.session_state:
+        stored_sheet = st.session_state["supplier_only_sheet"]
+        if stored_sheet not in compare_sheets:
+            st.session_state["supplier_only_sheet"] = fallback_sheet
+
     selected_sheet = st.sidebar.selectbox(
         "List pro analýzu",
         compare_sheets,
