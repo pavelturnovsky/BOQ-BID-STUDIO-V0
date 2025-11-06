@@ -5356,11 +5356,6 @@ def run_supplier_only_comparison(offer_storage: OfferStorage) -> None:
         key="supplier_only_sheet",
     )
 
-    dataset = build_supplier_only_dataset(selected_sheet, bids_dict, display_names)
-    if dataset.long_df.empty:
-        st.info("Vybraný list neobsahuje žádné položky ke zpracování.")
-        return
-
     st.subheader("Porovnání nabídek bez Master BoQ")
     st.markdown(
         """
@@ -5371,11 +5366,9 @@ def run_supplier_only_comparison(offer_storage: OfferStorage) -> None:
         """
     )
 
-    consensus_df = dataset.consensus_df
-    consensus_index = consensus_df.index.tolist()
-
-    tab_check, tab_compare, tab_curve, tab_recap = st.tabs(
+    tab_map, tab_check, tab_compare, tab_curve, tab_recap = st.tabs(
         [
+            "📑 Mapování",
             "🧾 Kontrola dat",
             "⚖️ Porovnání 2",
             "📈 Spojitá nabídková křivka",
@@ -5383,206 +5376,232 @@ def run_supplier_only_comparison(offer_storage: OfferStorage) -> None:
         ]
     )
 
+    with tab_map:
+        st.subheader("Mapování sloupců")
+        if not bids_dict:
+            st.info("Nahraj alespoň jednu nabídku dodavatele v levém panelu.")
+        else:
+            for raw_name, wb in bids_dict.items():
+                alias = display_names.get(raw_name, raw_name)
+                with st.expander(f"Mapování — {alias}", expanded=False):
+                    mapping_ui(
+                        alias,
+                        wb,
+                        minimal=True,
+                        section_id=sanitize_key("supplier_only_map", raw_name),
+                    )
+            st.success("Mapování připraveno. Pokračuj na další záložky pro porovnání.")
+
+    dataset = build_supplier_only_dataset(selected_sheet, bids_dict, display_names)
+    dataset_ready = not dataset.long_df.empty
+    consensus_df = dataset.consensus_df if dataset_ready else pd.DataFrame()
+    consensus_index = consensus_df.index.tolist() if not consensus_df.empty else []
+
     with tab_check:
         st.subheader("Pokrytí položek")
-        total_items = len(consensus_df)
-        coverage_rows: List[Dict[str, Any]] = []
-        for supplier in dataset.supplier_order:
-            supplier_totals = dataset.totals_wide.get(supplier)
-            if supplier_totals is None:
-                continue
-            supplier_totals = pd.to_numeric(supplier_totals, errors="coerce")
-            coverage = int(supplier_totals.notna().sum())
-            share = (coverage / total_items * 100.0) if total_items else np.nan
-            coverage_rows.append(
-                {
-                    "Dodavatel": supplier,
-                    "Počet položek": coverage,
-                    "Pokrytí (%)": share,
-                }
-            )
-        coverage_df = pd.DataFrame(coverage_rows)
-        if coverage_df.empty:
-            st.info("Pro vybraný list nejsou dostupné porovnatelné položky.")
+        if not dataset_ready or consensus_df.empty:
+            st.info("Vybraný list neobsahuje žádné položky ke zpracování.")
         else:
-            st.dataframe(
-                coverage_df.style.format(
+            total_items = len(consensus_df)
+            coverage_rows: List[Dict[str, Any]] = []
+            for supplier in dataset.supplier_order:
+                supplier_totals = dataset.totals_wide.get(supplier)
+                if supplier_totals is None:
+                    continue
+                supplier_totals = pd.to_numeric(supplier_totals, errors="coerce")
+                coverage = int(supplier_totals.notna().sum())
+                share = (coverage / total_items * 100.0) if total_items else np.nan
+                coverage_rows.append(
                     {
-                        "Pokrytí (%)": lambda x: f"{float(x):.1f} %"
-                        if pd.notna(x)
-                        else "–"
+                        "Dodavatel": supplier,
+                        "Počet položek": coverage,
+                        "Pokrytí (%)": share,
                     }
-                ),
-                use_container_width=True,
-            )
-
-        st.markdown("### Kontrola proti prázdné šabloně")
-        stored_templates = offer_storage.list_templates()
-        template_display_map = {"": "— žádná šablona —"}
-        template_options = [""]
-        for entry in stored_templates:
-            template_options.append(entry["name"])
-            timestamp = format_timestamp(entry.get("updated_at"))
-            template_display_map[entry["name"]] = (
-                f"{entry['name']} ({timestamp})" if timestamp else entry["name"]
-            )
-
-        selected_template_name = st.selectbox(
-            "Uložená prázdná šablona",
-            template_options,
-            format_func=lambda value: template_display_map.get(value, value),
-            key="supplier_only_template_select",
-        )
-
-        uploaded_template = st.file_uploader(
-            "Nahrát prázdný BoQ",
-            type=["xlsx", "xlsm"],
-            key="supplier_only_template_upload",
-        )
-
-        template_file: Optional[io.BytesIO] = None
-        if uploaded_template is not None:
-            offer_storage.save_template(uploaded_template)
-            template_file = uploaded_template
-        elif selected_template_name:
-            try:
-                template_file = offer_storage.load_template(selected_template_name)
-            except FileNotFoundError:
-                st.warning(
-                    f"Uloženou šablonu '{selected_template_name}' se nepodařilo načíst."
                 )
-
-        if template_file is None:
-            st.info(
-                "Pro kontrolu úprav dodavatelů nahraj prázdnou referenční šablonu."
-            )
-        else:
-            template_wb = read_workbook(template_file)
-            template_sheets = list(template_wb.sheets.keys())
-            if not template_sheets:
-                st.warning("Nahraná šablona neobsahuje žádné listy.")
+            coverage_df = pd.DataFrame(coverage_rows)
+            if coverage_df.empty:
+                st.info("Pro vybraný list nejsou dostupné porovnatelné položky.")
             else:
-                default_template_sheet = (
-                    selected_sheet
-                    if selected_sheet in template_sheets
-                    else template_sheets[0]
+                st.dataframe(
+                    coverage_df.style.format(
+                        {
+                            "Pokrytí (%)": lambda x: f"{float(x):.1f} %"
+                            if pd.notna(x)
+                            else "–"
+                        }
+                    ),
+                    use_container_width=True,
                 )
-                template_sheet = st.selectbox(
-                    "List v šabloně",
-                    template_sheets,
-                    index=template_sheets.index(default_template_sheet)
-                    if default_template_sheet in template_sheets
-                    else 0,
-                    key="supplier_only_template_sheet",
+
+            st.markdown("### Kontrola proti prázdné šabloně")
+            stored_templates = offer_storage.list_templates()
+            template_display_map = {"": "— žádná šablona —"}
+            template_options = [""]
+            for entry in stored_templates:
+                template_options.append(entry["name"])
+                timestamp = format_timestamp(entry.get("updated_at"))
+                template_display_map[entry["name"]] = (
+                    f"{entry['name']} ({timestamp})" if timestamp else entry["name"]
                 )
-                template_obj = template_wb.sheets.get(template_sheet, {})
-                template_table = (
-                    template_obj.get("table") if isinstance(template_obj, dict) else None
+
+            selected_template_name = st.selectbox(
+                "Uložená prázdná šablona",
+                template_options,
+                format_func=lambda value: template_display_map.get(value, value),
+                key="supplier_only_template_select",
+            )
+
+            uploaded_template = st.file_uploader(
+                "Nahrát prázdný BoQ",
+                type=["xlsx", "xlsm"],
+                key="supplier_only_template_upload",
+            )
+
+            template_file: Optional[io.BytesIO] = None
+            if uploaded_template is not None:
+                offer_storage.save_template(uploaded_template)
+                template_file = uploaded_template
+            elif selected_template_name:
+                try:
+                    template_file = offer_storage.load_template(selected_template_name)
+                except FileNotFoundError:
+                    st.warning(
+                        f"Uloženou šablonu '{selected_template_name}' se nepodařilo načíst."
+                    )
+
+            if template_file is None:
+                st.info(
+                    "Pro kontrolu úprav dodavatelů nahraj prázdnou referenční šablonu."
                 )
-                if not isinstance(template_table, pd.DataFrame) or template_table.empty:
-                    st.warning("Vybraný list šablony je prázdný.")
+            else:
+                template_wb = read_workbook(template_file)
+                template_sheets = list(template_wb.sheets.keys())
+                if not template_sheets:
+                    st.warning("Nahraná šablona neobsahuje žádné listy.")
                 else:
-                    template_working = template_table.copy()
-                    if "is_summary" in template_working.columns:
-                        summary_mask = (
-                            template_working["is_summary"].fillna(False).astype(bool)
-                        )
-                        include_summary_other = summary_rows_included_as_items(
-                            template_working
-                        )
-                        if isinstance(include_summary_other, pd.Series):
-                            summary_mask &= ~include_summary_other.reindex(
-                                template_working.index, fill_value=False
-                            )
-                        template_working = template_working[~summary_mask].copy()
-                    prepared_template = _prepare_table_for_join(template_working)
-                    template_ready = True
-                    if prepared_template.empty:
-                        st.warning(
-                            "Vybraný list šablony neobsahuje žádné položky s popisem k porovnání."
-                        )
-                        template_ready = False
+                    default_template_sheet = (
+                        selected_sheet
+                        if selected_sheet in template_sheets
+                        else template_sheets[0]
+                    )
+                    template_sheet = st.selectbox(
+                        "List v šabloně",
+                        template_sheets,
+                        index=template_sheets.index(default_template_sheet)
+                        if default_template_sheet in template_sheets
+                        else 0,
+                        key="supplier_only_template_sheet",
+                    )
+                    template_obj = template_wb.sheets.get(template_sheet, {})
+                    template_table = (
+                        template_obj.get("table") if isinstance(template_obj, dict) else None
+                    )
+                    if not isinstance(template_table, pd.DataFrame) or template_table.empty:
+                        st.warning("Vybraný list šablony je prázdný.")
                     else:
-                        required_template_columns = {"__join_key__", "code", "description"}
-                        missing_template_columns = required_template_columns.difference(
-                            prepared_template.columns
-                        )
-                        if missing_template_columns:
-                            missing_readable = ", ".join(sorted(missing_template_columns))
+                        template_working = template_table.copy()
+                        if "is_summary" in template_working.columns:
+                            summary_mask = (
+                                template_working["is_summary"].fillna(False).astype(bool)
+                            )
+                            include_summary_other = summary_rows_included_as_items(
+                                template_working
+                            )
+                            if isinstance(include_summary_other, pd.Series):
+                                summary_mask &= ~include_summary_other.reindex(
+                                    template_working.index, fill_value=False
+                                )
+                            template_working = template_working[~summary_mask].copy()
+                        prepared_template = _prepare_table_for_join(template_working)
+                        template_ready = True
+                        if prepared_template.empty:
                             st.warning(
-                                "Šablonu se nepodařilo zpracovat. Chybějící sloupce: "
-                                f"{missing_readable}."
+                                "Vybraný list šablony neobsahuje žádné položky s popisem k porovnání."
                             )
                             template_ready = False
-
-                    if template_ready:
-                        template_keys = set(
-                            prepared_template.get("__join_key__", pd.Series(dtype=str))
-                            .astype(str)
-                            .tolist()
-                        )
-
-                        diff_rows: List[Dict[str, Any]] = []
-                        for supplier in dataset.supplier_order:
-                            supplier_keys = set(
-                                dataset.long_df.loc[
-                                    dataset.long_df["supplier"] == supplier, "join_key"
-                                ].astype(str)
+                        else:
+                            required_template_columns = {"__join_key__", "code", "description"}
+                            missing_template_columns = required_template_columns.difference(
+                                prepared_template.columns
                             )
-                            missing_keys = sorted(template_keys - supplier_keys)
-                            new_keys = sorted(supplier_keys - template_keys)
-                            diff_rows.append(
-                                {
-                                    "Dodavatel": supplier,
-                                    "Chybějící položky": len(missing_keys),
-                                    "Nové položky": len(new_keys),
-                                }
+                            if missing_template_columns:
+                                missing_readable = ", ".join(sorted(missing_template_columns))
+                                st.warning(
+                                    "Šablonu se nepodařilo zpracovat. Chybějící sloupce: "
+                                    f"{missing_readable}."
+                                )
+                                template_ready = False
+
+                        if template_ready:
+                            template_keys = set(
+                                prepared_template.get("__join_key__", pd.Series(dtype=str))
+                                .astype(str)
+                                .tolist()
                             )
 
-                        diff_df = pd.DataFrame(diff_rows)
-                        st.dataframe(diff_df, use_container_width=True)
+                            diff_rows: List[Dict[str, Any]] = []
+                            for supplier in dataset.supplier_order:
+                                supplier_keys = set(
+                                    dataset.long_df.loc[
+                                        dataset.long_df["supplier"] == supplier, "join_key"
+                                    ].astype(str)
+                                )
+                                missing_keys = sorted(template_keys - supplier_keys)
+                                new_keys = sorted(supplier_keys - template_keys)
+                                diff_rows.append(
+                                    {
+                                        "Dodavatel": supplier,
+                                        "Chybějící položky": len(missing_keys),
+                                        "Nové položky": len(new_keys),
+                                    }
+                                )
 
-                        for supplier in dataset.supplier_order:
-                            supplier_keys = set(
-                                dataset.long_df.loc[
-                                    dataset.long_df["supplier"] == supplier, "join_key"
-                                ].astype(str)
-                            )
-                            missing_keys = sorted(template_keys - supplier_keys)
-                            new_keys = sorted(supplier_keys - template_keys)
-                            if not missing_keys and not new_keys:
-                                continue
-                            with st.expander(f"Detail změn — {supplier}"):
-                                if missing_keys:
-                                    missing_df = prepared_template[
-                                        prepared_template["__join_key__"].astype(str).isin(
-                                            missing_keys
+                            diff_df = pd.DataFrame(diff_rows)
+                            st.dataframe(diff_df, use_container_width=True)
+
+                            for supplier in dataset.supplier_order:
+                                supplier_keys = set(
+                                    dataset.long_df.loc[
+                                        dataset.long_df["supplier"] == supplier, "join_key"
+                                    ].astype(str)
+                                )
+                                missing_keys = sorted(template_keys - supplier_keys)
+                                new_keys = sorted(supplier_keys - template_keys)
+                                if not missing_keys and not new_keys:
+                                    continue
+                                with st.expander(f"Detail změn — {supplier}"):
+                                    if missing_keys:
+                                        missing_df = prepared_template[
+                                            prepared_template["__join_key__"].astype(str).isin(
+                                                missing_keys
+                                            )
+                                        ][["code", "description"]].copy()
+                                        missing_df.rename(
+                                            columns={"code": "Kód", "description": "Popis"},
+                                            inplace=True,
                                         )
-                                    ][["code", "description"]].copy()
-                                    missing_df.rename(
-                                        columns={"code": "Kód", "description": "Popis"},
-                                        inplace=True,
-                                    )
-                                    st.markdown("**Položky chybějící oproti šabloně**")
-                                    st.dataframe(missing_df, use_container_width=True)
-                                if new_keys:
-                                    new_df = dataset.long_df[
-                                        dataset.long_df["join_key"].isin(new_keys)
-                                        & (dataset.long_df["supplier"] == supplier)
-                                    ][["code", "description", "total"]]
-                                    new_df = new_df.rename(
-                                        columns={
-                                            "code": "Kód",
-                                            "description": "Popis",
-                                            "total": f"Cena ({currency})",
-                                        }
-                                    )
-                                    st.markdown("**Položky navíc oproti šabloně**")
-                                    st.dataframe(new_df, use_container_width=True)
+                                        st.markdown("**Položky chybějící oproti šabloně**")
+                                        st.dataframe(missing_df, use_container_width=True)
+                                    if new_keys:
+                                        new_df = dataset.long_df[
+                                            dataset.long_df["join_key"].isin(new_keys)
+                                            & (dataset.long_df["supplier"] == supplier)
+                                        ][["code", "description", "total"]]
+                                        new_df = new_df.rename(
+                                            columns={
+                                                "code": "Kód",
+                                                "description": "Popis",
+                                                "total": f"Cena ({currency})",
+                                            }
+                                        )
+                                        st.markdown("**Položky navíc oproti šabloně**")
+                                        st.dataframe(new_df, use_container_width=True)
 
     with tab_compare:
         st.subheader("Porovnání dvou dodavatelů")
-        if len(dataset.supplier_order) < 2:
+        if not dataset_ready:
+            st.info("Vybraný list neobsahuje žádné položky ke zpracování.")
+        elif len(dataset.supplier_order) < 2:
             st.info("Pro porovnání jsou potřeba alespoň dvě nabídky.")
         else:
             col_left, col_right = st.columns(2)
@@ -5648,68 +5667,78 @@ def run_supplier_only_comparison(offer_storage: OfferStorage) -> None:
 
     with tab_curve:
         st.subheader("Spojitá nabídková křivka")
-        chart_records: List[Dict[str, Any]] = []
-        for supplier in dataset.supplier_order:
-            series = dataset.totals_wide.get(supplier)
-            if series is None:
-                continue
-            ordered = pd.to_numeric(series.reindex(consensus_index), errors="coerce").fillna(0)
-            cumulative = ordered.cumsum()
-            for pos, (key, total_value, cumulative_value) in enumerate(
-                zip(consensus_index, ordered, cumulative), start=1
-            ):
-                chart_records.append(
-                    {
-                        "Dodavatel": supplier,
-                        "Pozice": pos,
-                        "Kumulativní cena": cumulative_value,
-                        "Cena položky": total_value,
-                        "Položka": consensus_df.loc[key, "description"],
-                    }
-                )
-
-        chart_df = pd.DataFrame(chart_records)
-        if chart_df.empty:
+        if not dataset_ready or consensus_df.empty:
             st.info("Pro graf je potřeba alespoň jedna položka s cenou.")
         else:
-            fig = px.line(
-                chart_df,
-                x="Pozice",
-                y="Kumulativní cena",
-                color="Dodavatel",
-                hover_data=["Položka", "Cena položky"],
-            )
-            for trace in fig.data:
-                color = color_map.get(trace.name)
-                if color:
-                    trace.line.color = color
-            st.plotly_chart(fig, use_container_width=True)
+            chart_records: List[Dict[str, Any]] = []
+            for supplier in dataset.supplier_order:
+                series = dataset.totals_wide.get(supplier)
+                if series is None:
+                    continue
+                ordered = pd.to_numeric(
+                    series.reindex(consensus_index), errors="coerce"
+                ).fillna(0)
+                cumulative = ordered.cumsum()
+                for pos, (key, total_value, cumulative_value) in enumerate(
+                    zip(consensus_index, ordered, cumulative), start=1
+                ):
+                    chart_records.append(
+                        {
+                            "Dodavatel": supplier,
+                            "Pozice": pos,
+                            "Kumulativní cena": cumulative_value,
+                            "Cena položky": total_value,
+                            "Položka": consensus_df.loc[key, "description"],
+                        }
+                    )
+
+            chart_df = pd.DataFrame(chart_records)
+            if chart_df.empty:
+                st.info("Pro graf je potřeba alespoň jedna položka s cenou.")
+            else:
+                fig = px.line(
+                    chart_df,
+                    x="Pozice",
+                    y="Kumulativní cena",
+                    color="Dodavatel",
+                    hover_data=["Položka", "Cena položky"],
+                )
+                for trace in fig.data:
+                    color = color_map.get(trace.name)
+                    if color:
+                        trace.line.color = color
+                st.plotly_chart(fig, use_container_width=True)
 
     with tab_recap:
         st.subheader("Souhrnné vyhodnocení")
-        summary_df = build_supplier_only_summary(dataset)
-        if summary_df.empty:
-            st.info("Souhrn nelze zobrazit, protože chybí hodnoty k porovnání.")
-        else:
-            st.dataframe(
-                summary_df.style.format(
-                    {
-                        "Celkem": lambda x: format_currency_label(x, currency),
-                        "Delta vs nejlevnější": lambda x: format_currency_label(x, currency),
-                        "Delta vs medián": lambda x: format_currency_label(x, currency),
-                        "Podíl položek": lambda x: f"{float(x):.1f} %"
-                        if pd.notna(x)
-                        else "–",
-                        "Mediánová odchylka (%)": lambda x: f"{float(x):+.1f} %"
-                        if pd.notna(x)
-                        else "–",
-                        "Položky nad prahem (%)": lambda x: f"{float(x):.1f} %"
-                        if pd.notna(x)
-                        else "–",
-                    }
-                ),
-                use_container_width=True,
+        if not dataset_ready:
+            st.info(
+                "Souhrn nelze zobrazit, protože vybraný list neobsahuje žádné položky ke zpracování."
             )
+        else:
+            summary_df = build_supplier_only_summary(dataset)
+            if summary_df.empty:
+                st.info("Souhrn nelze zobrazit, protože chybí hodnoty k porovnání.")
+            else:
+                st.dataframe(
+                    summary_df.style.format(
+                        {
+                            "Celkem": lambda x: format_currency_label(x, currency),
+                            "Delta vs nejlevnější": lambda x: format_currency_label(x, currency),
+                            "Delta vs medián": lambda x: format_currency_label(x, currency),
+                            "Podíl položek": lambda x: f"{float(x):.1f} %"
+                            if pd.notna(x)
+                            else "–",
+                            "Mediánová odchylka (%)": lambda x: f"{float(x):+.1f} %"
+                            if pd.notna(x)
+                            else "–",
+                            "Položky nad prahem (%)": lambda x: f"{float(x):.1f} %"
+                            if pd.notna(x)
+                            else "–",
+                        }
+                    ),
+                    use_container_width=True,
+                )
 
 def validate_totals(df: pd.DataFrame) -> float:
     """Return cumulative absolute difference between summaries and items.
