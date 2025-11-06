@@ -5496,69 +5496,89 @@ def run_supplier_only_comparison(offer_storage: OfferStorage) -> None:
                             )
                         template_working = template_working[~summary_mask].copy()
                     prepared_template = _prepare_table_for_join(template_working)
-                    template_keys = set(
-                        prepared_template.get("__join_key__", pd.Series(dtype=str))
-                        .astype(str)
-                        .tolist()
-                    )
-
-                    diff_rows: List[Dict[str, Any]] = []
-                    for supplier in dataset.supplier_order:
-                        supplier_keys = set(
-                            dataset.long_df.loc[
-                                dataset.long_df["supplier"] == supplier, "join_key"
-                            ].astype(str)
+                    template_ready = True
+                    if prepared_template.empty:
+                        st.warning(
+                            "Vybraný list šablony neobsahuje žádné položky s popisem k porovnání."
                         )
-                        missing_keys = sorted(template_keys - supplier_keys)
-                        new_keys = sorted(supplier_keys - template_keys)
-                        diff_rows.append(
-                            {
-                                "Dodavatel": supplier,
-                                "Chybějící položky": len(missing_keys),
-                                "Nové položky": len(new_keys),
-                            }
+                        template_ready = False
+                    else:
+                        required_template_columns = {"__join_key__", "code", "description"}
+                        missing_template_columns = required_template_columns.difference(
+                            prepared_template.columns
+                        )
+                        if missing_template_columns:
+                            missing_readable = ", ".join(sorted(missing_template_columns))
+                            st.warning(
+                                "Šablonu se nepodařilo zpracovat. Chybějící sloupce: "
+                                f"{missing_readable}."
+                            )
+                            template_ready = False
+
+                    if template_ready:
+                        template_keys = set(
+                            prepared_template.get("__join_key__", pd.Series(dtype=str))
+                            .astype(str)
+                            .tolist()
                         )
 
-                    diff_df = pd.DataFrame(diff_rows)
-                    st.dataframe(diff_df, use_container_width=True)
+                        diff_rows: List[Dict[str, Any]] = []
+                        for supplier in dataset.supplier_order:
+                            supplier_keys = set(
+                                dataset.long_df.loc[
+                                    dataset.long_df["supplier"] == supplier, "join_key"
+                                ].astype(str)
+                            )
+                            missing_keys = sorted(template_keys - supplier_keys)
+                            new_keys = sorted(supplier_keys - template_keys)
+                            diff_rows.append(
+                                {
+                                    "Dodavatel": supplier,
+                                    "Chybějící položky": len(missing_keys),
+                                    "Nové položky": len(new_keys),
+                                }
+                            )
 
-                    for supplier in dataset.supplier_order:
-                        supplier_keys = set(
-                            dataset.long_df.loc[
-                                dataset.long_df["supplier"] == supplier, "join_key"
-                            ].astype(str)
-                        )
-                        missing_keys = sorted(template_keys - supplier_keys)
-                        new_keys = sorted(supplier_keys - template_keys)
-                        if not missing_keys and not new_keys:
-                            continue
-                        with st.expander(f"Detail změn — {supplier}"):
-                            if missing_keys:
-                                missing_df = prepared_template[
-                                    prepared_template["__join_key__"].astype(str).isin(
-                                        missing_keys
+                        diff_df = pd.DataFrame(diff_rows)
+                        st.dataframe(diff_df, use_container_width=True)
+
+                        for supplier in dataset.supplier_order:
+                            supplier_keys = set(
+                                dataset.long_df.loc[
+                                    dataset.long_df["supplier"] == supplier, "join_key"
+                                ].astype(str)
+                            )
+                            missing_keys = sorted(template_keys - supplier_keys)
+                            new_keys = sorted(supplier_keys - template_keys)
+                            if not missing_keys and not new_keys:
+                                continue
+                            with st.expander(f"Detail změn — {supplier}"):
+                                if missing_keys:
+                                    missing_df = prepared_template[
+                                        prepared_template["__join_key__"].astype(str).isin(
+                                            missing_keys
+                                        )
+                                    ][["code", "description"]].copy()
+                                    missing_df.rename(
+                                        columns={"code": "Kód", "description": "Popis"},
+                                        inplace=True,
                                     )
-                                ][["code", "description"]].copy()
-                                missing_df.rename(
-                                    columns={"code": "Kód", "description": "Popis"},
-                                    inplace=True,
-                                )
-                                st.markdown("**Položky chybějící oproti šabloně**")
-                                st.dataframe(missing_df, use_container_width=True)
-                            if new_keys:
-                                new_df = dataset.long_df[
-                                    dataset.long_df["join_key"].isin(new_keys)
-                                    & (dataset.long_df["supplier"] == supplier)
-                                ][["code", "description", "total"]]
-                                new_df = new_df.rename(
-                                    columns={
-                                        "code": "Kód",
-                                        "description": "Popis",
-                                        "total": f"Cena ({currency})",
-                                    }
-                                )
-                                st.markdown("**Položky navíc oproti šabloně**")
-                                st.dataframe(new_df, use_container_width=True)
+                                    st.markdown("**Položky chybějící oproti šabloně**")
+                                    st.dataframe(missing_df, use_container_width=True)
+                                if new_keys:
+                                    new_df = dataset.long_df[
+                                        dataset.long_df["join_key"].isin(new_keys)
+                                        & (dataset.long_df["supplier"] == supplier)
+                                    ][["code", "description", "total"]]
+                                    new_df = new_df.rename(
+                                        columns={
+                                            "code": "Kód",
+                                            "description": "Popis",
+                                            "total": f"Cena ({currency})",
+                                        }
+                                    )
+                                    st.markdown("**Položky navíc oproti šabloně**")
+                                    st.dataframe(new_df, use_container_width=True)
 
     with tab_compare:
         st.subheader("Porovnání dvou dodavatelů")
