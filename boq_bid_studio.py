@@ -479,6 +479,18 @@ class ComparisonDataset:
     supplier_join_key_map: Dict[str, pd.Series]
 
 
+@dataclass
+class SupplierOnlyDataset:
+    sheet: str
+    long_df: pd.DataFrame
+    totals_wide: pd.DataFrame
+    consensus_df: pd.DataFrame
+    supplier_order: List[str]
+
+
+SUPPLIER_ONLY_DEVIATION_THRESHOLD = 0.1
+
+
 def is_master_column(column_name: str) -> bool:
     """Return True if the provided column represents Master totals."""
 
@@ -619,6 +631,247 @@ def normalize_join_value(value: Any) -> str:
     return collapsed.strip().lower()
 
 
+def _first_nonempty(values: Iterable[Any]) -> Any:
+    for value in values:
+        if isinstance(value, str):
+            text = value.strip()
+            if text:
+                return value
+        elif pd.notna(value):
+            return value
+    return ""
+
+
+def build_supplier_only_dataset(
+    sheet: str,
+    bids: Mapping[str, WorkbookData],
+    alias_map: Mapping[str, str],
+) -> SupplierOnlyDataset:
+    records: List[Dict[str, Any]] = []
+    supplier_order: List[str] = []
+
+    for raw_name, wb in bids.items():
+        alias = alias_map.get(raw_name, raw_name)
+        if alias not in supplier_order:
+            supplier_order.append(alias)
+        sheet_obj = wb.sheets.get(sheet, {}) if isinstance(wb, WorkbookData) else {}
+        table = sheet_obj.get("table") if isinstance(sheet_obj, dict) else None
+        if not isinstance(table, pd.DataFrame) or table.empty:
+            continue
+        working = table.copy()
+        if "is_summary" in working.columns:
+            summary_mask = working["is_summary"].fillna(False).astype(bool)
+            include_summary_other = summary_rows_included_as_items(working)
+            if isinstance(include_summary_other, pd.Series):
+                summary_mask &= ~include_summary_other.reindex(
+                    working.index, fill_value=False
+                )
+            working = working[~summary_mask].copy()
+        if "__key__" not in working.columns:
+            working["__key__"] = np.arange(len(working))
+        prepared = _prepare_table_for_join(working)
+        if prepared.empty:
+            continue
+
+        sort_series = pd.to_numeric(prepared.get("__sort_order__"), errors="coerce")
+        if sort_series.isna().all():
+            sort_series = pd.Series(
+                np.arange(len(prepared)), index=prepared.index, dtype=float
+            )
+
+        total_series = pd.to_numeric(prepared.get("total_price"), errors="coerce")
+        quantity_series = pd.to_numeric(prepared.get("quantity"), errors="coerce")
+
+        for idx, row in prepared.iterrows():
+            join_key = row.get("__join_key__")
+            if join_key is None or pd.isna(join_key) or not str(join_key).strip():
+                join_key = f"{alias}_{idx}"
+            record = {
+                "join_key": str(join_key),
+                "supplier": alias,
+                "code": row.get("code", ""),
+                "description": row.get("description", ""),
+                "unit": row.get("unit", ""),
+                "quantity": quantity_series.loc[idx]
+                if idx in quantity_series.index
+                else np.nan,
+                "total": total_series.loc[idx]
+                if idx in total_series.index
+                else np.nan,
+                "source_order": sort_series.loc[idx]
+                if idx in sort_series.index
+                else np.nan,
+            }
+            records.append(record)
+
+    long_df = pd.DataFrame(records)
+    if long_df.empty:
+        return SupplierOnlyDataset(
+            sheet=sheet,
+            long_df=pd.DataFrame(),
+            totals_wide=pd.DataFrame(),
+            consensus_df=pd.DataFrame(),
+            supplier_order=[],
+        )
+
+    long_df["total"] = pd.to_numeric(long_df.get("total"), errors="coerce")
+    long_df["quantity"] = pd.to_numeric(long_df.get("quantity"), errors="coerce")
+    long_df["source_order"] = pd.to_numeric(
+        long_df.get("source_order"), errors="coerce"
+    )
+
+    supplier_present = long_df["supplier"].dropna().unique().tolist()
+    supplier_order = [
+        supplier for supplier in supplier_order if supplier in supplier_present
+    ]
+
+    grouped = long_df.groupby("join_key", sort=False)
+    consensus_records: List[Dict[str, Any]] = []
+
+    for join_key, group in grouped:
+        totals_numeric = pd.to_numeric(group.get("total"), errors="coerce")
+        totals_numeric = totals_numeric.dropna()
+        best_supplier = ""
+        best_value = np.nan
+        if not totals_numeric.empty:
+            min_idx = totals_numeric.idxmin()
+            min_row = group.loc[min_idx]
+            best_supplier = str(min_row.get("supplier", ""))
+            best_value = float(totals_numeric.loc[min_idx])
+        median_total = float(totals_numeric.median()) if not totals_numeric.empty else np.nan
+        mean_total = float(totals_numeric.mean()) if not totals_numeric.empty else np.nan
+        min_total = float(totals_numeric.min()) if not totals_numeric.empty else np.nan
+        max_total = float(totals_numeric.max()) if not totals_numeric.empty else np.nan
+        order_hint = pd.to_numeric(group.get("source_order"), errors="coerce")
+        order_value = float(order_hint.median()) if order_hint.notna().any() else np.nan
+
+        consensus_records.append(
+            {
+                "join_key": join_key,
+                "code": _first_nonempty(group.get("code", [])),
+                "description": _first_nonempty(group.get("description", [])),
+                "unit": _first_nonempty(group.get("unit", [])),
+                "median_total": median_total,
+                "mean_total": mean_total,
+                "min_total": min_total,
+                "max_total": max_total,
+                "supplier_count": int(group["supplier"].nunique()),
+                "best_supplier": best_supplier,
+                "best_total": best_value,
+                "order_hint": order_value,
+            }
+        )
+
+    consensus_df = pd.DataFrame(consensus_records).set_index("join_key")
+    if not consensus_df.empty:
+        consensus_df["spread_total"] = (
+            consensus_df["max_total"] - consensus_df["min_total"]
+        )
+        with np.errstate(divide="ignore", invalid="ignore"):
+            consensus_df["variation_pct"] = (
+                consensus_df["spread_total"] / consensus_df["median_total"].abs()
+            )
+        order_series = pd.to_numeric(consensus_df.get("order_hint"), errors="coerce")
+        if order_series.notna().any():
+            consensus_df = consensus_df.sort_values(
+                by="order_hint", kind="stable"
+            )
+        else:
+            consensus_df = consensus_df.sort_values(
+                by=["code", "description"], kind="stable"
+            )
+        consensus_df["order"] = np.arange(1, len(consensus_df) + 1)
+    else:
+        consensus_df["order"] = []
+
+    totals_wide = long_df.pivot_table(
+        index="join_key",
+        columns="supplier",
+        values="total",
+        aggfunc="sum",
+    )
+    if not totals_wide.empty:
+        totals_wide = totals_wide.reindex(columns=supplier_order)
+
+    return SupplierOnlyDataset(
+        sheet=sheet,
+        long_df=long_df,
+        totals_wide=totals_wide,
+        consensus_df=consensus_df,
+        supplier_order=supplier_order,
+    )
+
+
+def build_supplier_only_summary(
+    dataset: SupplierOnlyDataset,
+    *,
+    deviation_threshold: float = SUPPLIER_ONLY_DEVIATION_THRESHOLD,
+) -> pd.DataFrame:
+    if dataset.consensus_df.empty or dataset.totals_wide.empty:
+        return pd.DataFrame(
+            columns=[
+                "Dodavatel",
+                "Celkem",
+                "Počet položek",
+                "Podíl položek",
+                "Mediánová odchylka (%)",
+                "Položky nad prahem (%)",
+            ]
+        )
+
+    median_series = pd.to_numeric(
+        dataset.consensus_df.get("median_total"), errors="coerce"
+    )
+    results: List[Dict[str, Any]] = []
+    total_items = int(len(dataset.consensus_df)) if len(dataset.consensus_df) else 0
+
+    for supplier in dataset.supplier_order:
+        supplier_totals = dataset.totals_wide.get(supplier)
+        if supplier_totals is None:
+            continue
+        supplier_totals = pd.to_numeric(supplier_totals, errors="coerce")
+        coverage = int(supplier_totals.notna().sum())
+        sum_total = float(supplier_totals.sum(min_count=1)) if coverage else np.nan
+        share = (coverage / total_items * 100.0) if total_items else np.nan
+        diff_pct = pd.Series(np.nan, index=supplier_totals.index)
+        if not median_series.empty:
+            baseline = median_series.reindex(supplier_totals.index)
+            with np.errstate(divide="ignore", invalid="ignore"):
+                diff_pct = (supplier_totals - baseline) / baseline
+            diff_pct[~np.isfinite(diff_pct)] = np.nan
+        median_diff_pct = (
+            float(diff_pct.median(skipna=True) * 100.0)
+            if diff_pct.dropna().any()
+            else np.nan
+        )
+        threshold_share = (
+            float((diff_pct.abs() > deviation_threshold).mean() * 100.0)
+            if diff_pct.dropna().any()
+            else np.nan
+        )
+        results.append(
+            {
+                "Dodavatel": supplier,
+                "Celkem": sum_total,
+                "Počet položek": coverage,
+                "Podíl položek": share,
+                "Mediánová odchylka (%)": median_diff_pct,
+                "Položky nad prahem (%)": threshold_share,
+            }
+        )
+
+    summary_df = pd.DataFrame(results)
+    if summary_df.empty:
+        return summary_df
+
+    summary_df.sort_values(by="Celkem", inplace=True, na_position="last")
+    summary_df.reset_index(drop=True, inplace=True)
+    best_total = summary_df["Celkem"].dropna().min()
+    median_total = summary_df["Celkem"].dropna().median()
+    summary_df["Delta vs nejlevnější"] = summary_df["Celkem"] - best_total
+    summary_df["Delta vs medián"] = summary_df["Celkem"] - median_total
+    summary_df["Pořadí"] = summary_df["Celkem"].rank(method="min")
+    return summary_df
 def normalize_identifier(values: Any) -> pd.Series:
     """Return normalized textual identifiers for row-level matching."""
 
@@ -1392,7 +1645,7 @@ class OfferStorage:
 
     def _load_index(self) -> Dict[str, Dict[str, Any]]:
         if not self.index_file.exists():
-            return {"master": {}, "bids": {}}
+            return {"master": {}, "bids": {}, "templates": {}}
         try:
             with self.index_file.open("r", encoding="utf-8") as handle:
                 data = json.load(handle)
@@ -1402,6 +1655,7 @@ class OfferStorage:
             return {"master": {}, "bids": {}}
         data.setdefault("master", {})
         data.setdefault("bids", {})
+        data.setdefault("templates", {})
         return data  # type: ignore[return-value]
 
     def _write_index(self) -> None:
@@ -1488,7 +1742,7 @@ class OfferStorage:
 
     def _cleanup_missing(self) -> None:
         changed = False
-        for category in ("master", "bids"):
+        for category in ("master", "bids", "templates"):
             entries = self._index.get(category, {})
             for name, meta in list(entries.items()):
                 path = self._category_dir(category) / meta.get("path", "")
@@ -1508,17 +1762,28 @@ class OfferStorage:
         self._write_file("bids", name, file_obj)
         return name
 
+    def save_template(self, file_obj: Any, *, display_name: Optional[str] = None) -> str:
+        name = display_name or getattr(file_obj, "name", "Template.xlsx")
+        self._write_file("templates", name, file_obj)
+        return name
+
     def load_master(self, display_name: str) -> io.BytesIO:
         return self._load_file("master", display_name)
 
     def load_bid(self, display_name: str) -> io.BytesIO:
         return self._load_file("bids", display_name)
 
+    def load_template(self, display_name: str) -> io.BytesIO:
+        return self._load_file("templates", display_name)
+
     def delete_master(self, display_name: str) -> bool:
         return self._delete_file("master", display_name)
 
     def delete_bid(self, display_name: str) -> bool:
         return self._delete_file("bids", display_name)
+
+    def delete_template(self, display_name: str) -> bool:
+        return self._delete_file("templates", display_name)
 
     def list_entries(self, category: str) -> List[Dict[str, Any]]:
         entries = self._index.get(category, {})
@@ -1540,6 +1805,9 @@ class OfferStorage:
 
     def list_bids(self) -> List[Dict[str, Any]]:
         return self.list_entries("bids")
+
+    def list_templates(self) -> List[Dict[str, Any]]:
+        return self.list_entries("templates")
 
 
 def format_timestamp(timestamp: Optional[float]) -> str:
@@ -4930,6 +5198,499 @@ def convert_detail_groups(
     return converted
 
 
+def run_supplier_only_comparison(offer_storage: OfferStorage) -> None:
+    st.sidebar.header("Vstupy")
+    st.sidebar.caption(
+        "Režim bez Master BoQ — nahraj pouze nabídky dodavatelů."
+    )
+
+    stored_bid_entries = offer_storage.list_bids()
+    bid_files: List[Any] = []
+
+    uploaded_bids = st.sidebar.file_uploader(
+        "Nabídky dodavatelů (max 7)",
+        type=["xlsx", "xlsm"],
+        accept_multiple_files=True,
+        key="supplier_only_bids",
+    )
+    if uploaded_bids:
+        uploaded_bids = list(uploaded_bids)
+        if len(uploaded_bids) > 7:
+            st.sidebar.warning("Zpracuje se pouze prvních 7 souborů.")
+            uploaded_bids = uploaded_bids[:7]
+        for file_obj in uploaded_bids:
+            offer_storage.save_bid(file_obj)
+            bid_files.append(file_obj)
+
+    if stored_bid_entries:
+        bid_display_map: Dict[str, str] = {}
+        bid_options: List[str] = []
+        for entry in stored_bid_entries:
+            bid_options.append(entry["name"])
+            timestamp = format_timestamp(entry.get("updated_at"))
+            bid_display_map[entry["name"]] = (
+                f"{entry['name']} ({timestamp})" if timestamp else entry["name"]
+            )
+        selected_stored = st.sidebar.multiselect(
+            "Přidat uložené nabídky",
+            bid_options,
+            format_func=lambda value: bid_display_map.get(value, value),
+            key="supplier_only_stored_bids",
+        )
+        for name in selected_stored:
+            try:
+                bid_files.append(offer_storage.load_bid(name))
+            except FileNotFoundError:
+                st.sidebar.warning(
+                    f"Uloženou nabídku '{name}' se nepodařilo načíst."
+                )
+
+    if len(bid_files) > 7:
+        st.sidebar.warning("Bylo vybráno více než 7 nabídek, zpracuje se prvních 7.")
+        bid_files = bid_files[:7]
+
+    currency = st.sidebar.text_input(
+        "Popisek měny",
+        value="CZK",
+        key="supplier_only_currency",
+    )
+
+    bids_dict: Dict[str, WorkbookData] = {}
+    if not bid_files:
+        st.info("➡️ Nahraj alespoň jednu nabídku dodavatele v levém panelu.")
+        return
+
+    for i, file_obj in enumerate(bid_files, start=1):
+        name = getattr(file_obj, "name", f"Bid{i}")
+        if hasattr(file_obj, "seek"):
+            try:
+                file_obj.seek(0)
+            except Exception:
+                pass
+        wb = read_workbook(file_obj)
+        bids_dict[name] = wb
+
+    if not bids_dict:
+        st.info("Nepodařilo se načíst žádnou nabídku.")
+        return
+
+    if "supplier_only_metadata" not in st.session_state:
+        st.session_state["supplier_only_metadata"] = {}
+    metadata: Dict[str, Dict[str, str]] = st.session_state["supplier_only_metadata"]
+
+    current_suppliers = list(bids_dict.keys())
+    for obsolete in list(metadata.keys()):
+        if obsolete not in current_suppliers:
+            metadata.pop(obsolete, None)
+
+    palette = (
+        px.colors.qualitative.Plotly
+        + px.colors.qualitative.Safe
+        + px.colors.qualitative.Pastel
+    )
+
+    for idx, raw_name in enumerate(current_suppliers):
+        entry = metadata.get(raw_name, {})
+        if not entry.get("alias"):
+            entry["alias"] = supplier_default_alias(raw_name)
+        if not entry.get("color"):
+            entry["color"] = palette[idx % len(palette)]
+        metadata[raw_name] = entry
+
+    with st.sidebar.expander("Alias a barvy dodavatelů", expanded=True):
+        st.caption(
+            "Zkrácený název a barva se promítnou do tabulek a grafů v tomto režimu."
+        )
+        for raw_name in current_suppliers:
+            entry = metadata.get(raw_name, {})
+            alias_value = st.text_input(
+                f"Alias pro {raw_name}",
+                value=entry.get("alias", supplier_default_alias(raw_name)),
+                key=sanitize_key("supplier_only_alias", raw_name),
+            )
+            alias_clean = alias_value.strip() or supplier_default_alias(raw_name)
+            color_default = entry.get("color", "#1f77b4")
+            color_value = st.color_picker(
+                f"Barva — {alias_clean}",
+                value=color_default,
+                key=sanitize_key("supplier_only_color", raw_name),
+            )
+            metadata[raw_name]["alias"] = alias_clean
+            metadata[raw_name]["color"] = color_value or color_default
+
+    display_names = {raw: metadata[raw]["alias"] for raw in current_suppliers}
+    display_names = ensure_unique_aliases(display_names)
+    for raw, alias in display_names.items():
+        metadata[raw]["alias_display"] = alias
+    st.session_state["supplier_only_metadata"] = metadata
+
+    color_map = {
+        display_names[raw]: metadata[raw]["color"]
+        for raw in current_suppliers
+        if raw in display_names
+    }
+
+    sheet_counts: Dict[str, int] = {}
+    for wb in bids_dict.values():
+        for sheet_name in wb.sheets.keys():
+            sheet_counts[sheet_name] = sheet_counts.get(sheet_name, 0) + 1
+
+    if not sheet_counts:
+        st.info("Nahrané nabídky neobsahují žádné listy k porovnání.")
+        return
+
+    sorted_sheets = sorted(
+        sheet_counts.items(), key=lambda item: (-item[1], item[0].casefold())
+    )
+    sheet_options = [item[0] for item in sorted_sheets]
+    default_sheet = next(
+        (sheet for sheet, count in sorted_sheets if count == len(bids_dict)),
+        sheet_options[0],
+    )
+    selected_sheet = st.sidebar.selectbox(
+        "List pro analýzu",
+        sheet_options,
+        index=sheet_options.index(default_sheet)
+        if default_sheet in sheet_options
+        else 0,
+        key="supplier_only_sheet",
+    )
+
+    dataset = build_supplier_only_dataset(selected_sheet, bids_dict, display_names)
+    if dataset.long_df.empty:
+        st.info("Vybraný list neobsahuje žádné položky ke zpracování.")
+        return
+
+    st.subheader("Porovnání nabídek bez Master BoQ")
+    st.markdown(
+        """
+        Tento režim vytváří referenční hodnoty na základě mediánu cen
+        jednotlivých položek napříč všemi nabídkami. Dodavatelé jsou
+        vyhodnoceni podle souhrnných cen, odchylek od mediánu a podílu
+        položek, kde odchylka překračuje 10 %.
+        """
+    )
+
+    consensus_df = dataset.consensus_df
+    consensus_index = consensus_df.index.tolist()
+
+    tab_check, tab_compare, tab_curve, tab_recap = st.tabs(
+        [
+            "🧾 Kontrola dat",
+            "⚖️ Porovnání 2",
+            "📈 Spojitá nabídková křivka",
+            "📊 Rekapitulace",
+        ]
+    )
+
+    with tab_check:
+        st.subheader("Pokrytí položek")
+        total_items = len(consensus_df)
+        coverage_rows: List[Dict[str, Any]] = []
+        for supplier in dataset.supplier_order:
+            supplier_totals = dataset.totals_wide.get(supplier)
+            if supplier_totals is None:
+                continue
+            supplier_totals = pd.to_numeric(supplier_totals, errors="coerce")
+            coverage = int(supplier_totals.notna().sum())
+            share = (coverage / total_items * 100.0) if total_items else np.nan
+            coverage_rows.append(
+                {
+                    "Dodavatel": supplier,
+                    "Počet položek": coverage,
+                    "Pokrytí (%)": share,
+                }
+            )
+        coverage_df = pd.DataFrame(coverage_rows)
+        if coverage_df.empty:
+            st.info("Pro vybraný list nejsou dostupné porovnatelné položky.")
+        else:
+            st.dataframe(
+                coverage_df.style.format(
+                    {
+                        "Pokrytí (%)": lambda x: f"{float(x):.1f} %"
+                        if pd.notna(x)
+                        else "–"
+                    }
+                ),
+                use_container_width=True,
+            )
+
+        st.markdown("### Kontrola proti prázdné šabloně")
+        stored_templates = offer_storage.list_templates()
+        template_display_map = {"": "— žádná šablona —"}
+        template_options = [""]
+        for entry in stored_templates:
+            template_options.append(entry["name"])
+            timestamp = format_timestamp(entry.get("updated_at"))
+            template_display_map[entry["name"]] = (
+                f"{entry['name']} ({timestamp})" if timestamp else entry["name"]
+            )
+
+        selected_template_name = st.selectbox(
+            "Uložená prázdná šablona",
+            template_options,
+            format_func=lambda value: template_display_map.get(value, value),
+            key="supplier_only_template_select",
+        )
+
+        uploaded_template = st.file_uploader(
+            "Nahrát prázdný BoQ",
+            type=["xlsx", "xlsm"],
+            key="supplier_only_template_upload",
+        )
+
+        template_file: Optional[io.BytesIO] = None
+        if uploaded_template is not None:
+            offer_storage.save_template(uploaded_template)
+            template_file = uploaded_template
+        elif selected_template_name:
+            try:
+                template_file = offer_storage.load_template(selected_template_name)
+            except FileNotFoundError:
+                st.warning(
+                    f"Uloženou šablonu '{selected_template_name}' se nepodařilo načíst."
+                )
+
+        if template_file is None:
+            st.info(
+                "Pro kontrolu úprav dodavatelů nahraj prázdnou referenční šablonu."
+            )
+        else:
+            template_wb = read_workbook(template_file)
+            template_sheets = list(template_wb.sheets.keys())
+            if not template_sheets:
+                st.warning("Nahraná šablona neobsahuje žádné listy.")
+            else:
+                default_template_sheet = (
+                    selected_sheet
+                    if selected_sheet in template_sheets
+                    else template_sheets[0]
+                )
+                template_sheet = st.selectbox(
+                    "List v šabloně",
+                    template_sheets,
+                    index=template_sheets.index(default_template_sheet)
+                    if default_template_sheet in template_sheets
+                    else 0,
+                    key="supplier_only_template_sheet",
+                )
+                template_obj = template_wb.sheets.get(template_sheet, {})
+                template_table = (
+                    template_obj.get("table") if isinstance(template_obj, dict) else None
+                )
+                if not isinstance(template_table, pd.DataFrame) or template_table.empty:
+                    st.warning("Vybraný list šablony je prázdný.")
+                else:
+                    template_working = template_table.copy()
+                    if "is_summary" in template_working.columns:
+                        summary_mask = (
+                            template_working["is_summary"].fillna(False).astype(bool)
+                        )
+                        include_summary_other = summary_rows_included_as_items(
+                            template_working
+                        )
+                        if isinstance(include_summary_other, pd.Series):
+                            summary_mask &= ~include_summary_other.reindex(
+                                template_working.index, fill_value=False
+                            )
+                        template_working = template_working[~summary_mask].copy()
+                    prepared_template = _prepare_table_for_join(template_working)
+                    template_keys = set(
+                        prepared_template.get("__join_key__", pd.Series(dtype=str))
+                        .astype(str)
+                        .tolist()
+                    )
+
+                    diff_rows: List[Dict[str, Any]] = []
+                    for supplier in dataset.supplier_order:
+                        supplier_keys = set(
+                            dataset.long_df.loc[
+                                dataset.long_df["supplier"] == supplier, "join_key"
+                            ].astype(str)
+                        )
+                        missing_keys = sorted(template_keys - supplier_keys)
+                        new_keys = sorted(supplier_keys - template_keys)
+                        diff_rows.append(
+                            {
+                                "Dodavatel": supplier,
+                                "Chybějící položky": len(missing_keys),
+                                "Nové položky": len(new_keys),
+                            }
+                        )
+
+                    diff_df = pd.DataFrame(diff_rows)
+                    st.dataframe(diff_df, use_container_width=True)
+
+                    for supplier in dataset.supplier_order:
+                        supplier_keys = set(
+                            dataset.long_df.loc[
+                                dataset.long_df["supplier"] == supplier, "join_key"
+                            ].astype(str)
+                        )
+                        missing_keys = sorted(template_keys - supplier_keys)
+                        new_keys = sorted(supplier_keys - template_keys)
+                        if not missing_keys and not new_keys:
+                            continue
+                        with st.expander(f"Detail změn — {supplier}"):
+                            if missing_keys:
+                                missing_df = prepared_template[
+                                    prepared_template["__join_key__"].astype(str).isin(
+                                        missing_keys
+                                    )
+                                ][["code", "description"]].copy()
+                                missing_df.rename(
+                                    columns={"code": "Kód", "description": "Popis"},
+                                    inplace=True,
+                                )
+                                st.markdown("**Položky chybějící oproti šabloně**")
+                                st.dataframe(missing_df, use_container_width=True)
+                            if new_keys:
+                                new_df = dataset.long_df[
+                                    dataset.long_df["join_key"].isin(new_keys)
+                                    & (dataset.long_df["supplier"] == supplier)
+                                ][["code", "description", "total"]]
+                                new_df = new_df.rename(
+                                    columns={
+                                        "code": "Kód",
+                                        "description": "Popis",
+                                        "total": f"Cena ({currency})",
+                                    }
+                                )
+                                st.markdown("**Položky navíc oproti šabloně**")
+                                st.dataframe(new_df, use_container_width=True)
+
+    with tab_compare:
+        st.subheader("Porovnání dvou dodavatelů")
+        if len(dataset.supplier_order) < 2:
+            st.info("Pro porovnání jsou potřeba alespoň dvě nabídky.")
+        else:
+            col_left, col_right = st.columns(2)
+            base_supplier = col_left.selectbox(
+                "Základní dodavatel",
+                dataset.supplier_order,
+                key="supplier_only_compare_base",
+            )
+            compare_candidates = [
+                supplier
+                for supplier in dataset.supplier_order
+                if supplier != base_supplier
+            ]
+            if not compare_candidates:
+                st.info("Není dostupný žádný další dodavatel k porovnání.")
+            else:
+                compare_supplier = col_right.selectbox(
+                    "Porovnat s",
+                    compare_candidates,
+                    key="supplier_only_compare_target",
+                )
+                wide_totals = dataset.totals_wide.reindex(consensus_index)
+                base_series = pd.to_numeric(
+                    wide_totals.get(base_supplier), errors="coerce"
+                )
+                compare_series = pd.to_numeric(
+                    wide_totals.get(compare_supplier), errors="coerce"
+                )
+                diff_series = compare_series - base_series
+                with np.errstate(divide="ignore", invalid="ignore"):
+                    diff_pct = diff_series / base_series
+                diff_pct[~np.isfinite(diff_pct)] = np.nan
+
+                compare_df = pd.DataFrame(
+                    {
+                        "Kód": consensus_df.get("code"),
+                        "Popis": consensus_df.get("description"),
+                        "Jednotka": consensus_df.get("unit"),
+                        f"{base_supplier} ({currency})": base_series,
+                        f"{compare_supplier} ({currency})": compare_series,
+                        "Rozdíl": diff_series,
+                        "Rozdíl (%)": diff_pct * 100.0,
+                    }
+                )
+                compare_df = compare_df.reset_index(drop=True)
+                st.dataframe(
+                    compare_df.style.format(
+                        {
+                            f"{base_supplier} ({currency})": lambda x: format_currency_label(
+                                x, currency
+                            ),
+                            f"{compare_supplier} ({currency})": lambda x: format_currency_label(
+                                x, currency
+                            ),
+                            "Rozdíl": lambda x: format_currency_label(x, currency),
+                            "Rozdíl (%)": lambda x: f"{float(x):+.1f} %"
+                            if pd.notna(x)
+                            else "–",
+                        }
+                    ),
+                    use_container_width=True,
+                )
+
+    with tab_curve:
+        st.subheader("Spojitá nabídková křivka")
+        chart_records: List[Dict[str, Any]] = []
+        for supplier in dataset.supplier_order:
+            series = dataset.totals_wide.get(supplier)
+            if series is None:
+                continue
+            ordered = pd.to_numeric(series.reindex(consensus_index), errors="coerce").fillna(0)
+            cumulative = ordered.cumsum()
+            for pos, (key, total_value, cumulative_value) in enumerate(
+                zip(consensus_index, ordered, cumulative), start=1
+            ):
+                chart_records.append(
+                    {
+                        "Dodavatel": supplier,
+                        "Pozice": pos,
+                        "Kumulativní cena": cumulative_value,
+                        "Cena položky": total_value,
+                        "Položka": consensus_df.loc[key, "description"],
+                    }
+                )
+
+        chart_df = pd.DataFrame(chart_records)
+        if chart_df.empty:
+            st.info("Pro graf je potřeba alespoň jedna položka s cenou.")
+        else:
+            fig = px.line(
+                chart_df,
+                x="Pozice",
+                y="Kumulativní cena",
+                color="Dodavatel",
+                hover_data=["Položka", "Cena položky"],
+            )
+            for trace in fig.data:
+                color = color_map.get(trace.name)
+                if color:
+                    trace.line.color = color
+            st.plotly_chart(fig, use_container_width=True)
+
+    with tab_recap:
+        st.subheader("Souhrnné vyhodnocení")
+        summary_df = build_supplier_only_summary(dataset)
+        if summary_df.empty:
+            st.info("Souhrn nelze zobrazit, protože chybí hodnoty k porovnání.")
+        else:
+            st.dataframe(
+                summary_df.style.format(
+                    {
+                        "Celkem": lambda x: format_currency_label(x, currency),
+                        "Delta vs nejlevnější": lambda x: format_currency_label(x, currency),
+                        "Delta vs medián": lambda x: format_currency_label(x, currency),
+                        "Podíl položek": lambda x: f"{float(x):.1f} %"
+                        if pd.notna(x)
+                        else "–",
+                        "Mediánová odchylka (%)": lambda x: f"{float(x):+.1f} %"
+                        if pd.notna(x)
+                        else "–",
+                        "Položky nad prahem (%)": lambda x: f"{float(x):.1f} %"
+                        if pd.notna(x)
+                        else "–",
+                    }
+                ),
+                use_container_width=True,
+            )
+
 def validate_totals(df: pd.DataFrame) -> float:
     """Return cumulative absolute difference between summaries and items.
 
@@ -5036,6 +5797,22 @@ def qa_checks(master: WorkbookData, bids: Dict[str, WorkbookData]) -> Dict[str, 
 # ------------- Sidebar Inputs -------------
 
 offer_storage = OfferStorage()
+
+comparison_mode = st.radio(
+    "Výběr režimu porovnání",
+    [
+        "Porovnání s Master BoQ",
+        "Porovnání nabídek bez Master BoQ",
+    ],
+    index=0,
+    horizontal=True,
+    key="comparison_mode_selector",
+)
+
+if comparison_mode == "Porovnání nabídek bez Master BoQ":
+    run_supplier_only_comparison(offer_storage)
+    st.stop()
+
 stored_master_entries = offer_storage.list_master()
 stored_bid_entries = offer_storage.list_bids()
 
