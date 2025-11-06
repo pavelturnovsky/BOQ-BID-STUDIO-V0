@@ -5343,15 +5343,37 @@ def run_supplier_only_comparison(offer_storage: OfferStorage) -> None:
         sheet_counts.items(), key=lambda item: (-item[1], item[0].casefold())
     )
     sheet_options = [item[0] for item in sorted_sheets]
+
+    default_compare = [
+        sheet for sheet, count in sorted_sheets if count == len(bids_dict)
+    ]
+    if not default_compare:
+        default_compare = sheet_options
+
+    compare_sheets = st.sidebar.multiselect(
+        "Listy pro porovnání",
+        sheet_options,
+        default=default_compare,
+        key="supplier_only_compare_sheets",
+    )
+
+    if not compare_sheets:
+        st.info("Vyber alespoň jeden list pro porovnání v levém panelu.")
+        return
+
     default_sheet = next(
-        (sheet for sheet, count in sorted_sheets if count == len(bids_dict)),
-        sheet_options[0],
+        (
+            sheet
+            for sheet, count in sorted_sheets
+            if sheet in compare_sheets and count == len(bids_dict)
+        ),
+        compare_sheets[0],
     )
     selected_sheet = st.sidebar.selectbox(
         "List pro analýzu",
-        sheet_options,
-        index=sheet_options.index(default_sheet)
-        if default_sheet in sheet_options
+        compare_sheets,
+        index=compare_sheets.index(default_sheet)
+        if default_sheet in compare_sheets
         else 0,
         key="supplier_only_sheet",
     )
