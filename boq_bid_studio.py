@@ -5548,6 +5548,28 @@ def run_supplier_only_comparison(offer_storage: OfferStorage) -> None:
                         key="supplier_only_template_sheet",
                     )
                     template_obj = template_wb.sheets.get(template_sheet, {})
+
+                    if isinstance(template_obj, dict):
+                        mapping_section_id = sanitize_key(
+                            "supplier_only_template_map",
+                            f"{template_wb.name}_{template_sheet}",
+                        )
+                        mapping_container = WorkbookData(
+                            name=f"{template_wb.name}__template_map",
+                            sheets={template_sheet: template_obj},
+                        )
+                        with st.expander("Mapování šablony", expanded=False):
+                            st.caption(
+                                "Pokud automatické rozpoznání nefungovalo, nastav mapování manuálně."
+                            )
+                            mapping_ui(
+                                f"Šablona — {template_sheet}",
+                                mapping_container,
+                                minimal=True,
+                                section_id=mapping_section_id,
+                            )
+
+                    template_obj = template_wb.sheets.get(template_sheet, {})
                     template_table = (
                         template_obj.get("table") if isinstance(template_obj, dict) else None
                     )
