@@ -2515,6 +2515,7 @@ def build_normalized_table(
     mapping: Dict[str, int],
     *,
     preserve_summary_totals: bool = False,
+    keep_empty_rows: bool = False,
 ) -> pd.DataFrame:
     cols = df.columns.tolist()
     def pick(mapped_key, default=None):
@@ -2597,7 +2598,9 @@ def build_normalized_table(
     summary_col = out["is_summary"].fillna(False).astype(bool)
     if isinstance(include_summary_other, pd.Series):
         summary_col &= ~include_summary_other.reindex(out.index, fill_value=False)
-    out = out[~((out[numeric_cols].isna() | (out[numeric_cols] == 0)).all(axis=1) & ~summary_col)]
+    if not keep_empty_rows and len(numeric_cols) > 0:
+        value_mask = (out[numeric_cols].isna() | (out[numeric_cols] == 0)).all(axis=1)
+        out = out[~(value_mask & ~summary_col)]
     # Canonical key (will be overridden if user picks dedicated Item ID)
     out["__key__"] = (
         out["code"].astype(str).str.strip() + " | " + desc_str.str.strip()
@@ -3505,7 +3508,28 @@ def read_workbook(upload, limit_sheets: Optional[List[str]] = None) -> WorkbookD
                 if not mapping:
                     body = fallback.copy()
 
-            tbl = build_normalized_table(body, mapping) if mapping else pd.DataFrame()
+            if mapping:
+                tbl = build_normalized_table(body, mapping)
+                needs_rebuild = False
+                if not isinstance(tbl, pd.DataFrame) or tbl.empty:
+                    needs_rebuild = True
+                else:
+                    desc_series = tbl.get("description")
+                    if isinstance(desc_series, pd.Series):
+                        normalized_desc = (
+                            desc_series.dropna().astype(str).str.strip()
+                        )
+                        has_description = normalized_desc.ne("").any()
+                        if not has_description:
+                            needs_rebuild = True
+                if needs_rebuild and isinstance(body, pd.DataFrame):
+                    tbl = build_normalized_table(
+                        body,
+                        mapping,
+                        keep_empty_rows=True,
+                    )
+            else:
+                tbl = pd.DataFrame()
 
             row_outline_map = outline_levels.get(s, {}).get("rows", {}) if outline_levels else {}
             col_outline_map = outline_levels.get(s, {}).get("cols", {}) if outline_levels else {}
