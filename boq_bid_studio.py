@@ -3253,6 +3253,37 @@ def dataframe_to_excel_bytes(
     return buffer.getvalue()
 
 
+def dataframes_to_excel_bytes(
+    tables: Iterable[Tuple[str, pd.DataFrame]]
+) -> bytes:
+    """Serialize multiple dataframes into an XLSX workbook."""
+
+    buffer = io.BytesIO()
+    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+        used_names: Set[str] = set()
+        for index, (title, table) in enumerate(tables, start=1):
+            if not isinstance(table, pd.DataFrame):
+                continue
+            sheet_df = table.copy()
+            base_default = f"List_{index}"
+            base_name = sanitize_filename(title, default=base_default)[:31]
+            if not base_name:
+                base_name = base_default
+            candidate = base_name
+            suffix = 2
+            while candidate in used_names:
+                suffix_text = f"_{suffix}"
+                candidate = f"{base_name[: max(0, 31 - len(suffix_text))]}{suffix_text}"
+                if not candidate:
+                    candidate = f"{base_default}_{suffix}"
+                suffix += 1
+            used_names.add(candidate)
+            sheet_df.to_excel(writer, index=False, sheet_name=candidate)
+
+    buffer.seek(0)
+    return buffer.getvalue()
+
+
 def show_df(df: pd.DataFrame) -> None:
     if not isinstance(df, pd.DataFrame):
         st.dataframe(df)
@@ -5620,6 +5651,7 @@ def run_supplier_only_comparison(offer_storage: OfferStorage) -> None:
                             )
 
                             diff_rows: List[Dict[str, Any]] = []
+                            export_tables: List[Tuple[str, pd.DataFrame]] = []
                             for supplier in dataset.supplier_order:
                                 supplier_keys = set(
                                     dataset.long_df.loc[
@@ -5638,6 +5670,8 @@ def run_supplier_only_comparison(offer_storage: OfferStorage) -> None:
 
                             diff_df = pd.DataFrame(diff_rows)
                             st.dataframe(diff_df, use_container_width=True)
+                            if not diff_df.empty:
+                                export_tables.append(("Souhrn rozdílů", diff_df))
 
                             for supplier in dataset.supplier_order:
                                 supplier_keys = set(
@@ -5662,6 +5696,13 @@ def run_supplier_only_comparison(offer_storage: OfferStorage) -> None:
                                         )
                                         st.markdown("**Položky chybějící oproti šabloně**")
                                         st.dataframe(missing_df, use_container_width=True)
+                                        if not missing_df.empty:
+                                            export_tables.append(
+                                                (
+                                                    f"{supplier} — Chybějící položky",
+                                                    missing_df.copy(),
+                                                )
+                                            )
                                     if new_keys:
                                         new_df = dataset.long_df[
                                             dataset.long_df["join_key"].isin(new_keys)
@@ -5676,7 +5717,45 @@ def run_supplier_only_comparison(offer_storage: OfferStorage) -> None:
                                         )
                                         st.markdown("**Položky navíc oproti šabloně**")
                                         st.dataframe(new_df, use_container_width=True)
+                                        if not new_df.empty:
+                                            export_tables.append(
+                                                (
+                                                    f"{supplier} — Nové položky",
+                                                    new_df.copy(),
+                                                )
+                                            )
 
+                            export_payload = [
+                                (title, table)
+                                for title, table in export_tables
+                                if isinstance(table, pd.DataFrame) and not table.empty
+                            ]
+                            if export_payload:
+                                export_stub = sanitize_filename(
+                                    f"kontrola_{template_sheet}_{selected_sheet}"
+                                )
+                                excel_bytes = dataframes_to_excel_bytes(export_payload)
+                                pdf_bytes = generate_tables_pdf(
+                                    f"Kontrola dat — {selected_sheet}", export_payload
+                                )
+                                download_key_base = make_widget_key(
+                                    "supplier_only_template_diff", selected_sheet, template_sheet
+                                )
+                                export_cols = st.columns(2)
+                                export_cols[0].download_button(
+                                    "⬇️ Export výsledků XLSX",
+                                    data=excel_bytes,
+                                    file_name=f"{export_stub}.xlsx",
+                                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                    key=f"{download_key_base}_xlsx",
+                                )
+                                export_cols[1].download_button(
+                                    "⬇️ Export výsledků PDF",
+                                    data=pdf_bytes,
+                                    file_name=f"{export_stub}.pdf",
+                                    mime="application/pdf",
+                                    key=f"{download_key_base}_pdf",
+                                )
     with tab_compare:
         st.subheader("Porovnání dvou dodavatelů")
         if not dataset_ready:
