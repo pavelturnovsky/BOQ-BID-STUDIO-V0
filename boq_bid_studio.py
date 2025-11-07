@@ -5568,46 +5568,49 @@ def run_supplier_only_comparison(offer_storage: OfferStorage) -> None:
                                 minimal=True,
                                 section_id=mapping_section_id,
                             )
+                        template_wb.sheets[template_sheet] = mapping_container.sheets.get(
+                            template_sheet, template_obj
+                        )
 
-                    template_obj = template_wb.sheets.get(template_sheet, {})
-                    template_table = (
-                        template_obj.get("table") if isinstance(template_obj, dict) else None
-                    )
-                    if not isinstance(template_table, pd.DataFrame) or template_table.empty:
-                        st.warning("Vybraný list šablony je prázdný.")
+                template_obj = template_wb.sheets.get(template_sheet, {})
+                template_table = (
+                    template_obj.get("table") if isinstance(template_obj, dict) else None
+                )
+                if not isinstance(template_table, pd.DataFrame) or template_table.empty:
+                    st.warning("Vybraný list šablony je prázdný.")
+                else:
+                    template_working = template_table.copy()
+                    if "is_summary" in template_working.columns:
+                        summary_mask = (
+                            template_working["is_summary"].fillna(False).astype(bool)
+                        )
+                        include_summary_other = summary_rows_included_as_items(
+                            template_working
+                        )
+                        if isinstance(include_summary_other, pd.Series):
+                            summary_mask &= ~include_summary_other.reindex(
+                                template_working.index, fill_value=False
+                            )
+                        template_working = template_working[~summary_mask].copy()
+                    prepared_template = _prepare_table_for_join(template_working)
+                    template_ready = True
+                    if prepared_template.empty:
+                        st.warning(
+                            "Vybraný list šablony neobsahuje žádné položky s popisem k porovnání."
+                        )
+                        template_ready = False
                     else:
-                        template_working = template_table.copy()
-                        if "is_summary" in template_working.columns:
-                            summary_mask = (
-                                template_working["is_summary"].fillna(False).astype(bool)
-                            )
-                            include_summary_other = summary_rows_included_as_items(
-                                template_working
-                            )
-                            if isinstance(include_summary_other, pd.Series):
-                                summary_mask &= ~include_summary_other.reindex(
-                                    template_working.index, fill_value=False
-                                )
-                            template_working = template_working[~summary_mask].copy()
-                        prepared_template = _prepare_table_for_join(template_working)
-                        template_ready = True
-                        if prepared_template.empty:
+                        required_template_columns = {"__join_key__", "code", "description"}
+                        missing_template_columns = required_template_columns.difference(
+                            prepared_template.columns
+                        )
+                        if missing_template_columns:
+                            missing_readable = ", ".join(sorted(missing_template_columns))
                             st.warning(
-                                "Vybraný list šablony neobsahuje žádné položky s popisem k porovnání."
+                                "Šablonu se nepodařilo zpracovat. Chybějící sloupce: "
+                                f"{missing_readable}."
                             )
                             template_ready = False
-                        else:
-                            required_template_columns = {"__join_key__", "code", "description"}
-                            missing_template_columns = required_template_columns.difference(
-                                prepared_template.columns
-                            )
-                            if missing_template_columns:
-                                missing_readable = ", ".join(sorted(missing_template_columns))
-                                st.warning(
-                                    "Šablonu se nepodařilo zpracovat. Chybějící sloupce: "
-                                    f"{missing_readable}."
-                                )
-                                template_ready = False
 
                         if template_ready:
                             template_keys = set(
