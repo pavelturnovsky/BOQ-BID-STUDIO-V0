@@ -141,6 +141,24 @@ def test_multiple_bid_loading() -> None:
     assert df.shape[0] == 1
 
 
+def test_read_workbook_keeps_rows_from_empty_template() -> None:
+    template_df = pd.DataFrame(
+        {
+            "code": ["1", "2"],
+            "description": ["Item A", "Item B"],
+            "unit": ["m", "m"],
+            "quantity": ["", ""],
+            "total price": ["", ""],
+        }
+    )
+    template_file = make_workbook(template_df)
+    wb = read_workbook(template_file, limit_sheets=["Sheet1"])
+    table = wb.sheets["Sheet1"].get("table")
+    assert isinstance(table, pd.DataFrame)
+    assert table.shape[0] == 2
+    assert table["description"].tolist() == ["Item A", "Item B"]
+
+
 def test_compare_master_total_with_duplicate_supplier_rows() -> None:
     master_df = pd.DataFrame(
         {
@@ -684,6 +702,31 @@ def test_ignore_rows_without_description() -> None:
     mapping = {"code": 0, "description": 1, "total_price": 2}
     out = module.build_normalized_table(df, mapping)
     assert out.shape[0] == 1
+
+
+def test_keep_empty_rows_when_requested() -> None:
+    df = pd.DataFrame(
+        {
+            "code": ["1", "2"],
+            "description": ["Item A", "Item B"],
+            "unit": ["m", "m"],
+            "quantity": ["", ""],
+            "total_price": ["", ""],
+        }
+    )
+    mapping = {
+        "code": 0,
+        "description": 1,
+        "unit": 2,
+        "quantity": 3,
+        "total_price": 4,
+    }
+    out_default = module.build_normalized_table(df, mapping)
+    assert out_default.empty or out_default["description"].isna().all()
+
+    out_keep = module.build_normalized_table(df, mapping, keep_empty_rows=True)
+    assert out_keep.shape[0] == 2
+    assert out_keep["description"].tolist() == ["Item A", "Item B"]
 
 
 def test_detect_summary_rows_alternating() -> None:
