@@ -7140,42 +7140,58 @@ with tab_preview:
             help="Při zapnutí se Master a vybraná nabídka posouvají zároveň.",
         )
 
-        master_keys_set = extract_preview_key_set(master_table)
-        master_highlight_keys: Set[str] = set()
-        supplier_missing_map: Dict[str, Set[str]] = {}
-        supplier_extra_map: Dict[str, Set[str]] = {}
-        discrepancy_frames: List[pd.DataFrame] = []
-
-        def build_discrepancy_frame(
-            source_table: pd.DataFrame,
-            keys: Set[str],
-            supplier_alias: str,
-            diff_label: str,
-        ) -> pd.DataFrame:
-            if not isinstance(source_table, pd.DataFrame) or source_table.empty or not keys:
-                return pd.DataFrame()
-
-            subset = filter_table_by_keys(source_table, keys)
-            if subset.empty:
-                return pd.DataFrame()
-
-            subset = subset.reset_index(drop=True)
-            prepared_subset = prepare_preview_table(subset)
-            if prepared_subset.empty:
-                return pd.DataFrame()
-
-            numeric_cols = [
-                col
-                for col in prepared_subset.columns
-                if col in subset.columns and pd.api.types.is_numeric_dtype(subset[col])
-            ]
-            formatted_subset = format_preview_numbers(
-                prepared_subset, subset, numeric_cols
+        def _normalize_description_key(value: Any) -> str:
+            if pd.isna(value):
+                return ""
+            text = str(value).strip()
+            if not text:
+                return ""
+            text = re.sub(r"\s+", " ", text)
+            normalized = unicodedata.normalize("NFKD", text)
+            without_diacritics = "".join(
+                ch for ch in normalized if not unicodedata.combining(ch)
             )
-            formatted_subset.insert(0, "Typ rozdílu", diff_label)
-            formatted_subset.insert(0, "Dodavatel", supplier_alias)
-            formatted_subset.insert(0, "List", selected_preview_sheet)
-            return formatted_subset
+            return without_diacritics.casefold()
+
+        master_highlight_keys: Set[str] = set()
+        supplier_missing_highlights: Dict[str, Set[str]] = {}
+        supplier_extra_highlights: Dict[str, Set[str]] = {}
+        diff_counts: Dict[str, Dict[str, int]] = {}
+
+        unpriced_detail_records: List[Tuple[str, pd.DataFrame]] = []
+        unpriced_summary_rows: List[Dict[str, Any]] = []
+        unpriced_export_tables: List[Tuple[str, pd.DataFrame]] = []
+
+        diff_summary_rows: List[Dict[str, Any]] = []
+        diff_detail_frames: List[pd.DataFrame] = []
+        diff_supplier_tables: Dict[str, pd.DataFrame] = {}
+
+        master_desc_key_map: Dict[str, Set[str]] = {}
+        master_desc_keys: Set[str] = set()
+        master_row_keys = extract_preview_row_keys(master_table)
+        master_working = pd.DataFrame()
+        if isinstance(master_table, pd.DataFrame) and not master_table.empty and master_row_keys:
+            master_working = master_table.reset_index(drop=True).copy()
+            master_working["__desc_norm__"] = (
+                master_working.get("description", pd.Series("", index=master_working.index))
+                .astype(str)
+                .map(_normalize_description_key)
+            )
+            master_summary_mask: Optional[pd.Series] = None
+            if "is_summary" in master_working.columns:
+                master_summary_mask = master_working["is_summary"].fillna(False).astype(bool)
+                include_summary_other = summary_rows_included_as_items(master_working)
+                if isinstance(include_summary_other, pd.Series):
+                    master_summary_mask &= ~include_summary_other.reindex(
+                        master_working.index, fill_value=False
+                    )
+                master_working.loc[master_summary_mask, "__desc_norm__"] = ""
+            desc_norm_series = master_working["__desc_norm__"]
+            master_desc_keys = {key for key in desc_norm_series if key}
+            for idx, desc_key in enumerate(desc_norm_series):
+                if not desc_key or idx >= len(master_row_keys):
+                    continue
+                master_desc_key_map.setdefault(desc_key, set()).add(master_row_keys[idx])
 
         if bids_dict:
             for sup_name, wb in bids_dict.items():
@@ -7199,24 +7215,243 @@ with tab_preview:
                 )
                 supplier_outline_views[sup_name] = supplier_display
                 supplier_outline_states[sup_name] = supplier_state
-                supplier_keys = extract_preview_key_set(supplier_table)
-                missing_keys = master_keys_set - supplier_keys
-                extra_keys = supplier_keys - master_keys_set
-                supplier_missing_map[alias] = missing_keys
-                supplier_extra_map[alias] = extra_keys
-                master_highlight_keys.update(missing_keys)
-
-                missing_frame = build_discrepancy_frame(
-                    master_table, missing_keys, alias, "Chybí v nabídce"
+                supplier_row_keys = extract_preview_row_keys(supplier_table)
+                supplier_working = (
+                    supplier_table.reset_index(drop=True).copy()
+                    if isinstance(supplier_table, pd.DataFrame)
+                    else pd.DataFrame()
                 )
-                if not missing_frame.empty:
-                    discrepancy_frames.append(missing_frame)
+                supplier_desc_keys: Set[str] = set()
+                supplier_desc_key_map: Dict[str, Set[str]] = {}
+                supplier_summary_mask: Optional[pd.Series] = None
+                if not supplier_working.empty and supplier_row_keys:
+                    supplier_working["__desc_norm__"] = (
+                        supplier_working.get(
+                            "description", pd.Series("", index=supplier_working.index)
+                        )
+                        .astype(str)
+                        .map(_normalize_description_key)
+                    )
+                    if "is_summary" in supplier_working.columns:
+                        supplier_summary_mask = (
+                            supplier_working["is_summary"].fillna(False).astype(bool)
+                        )
+                        include_summary_other = summary_rows_included_as_items(
+                            supplier_working
+                        )
+                        if isinstance(include_summary_other, pd.Series):
+                            supplier_summary_mask &= ~include_summary_other.reindex(
+                                supplier_working.index, fill_value=False
+                            )
+                        supplier_working.loc[supplier_summary_mask, "__desc_norm__"] = ""
+                    desc_norm_supplier = supplier_working["__desc_norm__"]
+                    supplier_desc_keys = {key for key in desc_norm_supplier if key}
+                    for idx, desc_key in enumerate(desc_norm_supplier):
+                        if not desc_key or idx >= len(supplier_row_keys):
+                            continue
+                        supplier_desc_key_map.setdefault(desc_key, set()).add(
+                            supplier_row_keys[idx]
+                        )
 
-                extra_frame = build_discrepancy_frame(
-                    supplier_table, extra_keys, alias, "Položka navíc"
-                )
-                if not extra_frame.empty:
-                    discrepancy_frames.append(extra_frame)
+                    total_series = supplier_working.get("total_price")
+                    if total_series is not None:
+                        total_numeric = pd.to_numeric(total_series, errors="coerce")
+                        zero_mask = total_numeric.isna() | (total_numeric.abs() < 1e-9)
+                        desc_mask = desc_norm_supplier.astype(bool)
+                        unpriced_mask = zero_mask & desc_mask
+                        if supplier_summary_mask is not None:
+                            unpriced_mask &= ~supplier_summary_mask
+                        if unpriced_mask.any():
+                            unpriced_subset = supplier_working.loc[unpriced_mask].copy()
+                            prepared_unpriced = prepare_preview_table(unpriced_subset)
+                            numeric_source = unpriced_subset.reset_index(drop=True)
+                            numeric_cols = [
+                                col
+                                for col in prepared_unpriced.columns
+                                if col in numeric_source.columns
+                                and pd.api.types.is_numeric_dtype(numeric_source[col])
+                            ]
+                            formatted_unpriced = format_preview_numbers(
+                                prepared_unpriced, numeric_source, numeric_cols
+                            )
+                            display_columns = [
+                                col
+                                for col in [
+                                    "code",
+                                    "description",
+                                    "unit",
+                                    "quantity",
+                                    "total_price",
+                                ]
+                                if col in formatted_unpriced.columns
+                            ]
+                            if display_columns:
+                                formatted_unpriced = formatted_unpriced.loc[:, display_columns]
+                            rename_map = {
+                                "code": "Kód",
+                                "description": "Popis",
+                                "unit": "Jednotka",
+                                "quantity": "Množství",
+                                "total_price": f"Cena celkem ({currency})",
+                            }
+                            formatted_unpriced = formatted_unpriced.rename(
+                                columns={
+                                    col: rename_map.get(col, col)
+                                    for col in formatted_unpriced.columns
+                                }
+                            )
+                            formatted_unpriced.insert(0, "Dodavatel", alias)
+                            formatted_unpriced.insert(0, "List", selected_preview_sheet)
+                            unpriced_detail_records.append((alias, formatted_unpriced))
+                            unpriced_summary_rows.append(
+                                {
+                                    "Dodavatel": alias,
+                                    "Počet nenaceněných položek": int(
+                                        len(formatted_unpriced)
+                                    ),
+                                }
+                            )
+                            unpriced_export_tables.append(
+                                (
+                                    f"{alias} — Nenaceněné položky",
+                                    formatted_unpriced.copy(),
+                                )
+                            )
+
+                missing_desc_keys = set()
+                extra_desc_keys = set()
+                if master_desc_keys:
+                    missing_desc_keys = master_desc_keys - supplier_desc_keys
+                    extra_desc_keys = supplier_desc_keys - master_desc_keys
+
+                missing_highlight_keys: Set[str] = set()
+                for desc_key in missing_desc_keys:
+                    missing_highlight_keys.update(
+                        master_desc_key_map.get(desc_key, set())
+                    )
+                supplier_missing_highlights[alias] = missing_highlight_keys
+                master_highlight_keys.update(missing_highlight_keys)
+
+                extra_highlight_keys: Set[str] = set()
+                for desc_key in extra_desc_keys:
+                    extra_highlight_keys.update(
+                        supplier_desc_key_map.get(desc_key, set())
+                    )
+                supplier_extra_highlights[alias] = extra_highlight_keys
+
+                diff_counts[alias] = {
+                    "missing": len(missing_desc_keys),
+                    "extra": len(extra_desc_keys),
+                }
+
+                supplier_diff_frames: List[pd.DataFrame] = []
+
+                if missing_desc_keys and not master_working.empty:
+                    missing_subset = master_working[
+                        master_working["__desc_norm__"].isin(missing_desc_keys)
+                    ].copy()
+                    if not missing_subset.empty:
+                        missing_subset = missing_subset.drop_duplicates(
+                            subset="__desc_norm__"
+                        )
+                        prepared_missing = prepare_preview_table(missing_subset)
+                        numeric_source = missing_subset.reset_index(drop=True)
+                        numeric_cols = [
+                            col
+                            for col in prepared_missing.columns
+                            if col in numeric_source.columns
+                            and pd.api.types.is_numeric_dtype(numeric_source[col])
+                        ]
+                        formatted_missing = format_preview_numbers(
+                            prepared_missing, numeric_source, numeric_cols
+                        )
+                        display_columns = [
+                            col
+                            for col in [
+                                "code",
+                                "description",
+                                "unit",
+                                "quantity",
+                                "total_price",
+                            ]
+                            if col in formatted_missing.columns
+                        ]
+                        if display_columns:
+                            formatted_missing = formatted_missing.loc[
+                                :, display_columns
+                            ]
+                        formatted_missing = formatted_missing.rename(
+                            columns={
+                                "code": "Kód",
+                                "description": "Popis",
+                                "unit": "Jednotka",
+                                "quantity": "Množství",
+                                "total_price": f"Cena celkem ({currency})",
+                            }
+                        )
+                        formatted_missing.insert(0, "Typ rozdílu", "Chybí oproti šabloně")
+                        formatted_missing.insert(0, "Dodavatel", alias)
+                        formatted_missing.insert(0, "List", selected_preview_sheet)
+                        supplier_diff_frames.append(formatted_missing)
+                        diff_detail_frames.append(formatted_missing.copy())
+
+                if extra_desc_keys and not supplier_working.empty:
+                    extra_subset = supplier_working[
+                        supplier_working["__desc_norm__"].isin(extra_desc_keys)
+                    ].copy()
+                    if not extra_subset.empty:
+                        extra_subset = extra_subset.drop_duplicates(subset="__desc_norm__")
+                        prepared_extra = prepare_preview_table(extra_subset)
+                        numeric_source = extra_subset.reset_index(drop=True)
+                        numeric_cols = [
+                            col
+                            for col in prepared_extra.columns
+                            if col in numeric_source.columns
+                            and pd.api.types.is_numeric_dtype(numeric_source[col])
+                        ]
+                        formatted_extra = format_preview_numbers(
+                            prepared_extra, numeric_source, numeric_cols
+                        )
+                        display_columns = [
+                            col
+                            for col in [
+                                "code",
+                                "description",
+                                "unit",
+                                "quantity",
+                                "total_price",
+                            ]
+                            if col in formatted_extra.columns
+                        ]
+                        if display_columns:
+                            formatted_extra = formatted_extra.loc[:, display_columns]
+                        formatted_extra = formatted_extra.rename(
+                            columns={
+                                "code": "Kód",
+                                "description": "Popis",
+                                "unit": "Jednotka",
+                                "quantity": "Množství",
+                                "total_price": f"Cena celkem ({currency})",
+                            }
+                        )
+                        formatted_extra.insert(0, "Typ rozdílu", "Položka navíc")
+                        formatted_extra.insert(0, "Dodavatel", alias)
+                        formatted_extra.insert(0, "List", selected_preview_sheet)
+                        supplier_diff_frames.append(formatted_extra)
+                        diff_detail_frames.append(formatted_extra.copy())
+
+                if supplier_diff_frames:
+                    combined_diff = pd.concat(
+                        supplier_diff_frames, ignore_index=True, sort=False
+                    )
+                    diff_supplier_tables[alias] = combined_diff
+                    diff_summary_rows.append(
+                        {
+                            "Dodavatel": alias,
+                            "Chybějící položky": len(missing_desc_keys),
+                            "Položky navíc": len(extra_desc_keys),
+                        }
+                    )
 
         master_wrapper_id = ""
         cols_preview = st.columns(2)
@@ -7241,11 +7476,13 @@ with tab_preview:
                 )
                 if master_highlight_keys:
                     missing_lines = []
-                    for alias, missing in supplier_missing_map.items():
-                        if not missing:
+                    for alias, counts in diff_counts.items():
+                        missing_count = counts.get("missing", 0)
+                        if not missing_count:
                             continue
-                        missing_count = count_rows_by_keys(master_table, missing)
-                        missing_lines.append(f"- {alias}: {missing_count} řádků chybí")
+                        missing_lines.append(
+                            f"- {alias}: {missing_count} položek chybí oproti šabloně"
+                        )
                     if missing_lines:
                         st.caption(
                             "Červeně zvýrazněné řádky chybí v těchto nabídkách:\n"
@@ -7277,33 +7514,29 @@ with tab_preview:
                                 selected_preview_sheet,
                                 alias,
                                 supplier_widget_suffix,
-                                highlight_keys=supplier_extra_map.get(alias, set()),
+                                highlight_keys=supplier_extra_highlights.get(alias, set()),
                                 highlight_color="#FFF0D6",
                                 currency_label=currency,
                                 summary_title=f"Součty — {alias}",
                                 original_df=supplier_table,
                                 outline_state=supplier_outline_states.get(sup_name),
                             )
-                            missing_keys = supplier_missing_map.get(alias, set())
-                            extra_keys = supplier_extra_map.get(alias, set())
-                            if missing_keys:
-                                missing_count = count_rows_by_keys(
-                                    master_table, missing_keys
-                                )
+                            missing_keys = supplier_missing_highlights.get(alias, set())
+                            extra_keys = supplier_extra_highlights.get(alias, set())
+                            missing_count = diff_counts.get(alias, {}).get("missing", 0)
+                            extra_count = diff_counts.get(alias, {}).get("extra", 0)
+                            if missing_count:
                                 st.error(
-                                    f"Chybí {missing_count} řádků oproti Master."
+                                    f"Chybí {missing_count} položek oproti šabloně."
                                 )
                                 missing_desc = describe_preview_rows(
                                     master_table, missing_keys
                                 )
                                 if missing_desc:
                                     st.markdown(missing_desc)
-                            if extra_keys:
-                                extra_count = count_rows_by_keys(
-                                    supplier_table, extra_keys
-                                )
+                            if extra_count:
                                 st.info(
-                                    f"Dodavatel obsahuje {extra_count} řádků navíc oproti Master."
+                                    f"Dodavatel obsahuje {extra_count} položek navíc oproti šabloně."
                                 )
                                 extra_desc = describe_preview_rows(
                                     supplier_table, extra_keys
@@ -7322,47 +7555,127 @@ with tab_preview:
                                 sync_scroll_enabled,
                             )
 
-        discrepancy_table = (
-            pd.concat(discrepancy_frames, ignore_index=True, sort=False)
-            if discrepancy_frames
+        st.markdown("### Výtah nenaceněných položek")
+        if not unpriced_detail_records:
+            st.info("Všechny položky dodavatelů mají vyplněnou cenu celkem.")
+        else:
+            unpriced_summary_df = pd.DataFrame(unpriced_summary_rows)
+            if not unpriced_summary_df.empty:
+                unpriced_summary_df = unpriced_summary_df.sort_values(
+                    by=["Dodavatel"]
+                ).reset_index(drop=True)
+                st.dataframe(unpriced_summary_df, use_container_width=True)
+
+            unpriced_combined = pd.concat(
+                [df for _, df in unpriced_detail_records], ignore_index=True, sort=False
+            )
+            unpriced_height = min(900, 220 + max(len(unpriced_combined), 1) * 28)
+            st.dataframe(
+                unpriced_combined,
+                use_container_width=True,
+                height=unpriced_height,
+            )
+
+            export_payload: List[Tuple[str, pd.DataFrame]] = []
+            if not unpriced_summary_df.empty:
+                export_payload.append(("Souhrn", unpriced_summary_df.copy()))
+            export_payload.extend(unpriced_export_tables)
+            export_payload.append(
+                ("Všechny nenaceněné položky", unpriced_combined.copy())
+            )
+            export_payload = [
+                (title, table)
+                for title, table in export_payload
+                if isinstance(table, pd.DataFrame) and not table.empty
+            ]
+            if export_payload:
+                export_stub = sanitize_filename(
+                    f"nenacenene_{selected_preview_sheet}"
+                )
+                excel_bytes = dataframes_to_excel_bytes(export_payload)
+                pdf_bytes = generate_tables_pdf(
+                    f"Výtah nenaceněných položek — {selected_preview_sheet}",
+                    export_payload,
+                )
+                export_cols = st.columns(2)
+                export_cols[0].download_button(
+                    "⬇️ Export výtahu XLSX",
+                    data=excel_bytes,
+                    file_name=f"{export_stub}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    key=f"{selected_preview_sheet}_unpriced_xlsx",
+                )
+                export_cols[1].download_button(
+                    "⬇️ Export výtahu PDF",
+                    data=pdf_bytes,
+                    file_name=f"{export_stub}.pdf",
+                    mime="application/pdf",
+                    key=f"{selected_preview_sheet}_unpriced_pdf",
+                )
+
+        st.markdown("### Rozdíly oproti šabloně (podle popisu)")
+        diff_summary_df = pd.DataFrame(diff_summary_rows)
+        diff_combined = (
+            pd.concat(diff_detail_frames, ignore_index=True, sort=False)
+            if diff_detail_frames
             else pd.DataFrame()
         )
-        if not discrepancy_table.empty:
-            base_columns = ["List", "Dodavatel", "Typ rozdílu"]
-            ordered_columns = base_columns + [
-                col for col in discrepancy_table.columns if col not in base_columns
+        if diff_summary_df.empty and diff_combined.empty:
+            st.info("Žádné rozdíly podle popisu nebyly nalezeny.")
+        else:
+            if not diff_summary_df.empty:
+                diff_summary_df = diff_summary_df.sort_values(by=["Dodavatel"]).reset_index(
+                    drop=True
+                )
+                st.dataframe(diff_summary_df, use_container_width=True)
+
+            if not diff_combined.empty:
+                diff_height = min(900, 220 + max(len(diff_combined), 1) * 28)
+                st.caption(
+                    "Tabulka obsahuje všechny chybějící nebo přidané položky identifikované podle popisu."
+                )
+                st.dataframe(
+                    diff_combined,
+                    use_container_width=True,
+                    height=diff_height,
+                )
+
+            diff_export_tables: List[Tuple[str, pd.DataFrame]] = []
+            if not diff_summary_df.empty:
+                diff_export_tables.append(("Souhrn rozdílů", diff_summary_df.copy()))
+            for alias, table in diff_supplier_tables.items():
+                if isinstance(table, pd.DataFrame) and not table.empty:
+                    diff_export_tables.append((f"{alias} — Rozdíly", table.copy()))
+            if not diff_combined.empty:
+                diff_export_tables.append(("Všechny rozdíly", diff_combined.copy()))
+
+            diff_export_tables = [
+                (title, table)
+                for title, table in diff_export_tables
+                if isinstance(table, pd.DataFrame) and not table.empty
             ]
-            discrepancy_table = discrepancy_table.reindex(columns=ordered_columns)
-
-            st.markdown("### Kompletní seznam rozdílů")
-            st.caption(
-                "Tabulka obsahuje všechny chybějící nebo přidané položky pro vybraný list."
-            )
-            diff_height = min(900, 220 + max(len(discrepancy_table), 1) * 28)
-            st.dataframe(discrepancy_table, use_container_width=True, height=diff_height)
-
-            diff_stub = sanitize_filename(f"rozdily_{selected_preview_sheet}")
-            diff_csv = discrepancy_table.to_csv(index=False).encode("utf-8-sig")
-            diff_xlsx = dataframe_to_excel_bytes(
-                discrepancy_table, f"Rozdíly — {selected_preview_sheet}"
-            )
-            diff_cols = st.columns(2)
-            diff_cols[0].download_button(
-                "⬇️ Export rozdílů CSV",
-                data=diff_csv,
-                file_name=f"{diff_stub}.csv",
-                mime="text/csv",
-                key=f"{selected_preview_sheet}_diff_csv",
-            )
-            diff_cols[1].download_button(
-                "⬇️ Export rozdílů XLSX",
-                data=diff_xlsx,
-                file_name=f"{diff_stub}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                key=f"{selected_preview_sheet}_diff_xlsx",
-            )
-        elif bids_dict:
-            st.info("Žádné rozdíly mezi Master a nabídkami nebyly nalezeny.")
+            if diff_export_tables:
+                diff_stub = sanitize_filename(f"rozdily_{selected_preview_sheet}")
+                diff_excel = dataframes_to_excel_bytes(diff_export_tables)
+                diff_pdf = generate_tables_pdf(
+                    f"Rozdíly podle popisu — {selected_preview_sheet}",
+                    diff_export_tables,
+                )
+                diff_cols = st.columns(2)
+                diff_cols[0].download_button(
+                    "⬇️ Export rozdílů XLSX",
+                    data=diff_excel,
+                    file_name=f"{diff_stub}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    key=f"{selected_preview_sheet}_diff_xlsx",
+                )
+                diff_cols[1].download_button(
+                    "⬇️ Export rozdílů PDF",
+                    data=diff_pdf,
+                    file_name=f"{diff_stub}.pdf",
+                    mime="application/pdf",
+                    key=f"{selected_preview_sheet}_diff_pdf",
+                )
 
 # Pre-compute comparison results for reuse in tabs (after mapping)
 compare_results: Dict[str, pd.DataFrame] = {}
