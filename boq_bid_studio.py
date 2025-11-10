@@ -607,6 +607,89 @@ def normalize_text(value: Any) -> str:
     return without_diacritics.lower()
 
 
+def normalize_description_key(value: Any) -> str:
+    """Return a normalized identifier for textual item comparisons."""
+
+    if pd.isna(value):
+        return ""
+    text = str(value).strip()
+    if not text:
+        return ""
+    collapsed = re.sub(r"\s+", " ", text)
+    normalized = unicodedata.normalize("NFKD", collapsed)
+    without_diacritics = "".join(
+        ch for ch in normalized if not unicodedata.combining(ch)
+    )
+    return without_diacritics.casefold()
+
+
+def prepare_description_comparison_table(
+    df: Any,
+) -> Tuple[pd.DataFrame, Set[str]]:
+    """Return copy of ``df`` with normalized descriptions and the unique keys."""
+
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return pd.DataFrame(), set()
+    if "description" not in df.columns:
+        working = df.copy()
+        working["__desc_norm__"] = ""
+        return working, set()
+
+    working = df.reset_index(drop=True).copy()
+    working["description"] = working["description"].astype(str)
+    working["__desc_norm__"] = (
+        working["description"].map(normalize_description_key).fillna("")
+    )
+
+    if "is_summary" in working.columns:
+        summary_mask = working["is_summary"].fillna(False).astype(bool)
+        include_summary_other = summary_rows_included_as_items(working)
+        if isinstance(include_summary_other, pd.Series):
+            summary_mask &= ~include_summary_other.reindex(
+                working.index, fill_value=False
+            )
+        if summary_mask.any():
+            working.loc[summary_mask, "__desc_norm__"] = ""
+
+    desc_series = working.get("__desc_norm__", pd.Series(dtype=str))
+    desc_keys = {key for key in desc_series if isinstance(key, str) and key}
+    return working, desc_keys
+
+
+def format_description_diff_table(
+    df: pd.DataFrame, currency: str
+) -> pd.DataFrame:
+    """Return display-ready table for missing/extra item summaries."""
+
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return pd.DataFrame()
+
+    working = df.copy()
+    if "__desc_norm__" in working.columns:
+        working = working.drop(columns=["__desc_norm__"], errors="ignore")
+
+    column_order: List[str] = []
+    for col in ["code", "description", "unit", "quantity"]:
+        if col in working.columns:
+            column_order.append(col)
+    for col in ["total_price", "total"]:
+        if col in working.columns:
+            column_order.append(col)
+            break
+    if column_order:
+        working = working.loc[:, column_order]
+
+    rename_map = {
+        "code": "Kód",
+        "description": "Popis",
+        "unit": "Jednotka",
+        "quantity": "Množství",
+        "total_price": f"Cena celkem ({currency})",
+        "total": f"Cena celkem ({currency})",
+    }
+    return working.rename(columns={col: rename_map.get(col, col) for col in working.columns})
+
+
 def normalize_join_value(value: Any) -> str:
     """Return a canonical representation suitable for joining rows."""
 
@@ -5803,34 +5886,40 @@ def run_supplier_only_comparison(offer_storage: OfferStorage) -> None:
                             template_ready = False
 
                         if template_ready:
-                            template_keys = set(
-                                prepared_template.get("__join_key__", pd.Series(dtype=str))
-                                .astype(str)
-                                .tolist()
+                            template_comparison_df, template_desc_keys = (
+                                prepare_description_comparison_table(template_working)
                             )
 
                             diff_rows: List[Dict[str, Any]] = []
                             export_tables: List[Tuple[str, pd.DataFrame]] = []
                             unpriced_cache: Dict[str, pd.DataFrame] = {}
+                            supplier_diff_cache: Dict[str, Dict[str, Set[str]]] = {}
+                            supplier_table_cache: Dict[str, pd.DataFrame] = {}
+
                             for supplier in dataset.supplier_order:
                                 supplier_subset = dataset.long_df[
                                     dataset.long_df["supplier"] == supplier
                                 ].copy()
-                                join_series = supplier_subset.get(
-                                    "join_key", pd.Series(dtype=str)
-                                ).astype(str)
-                                supplier_keys = set(join_series.tolist())
-                                missing_keys = sorted(template_keys - supplier_keys)
-                                new_keys = sorted(supplier_keys - template_keys)
+                                supplier_comparison_df, supplier_desc_keys = (
+                                    prepare_description_comparison_table(supplier_subset)
+                                )
+                                supplier_table_cache[supplier] = supplier_comparison_df
+
+                                missing_desc_keys = template_desc_keys - supplier_desc_keys
+                                extra_desc_keys = supplier_desc_keys - template_desc_keys
+                                supplier_diff_cache[supplier] = {
+                                    "missing": missing_desc_keys,
+                                    "extra": extra_desc_keys,
+                                }
 
                                 totals_numeric = pd.to_numeric(
-                                    supplier_subset.get("total"), errors="coerce"
+                                    supplier_comparison_df.get("total"), errors="coerce"
                                 )
                                 zero_mask = totals_numeric.notna() & np.isclose(
                                     totals_numeric, 0.0, atol=1e-9
                                 )
                                 unpriced_mask = totals_numeric.isna() | zero_mask
-                                unpriced_subset = supplier_subset.loc[
+                                unpriced_subset = supplier_comparison_df.loc[
                                     unpriced_mask,
                                     ["code", "description", "unit", "quantity", "total"],
                                 ].copy()
@@ -5842,8 +5931,8 @@ def run_supplier_only_comparison(offer_storage: OfferStorage) -> None:
                                 diff_rows.append(
                                     {
                                         "Dodavatel": supplier,
-                                        "Chybějící položky": len(missing_keys),
-                                        "Nové položky": len(new_keys),
+                                        "Chybějící položky": len(missing_desc_keys),
+                                        "Nové položky": len(extra_desc_keys),
                                         "Neoceněné položky": int(unpriced_subset.shape[0]),
                                     }
                                 )
@@ -5866,58 +5955,68 @@ def run_supplier_only_comparison(offer_storage: OfferStorage) -> None:
 
                             for supplier in dataset.supplier_order:
                                 unpriced_subset = unpriced_cache.get(supplier)
-                                supplier_keys = set(
-                                    dataset.long_df.loc[
-                                        dataset.long_df["supplier"] == supplier, "join_key"
-                                    ]
-                                    .astype(str)
-                                    .tolist()
-                                )
-                                missing_keys = sorted(template_keys - supplier_keys)
-                                new_keys = sorted(supplier_keys - template_keys)
-                                if not missing_keys and not new_keys and (
-                                    unpriced_subset is None or unpriced_subset.empty
+                                diff_entry = supplier_diff_cache.get(supplier, {})
+                                missing_desc_keys = diff_entry.get("missing", set())
+                                extra_desc_keys = diff_entry.get("extra", set())
+                                if (
+                                    not missing_desc_keys
+                                    and not extra_desc_keys
+                                    and (
+                                        unpriced_subset is None
+                                        or unpriced_subset.empty
+                                    )
                                 ):
                                     continue
                                 with st.expander(f"Detail změn — {supplier}"):
-                                    if missing_keys:
-                                        missing_df = prepared_template[
-                                            prepared_template["__join_key__"].astype(str).isin(
-                                                missing_keys
+                                    if missing_desc_keys:
+                                        missing_df = template_comparison_df[
+                                            template_comparison_df["__desc_norm__"].isin(
+                                                list(missing_desc_keys)
                                             )
-                                        ][["code", "description"]].copy()
-                                        missing_df.rename(
-                                            columns={"code": "Kód", "description": "Popis"},
-                                            inplace=True,
+                                        ].copy()
+                                        if not missing_df.empty:
+                                            missing_df = missing_df.drop_duplicates(
+                                                subset="__desc_norm__"
+                                            )
+                                        missing_display = format_description_diff_table(
+                                            missing_df, currency
                                         )
                                         st.markdown("**Položky chybějící oproti šabloně**")
-                                        st.dataframe(missing_df, use_container_width=True)
-                                        if not missing_df.empty:
+                                        st.dataframe(
+                                            missing_display, use_container_width=True
+                                        )
+                                        if not missing_display.empty:
                                             export_tables.append(
                                                 (
                                                     f"{supplier} — Chybějící položky",
-                                                    missing_df.copy(),
+                                                    missing_display.copy(),
                                                 )
                                             )
-                                    if new_keys:
-                                        new_df = dataset.long_df[
-                                            dataset.long_df["join_key"].isin(new_keys)
-                                            & (dataset.long_df["supplier"] == supplier)
-                                        ][["code", "description", "total"]]
-                                        new_df = new_df.rename(
-                                            columns={
-                                                "code": "Kód",
-                                                "description": "Popis",
-                                                "total": f"Cena ({currency})",
-                                            }
+                                    if extra_desc_keys:
+                                        supplier_table = supplier_table_cache.get(
+                                            supplier, pd.DataFrame()
+                                        )
+                                        extra_df = supplier_table[
+                                            supplier_table["__desc_norm__"].isin(
+                                                list(extra_desc_keys)
+                                            )
+                                        ].copy()
+                                        if not extra_df.empty:
+                                            extra_df = extra_df.drop_duplicates(
+                                                subset="__desc_norm__"
+                                            )
+                                        extra_display = format_description_diff_table(
+                                            extra_df, currency
                                         )
                                         st.markdown("**Položky navíc oproti šabloně**")
-                                        st.dataframe(new_df, use_container_width=True)
-                                        if not new_df.empty:
+                                        st.dataframe(
+                                            extra_display, use_container_width=True
+                                        )
+                                        if not extra_display.empty:
                                             export_tables.append(
                                                 (
                                                     f"{supplier} — Nové položky",
-                                                    new_df.copy(),
+                                                    extra_display.copy(),
                                                 )
                                             )
                                     if unpriced_subset is None or unpriced_subset.empty:
