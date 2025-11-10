@@ -3988,6 +3988,39 @@ def mapping_ui(
                         key=make_widget_key("map", section_key, sheet_key, "description"),
                     )
                 with c3:
+                    qty_idx = st.selectbox(
+                        "Sloupec: quantity",
+                        cols,
+                        format_func=lambda i: header_names[i] if i < len(header_names) else "",
+                        index=clamp(pick_default("quantity")),
+                        key=make_widget_key("map", section_key, sheet_key, "quantity"),
+                    )
+                with c4:
+                    qty_sup_idx = st.selectbox(
+                        "Sloupec: quantity_supplier",
+                        cols,
+                        format_func=lambda i: header_names[i] if i < len(header_names) else "",
+                        index=clamp(pick_default("quantity_supplier")),
+                        key=make_widget_key("map", section_key, sheet_key, "quantity_supplier"),
+                    )
+                c5, c6, c7, c8 = st.columns(4)
+                with c5:
+                    upm_idx = st.selectbox(
+                        "Sloupec: unit_price_material",
+                        cols,
+                        format_func=lambda i: header_names[i] if i < len(header_names) else "",
+                        index=clamp(pick_default("unit_price_material")),
+                        key=make_widget_key("map", section_key, sheet_key, "unit_price_material"),
+                    )
+                with c6:
+                    upi_idx = st.selectbox(
+                        "Sloupec: unit_price_install",
+                        cols,
+                        format_func=lambda i: header_names[i] if i < len(header_names) else "",
+                        index=clamp(pick_default("unit_price_install")),
+                        key=make_widget_key("map", section_key, sheet_key, "unit_price_install"),
+                    )
+                with c7:
                     total_idx = st.selectbox(
                         "Sloupec: total_price",
                         cols,
@@ -3995,7 +4028,7 @@ def mapping_ui(
                         index=clamp(pick_default("total_price")),
                         key=make_widget_key("map", section_key, sheet_key, "total_price"),
                     )
-                with c4:
+                with c8:
                     summ_idx = st.selectbox(
                         "Sloupec: summary_total",
                         cols,
@@ -4007,10 +4040,10 @@ def mapping_ui(
                     "code": code_idx,
                     "description": desc_idx,
                     "unit": -1,
-                    "quantity": -1,
-                    "quantity_supplier": -1,
-                    "unit_price_material": -1,
-                    "unit_price_install": -1,
+                    "quantity": qty_idx,
+                    "quantity_supplier": qty_sup_idx,
+                    "unit_price_material": upm_idx,
+                    "unit_price_install": upi_idx,
                     "total_price": total_idx,
                     "summary_total": summ_idx,
                     "item_id": -1,
