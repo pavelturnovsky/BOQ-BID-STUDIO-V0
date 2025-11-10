@@ -24,6 +24,7 @@ apply_master_mapping = module.apply_master_mapping
 compare = module.compare
 validate_totals = module.validate_totals
 overview_comparison = module.overview_comparison
+supplier_only_qa_checks = module.supplier_only_qa_checks
 
 
 def make_workbook(df: pd.DataFrame) -> io.BytesIO:
@@ -1269,3 +1270,73 @@ def test_curve_alignment_uses_preserved_item_ids() -> None:
     assert set(curve_join_map.index) == set(comparison_index)
     aligned_curve = curve_join_map.loc[comparison_index]
     assert np.allclose(aligned_curve.values, comparison_join_map.values)
+
+
+def test_supplier_only_qa_checks_detects_missing_and_duplicates() -> None:
+    sheet_name = "Sheet1"
+    supplier_a_table = pd.DataFrame(
+        {
+            "__key__": ["K1", "K2", "SUM"],
+            "code": ["A", "B", ""],
+            "description": ["Item A", "Item B", "Total"],
+            "total_price": [100, 200, 300],
+            "summary_total": [np.nan, np.nan, 300],
+            "is_summary": [False, False, True],
+        }
+    )
+    supplier_b_table = pd.DataFrame(
+        {
+            "__key__": ["K1", "K3", "K3", "SUM"],
+            "code": ["A", "C", "C", ""],
+            "description": ["Item A", "Item C", "Item C", "Total"],
+            "total_price": [100, 150, 160, 320],
+            "summary_total": [np.nan, np.nan, np.nan, 320],
+            "is_summary": [False, False, False, True],
+        }
+    )
+
+    supplier_a = WorkbookData(name="A", sheets={sheet_name: {"table": supplier_a_table}})
+    supplier_b = WorkbookData(name="B", sheets={sheet_name: {"table": supplier_b_table}})
+
+    result = supplier_only_qa_checks(
+        {"A": supplier_a, "B": supplier_b},
+        {"A": "Dodavatel A", "B": "Dodavatel B"},
+    )
+
+    assert sheet_name in result
+    sheet_result = result[sheet_name]
+    assert set(sheet_result.keys()) == {"Dodavatel A", "Dodavatel B"}
+
+    info_a = sheet_result["Dodavatel A"]
+    assert "SUM" not in info_a["table"]["__key__"].tolist()
+    assert set(info_a["keys"].astype(str)) == {"K1", "K2"}
+    assert pytest.approx(float(info_a["total_diff"])) == 0.0
+    assert info_a["duplicates"].empty
+
+    info_b = sheet_result["Dodavatel B"]
+    assert set(info_b["keys"].astype(str)) == {"K1", "K3"}
+    duplicates = info_b["duplicates"]
+    assert duplicates.shape[0] == 1
+    assert duplicates.loc[0, "__key__"] == "K3"
+    assert duplicates.loc[0, "cnt"] == 2
+    # Summary difference equals |320 - 410| = 90 (absolute deviation of summaries)
+    assert pytest.approx(float(info_b["total_diff"])) == pytest.approx(90.0)
+
+
+def test_supplier_only_qa_checks_generates_keys_when_missing() -> None:
+    sheet_name = "Sheet1"
+    supplier_table = pd.DataFrame(
+        {
+            "code": ["A", "B"],
+            "description": ["Item A", "Item B"],
+            "total_price": [10.0, 20.0],
+        }
+    )
+
+    supplier = WorkbookData(name="Only", sheets={sheet_name: {"table": supplier_table}})
+
+    result = supplier_only_qa_checks({"Only": supplier}, {"Only": "Only"})
+    info = result[sheet_name]["Only"]
+    keys_series = info["keys"].astype(str)
+    assert len(keys_series) == 2
+    assert set(keys_series) == {"0", "1"}

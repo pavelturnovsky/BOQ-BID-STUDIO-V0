@@ -11,7 +11,7 @@ import unicodedata
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Set, Tuple, Union
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple, Union
 from string import Template
 
 import numpy as np
@@ -5606,6 +5606,7 @@ def run_supplier_only_comparison(offer_storage: OfferStorage) -> None:
             st.success("Mapování připraveno. Pokračuj na další záložky pro porovnání.")
 
     dataset = build_supplier_only_dataset(selected_sheet, bids_dict, display_names)
+    qa_summary = supplier_only_qa_checks(bids_dict, display_names)
     dataset_ready = not dataset.long_df.empty
     consensus_df = dataset.consensus_df if dataset_ready else pd.DataFrame()
     consensus_index = consensus_df.index.tolist() if not consensus_df.empty else []
@@ -5648,6 +5649,158 @@ def run_supplier_only_comparison(offer_storage: OfferStorage) -> None:
                         ),
                         use_container_width=True,
                     )
+
+            st.markdown("### Kontrola dat podle referenční nabídky")
+            sheet_checks = qa_summary.get(selected_sheet, {}) if isinstance(qa_summary, dict) else {}
+            supplier_aliases = [
+                alias for alias in dataset.supplier_order if alias in sheet_checks
+            ]
+            if not supplier_aliases:
+                st.info("Pro tuto kontrolu nejsou dostupné žádné srovnatelné tabulky.")
+            else:
+                reference_alias = st.selectbox(
+                    "Referenční nabídka",
+                    supplier_aliases,
+                    index=0,
+                    key=make_widget_key("supplier_only_qa_ref", selected_sheet),
+                )
+                reference_info = sheet_checks.get(reference_alias, {})
+                reference_table = reference_info.get("table", pd.DataFrame())
+                reference_keys_series = reference_info.get("keys", pd.Series(dtype=str))
+                if isinstance(reference_keys_series, pd.Series):
+                    reference_keys = set(reference_keys_series.astype(str))
+                else:
+                    reference_keys = set()
+
+                if (
+                    not isinstance(reference_table, pd.DataFrame)
+                    or reference_table.empty
+                    or not reference_keys
+                ):
+                    st.info(
+                        "Vybraná referenční nabídka neobsahuje žádné položky ke kontrole."
+                    )
+                else:
+                    first_supplier = True
+                    for alias in supplier_aliases:
+                        supplier_info = sheet_checks.get(alias)
+                        if not supplier_info:
+                            continue
+                        supplier_table = supplier_info.get("table", pd.DataFrame())
+                        supplier_keys_series = supplier_info.get(
+                            "keys", pd.Series(dtype=str)
+                        )
+                        if isinstance(supplier_keys_series, pd.Series):
+                            supplier_keys = set(supplier_keys_series.astype(str))
+                        else:
+                            supplier_keys = set()
+                        duplicates_df = supplier_info.get(
+                            "duplicates", pd.DataFrame(columns=["__key__", "cnt"])
+                        )
+                        duplicate_map: Dict[str, int] = {}
+                        if isinstance(duplicates_df, pd.DataFrame) and not duplicates_df.empty:
+                            for _, row in duplicates_df.iterrows():
+                                key_value = row.get("__key__")
+                                count_value = row.get("cnt")
+                                if pd.isna(key_value) or pd.isna(count_value):
+                                    continue
+                                duplicate_map[str(key_value)] = int(count_value)
+
+                        missing_keys: List[str]
+                        extra_keys: List[str]
+                        if alias == reference_alias:
+                            missing_keys = []
+                            extra_keys = []
+                        else:
+                            missing_keys = sorted(reference_keys - supplier_keys)
+                            extra_keys = sorted(supplier_keys - reference_keys)
+
+                        duplicate_overflow = (
+                            int(sum(max(count - 1, 0) for count in duplicate_map.values()))
+                            if duplicate_map
+                            else 0
+                        )
+                        total_diff_value = supplier_info.get("total_diff")
+                        if pd.isna(total_diff_value):
+                            diff_display = "N/A"
+                        else:
+                            diff_display = format_currency_label(total_diff_value, currency)
+
+                        if not first_supplier:
+                            st.markdown("---")
+                        first_supplier = False
+
+                        st.markdown(f"#### {alias}")
+                        metric_cols = st.columns(4)
+                        metric_cols[0].metric(
+                            "Chybějící položky",
+                            len(missing_keys) if alias != reference_alias else 0,
+                        )
+                        metric_cols[1].metric(
+                            "Nové položky",
+                            len(extra_keys) if alias != reference_alias else 0,
+                        )
+                        metric_cols[2].metric("Duplicitní řádky", duplicate_overflow)
+                        metric_cols[3].metric("Součet odchylek souhrnů", diff_display)
+
+                        if pd.isna(total_diff_value):
+                            st.caption(
+                                "Souhrnné řádky nelze ověřit (chybí potřebné souhrny)."
+                            )
+                        elif abs(float(total_diff_value)) < 1e-6:
+                            st.caption(
+                                "Souhrnné řádky odpovídají součtu položek (odchylka 0)."
+                            )
+                        else:
+                            st.caption(
+                                "Souhrnné řádky se liší od součtu položek – zkontroluj mezisoučty."
+                            )
+
+                        if alias == reference_alias:
+                            st.caption(
+                                "Referenční nabídka — ostatní nabídky se porovnávají vůči této tabulce."
+                            )
+                        else:
+                            missing_table = build_item_display_table(
+                                reference_table, missing_keys, currency
+                            )
+                            extra_table = build_item_display_table(
+                                supplier_table, extra_keys, currency
+                            )
+                            if missing_table.empty and extra_table.empty:
+                                st.caption(
+                                    "Dodavatel má stejné položky jako referenční nabídka."
+                                )
+                            else:
+                                if not missing_table.empty:
+                                    st.markdown("**Položky chybějící oproti referenci**")
+                                    st.dataframe(
+                                        missing_table,
+                                        use_container_width=True,
+                                    )
+                                if not extra_table.empty:
+                                    st.markdown("**Položky navíc oproti referenci**")
+                                    st.dataframe(
+                                        extra_table,
+                                        use_container_width=True,
+                                    )
+
+                        duplicate_table = build_item_display_table(
+                            supplier_table,
+                            list(duplicate_map.keys()),
+                            currency,
+                            count_map=duplicate_map,
+                        )
+                        if not duplicate_table.empty and "Počet výskytů" in duplicate_table.columns:
+                            duplicate_table["Počet výskytů"] = pd.to_numeric(
+                                duplicate_table["Počet výskytů"], errors="coerce"
+                            ).astype("Int64")
+                        if not duplicate_table.empty:
+                            st.markdown("**Duplicitní řádky**")
+                            st.caption(
+                                "Řádky se shodným interním klíčem v rámci jedné nabídky."
+                            )
+                            st.dataframe(duplicate_table, use_container_width=True)
 
             st.markdown("### Výtah nenaceněných položek")
             if dataset.long_df.empty:
@@ -6369,6 +6522,133 @@ def qa_checks(master: WorkbookData, bids: Dict[str, WorkbookData]) -> Dict[str, 
             }
         out[sheet] = per_sheet
     return out
+
+
+def supplier_only_qa_checks(
+    bids: Mapping[str, WorkbookData],
+    alias_map: Optional[Mapping[str, str]] = None,
+) -> Dict[str, Dict[str, Dict[str, Any]]]:
+    """Return per-sheet QA metadata for supplier-only comparison."""
+
+    alias_map = alias_map or {}
+    sheet_order: List[str] = []
+    for wb in bids.values():
+        if not isinstance(wb, WorkbookData):
+            continue
+        for sheet in wb.sheets.keys():
+            if sheet not in sheet_order:
+                sheet_order.append(sheet)
+
+    results: Dict[str, Dict[str, Dict[str, Any]]] = {}
+    for sheet in sheet_order:
+        per_sheet: Dict[str, Dict[str, Any]] = {}
+        for raw_name, wb in bids.items():
+            if not isinstance(wb, WorkbookData):
+                continue
+            alias = alias_map.get(raw_name, raw_name)
+            sheet_obj = wb.sheets.get(sheet, {})
+            table = sheet_obj.get("table", pd.DataFrame())
+            if not isinstance(table, pd.DataFrame) or table.empty:
+                per_sheet[alias] = {
+                    "table": pd.DataFrame(),
+                    "keys": pd.Series(dtype=str),
+                    "duplicates": pd.DataFrame(columns=["__key__", "cnt"]),
+                    "total_diff": np.nan,
+                }
+                continue
+
+            total_diff = validate_totals(table)
+            if "is_summary" in table.columns:
+                summary_mask = table["is_summary"].fillna(False).astype(bool)
+                include_summary_other = summary_rows_included_as_items(table)
+                if isinstance(include_summary_other, pd.Series):
+                    summary_mask &= ~include_summary_other.reindex(
+                        table.index, fill_value=False
+                    )
+                clean_table = table[~summary_mask].copy()
+            else:
+                clean_table = table.copy()
+
+            if "__key__" not in clean_table.columns:
+                clean_table = clean_table.copy()
+                clean_table["__key__"] = clean_table.index.astype(str)
+
+            key_series = clean_table["__key__"].dropna().astype(str)
+            duplicate_counts = key_series.value_counts()
+            duplicates = (
+                duplicate_counts[duplicate_counts > 1]
+                .rename_axis("__key__")
+                .reset_index(name="cnt")
+            )
+
+            per_sheet[alias] = {
+                "table": clean_table.reset_index(drop=True),
+                "keys": key_series.reset_index(drop=True),
+                "duplicates": duplicates,
+                "total_diff": total_diff,
+            }
+
+        if per_sheet:
+            results[sheet] = per_sheet
+
+    return results
+
+
+def build_item_display_table(
+    source: pd.DataFrame,
+    keys: Sequence[str],
+    currency: str,
+    *,
+    count_map: Optional[Mapping[str, Any]] = None,
+    count_label: str = "Počet výskytů",
+) -> pd.DataFrame:
+    """Return display-ready slice of ``source`` filtered by ``keys``."""
+
+    if not isinstance(source, pd.DataFrame) or source.empty:
+        return pd.DataFrame()
+    if not keys:
+        return pd.DataFrame()
+
+    working = source.copy()
+    if "__key__" not in working.columns:
+        return pd.DataFrame()
+
+    key_strings = pd.Series(keys, dtype=str)
+    working["__key__"] = working["__key__"].astype(str)
+    subset = working[working["__key__"].isin(key_strings)].copy()
+    if subset.empty:
+        return pd.DataFrame()
+
+    subset.sort_values(by=["description", "code"], inplace=True, kind="stable")
+
+    rename_map = {
+        "__key__": "Interní klíč",
+        "code": "Kód",
+        "description": "Popis",
+        "unit": "Jednotka",
+        "quantity": "Množství",
+        "total_price": f"Cena celkem ({currency})",
+        "total": f"Cena celkem ({currency})",
+    }
+
+    column_order: List[str] = ["__key__", "code", "description", "unit", "quantity"]
+    if "total_price" in subset.columns:
+        column_order.append("total_price")
+    elif "total" in subset.columns:
+        column_order.append("total")
+
+    available_columns = [col for col in column_order if col in subset.columns]
+    subset = subset.loc[:, available_columns]
+    subset = subset.rename(columns={col: rename_map.get(col, col) for col in subset.columns})
+
+    if count_map:
+        key_column = "Interní klíč"
+        if key_column in subset.columns:
+            subset[count_label] = subset[key_column].map(
+                lambda val: count_map.get(str(val), np.nan)
+            )
+
+    return subset.reset_index(drop=True)
 
 # ------------- Sidebar Inputs -------------
 
