@@ -623,6 +623,23 @@ def normalize_description_key(value: Any) -> str:
     return without_diacritics.casefold()
 
 
+def _normalized_description_series(df: Any) -> Tuple[pd.Series, Set[str]]:
+    """Return normalized item names used for textual comparisons."""
+
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return pd.Series(dtype=str), set()
+    if "description" not in df.columns:
+        empty = pd.Series(["" for _ in range(len(df))], index=df.index, dtype=str)
+        return empty, set()
+
+    desc_series = df["description"].astype(str)
+    normalized = desc_series.map(normalize_description_key).fillna("")
+    keys = {
+        value for value in normalized if isinstance(value, str) and value.strip()
+    }
+    return normalized, keys
+
+
 def prepare_description_comparison_table(
     df: Any,
 ) -> Tuple[pd.DataFrame, Set[str]]:
@@ -630,16 +647,10 @@ def prepare_description_comparison_table(
 
     if not isinstance(df, pd.DataFrame) or df.empty:
         return pd.DataFrame(), set()
-    if "description" not in df.columns:
-        working = df.copy()
-        working["__desc_norm__"] = ""
-        return working, set()
 
     working = df.reset_index(drop=True).copy()
-    working["description"] = working["description"].astype(str)
-    working["__desc_norm__"] = (
-        working["description"].map(normalize_description_key).fillna("")
-    )
+    normalized, _ = _normalized_description_series(working)
+    working["__desc_norm__"] = normalized
 
     if "is_summary" in working.columns:
         summary_mask = working["is_summary"].fillna(False).astype(bool)
