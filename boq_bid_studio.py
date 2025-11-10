@@ -5652,36 +5652,73 @@ def run_supplier_only_comparison(offer_storage: OfferStorage) -> None:
 
                             diff_rows: List[Dict[str, Any]] = []
                             export_tables: List[Tuple[str, pd.DataFrame]] = []
+                            unpriced_cache: Dict[str, pd.DataFrame] = {}
                             for supplier in dataset.supplier_order:
-                                supplier_keys = set(
-                                    dataset.long_df.loc[
-                                        dataset.long_df["supplier"] == supplier, "join_key"
-                                    ].astype(str)
-                                )
+                                supplier_subset = dataset.long_df[
+                                    dataset.long_df["supplier"] == supplier
+                                ].copy()
+                                join_series = supplier_subset.get(
+                                    "join_key", pd.Series(dtype=str)
+                                ).astype(str)
+                                supplier_keys = set(join_series.tolist())
                                 missing_keys = sorted(template_keys - supplier_keys)
                                 new_keys = sorted(supplier_keys - template_keys)
+
+                                totals_numeric = pd.to_numeric(
+                                    supplier_subset.get("total"), errors="coerce"
+                                )
+                                zero_mask = totals_numeric.notna() & np.isclose(
+                                    totals_numeric, 0.0, atol=1e-9
+                                )
+                                unpriced_mask = totals_numeric.isna() | zero_mask
+                                unpriced_subset = supplier_subset.loc[
+                                    unpriced_mask,
+                                    ["code", "description", "unit", "quantity", "total"],
+                                ].copy()
+                                unpriced_subset.sort_values(
+                                    by=["description", "code"], inplace=True, kind="stable"
+                                )
+                                unpriced_cache[supplier] = unpriced_subset
+
                                 diff_rows.append(
                                     {
                                         "Dodavatel": supplier,
                                         "Chybějící položky": len(missing_keys),
                                         "Nové položky": len(new_keys),
+                                        "Neoceněné položky": int(unpriced_subset.shape[0]),
                                     }
                                 )
 
                             diff_df = pd.DataFrame(diff_rows)
+                            desired_columns = [
+                                "Dodavatel",
+                                "Chybějící položky",
+                                "Nové položky",
+                                "Neoceněné položky",
+                            ]
+                            available_columns = [
+                                col for col in desired_columns if col in diff_df.columns
+                            ]
+                            if available_columns:
+                                diff_df = diff_df[available_columns]
                             st.dataframe(diff_df, use_container_width=True)
                             if not diff_df.empty:
                                 export_tables.append(("Souhrn rozdílů", diff_df))
 
                             for supplier in dataset.supplier_order:
+                                unpriced_subset = unpriced_cache.get(supplier)
                                 supplier_keys = set(
                                     dataset.long_df.loc[
                                         dataset.long_df["supplier"] == supplier, "join_key"
-                                    ].astype(str)
+                                    ]
+                                    .astype(str)
+                                    .tolist()
                                 )
                                 missing_keys = sorted(template_keys - supplier_keys)
                                 new_keys = sorted(supplier_keys - template_keys)
-                                if not missing_keys and not new_keys:
+                                if not missing_keys and not new_keys and (
+                                    unpriced_subset is None or unpriced_subset.empty
+                                ):
                                     continue
                                 with st.expander(f"Detail změn — {supplier}"):
                                     if missing_keys:
@@ -5724,6 +5761,35 @@ def run_supplier_only_comparison(offer_storage: OfferStorage) -> None:
                                                     new_df.copy(),
                                                 )
                                             )
+                                    if unpriced_subset is None or unpriced_subset.empty:
+                                        st.markdown("**Neoceněné položky dodavatele**")
+                                        st.write(
+                                            "Dodavatel ocenil všechny položky (žádné nuly ani prázdné hodnoty)."
+                                        )
+                                    else:
+                                        unpriced_df = unpriced_subset.rename(
+                                            columns={
+                                                "code": "Kód",
+                                                "description": "Popis",
+                                                "unit": "Jednotka",
+                                                "quantity": "Množství",
+                                                "total": f"Cena ({currency})",
+                                            }
+                                        )
+                                        st.markdown("**Neoceněné položky dodavatele**")
+                                        st.caption(
+                                            "Položky, které dodavatel nechal prázdné nebo s nulovou cenou."
+                                        )
+                                        st.dataframe(
+                                            unpriced_df,
+                                            use_container_width=True,
+                                        )
+                                        export_tables.append(
+                                            (
+                                                f"{supplier} — Neoceněné položky",
+                                                unpriced_df.copy(),
+                                            )
+                                        )
 
                             export_payload = [
                                 (title, table)
