@@ -9693,6 +9693,12 @@ with tab_curve:
                                             tickvals.append(int(position))
                                             ticktext.append(label)
 
+                                        cumulative_df = curve_df.copy()
+                                        cumulative_df["__cumulative_total__"] = (
+                                            cumulative_df.groupby("supplier")["total"].cumsum()
+                                        )
+                                        cumulative_df["item_total"] = cumulative_df["total"]
+
                                         color_mapping = {
                                             name: color
                                             for name, color in chart_color_map.items()
@@ -9700,6 +9706,62 @@ with tab_curve:
                                             and isinstance(color, str)
                                             and color
                                         }
+
+                                        xaxis_config = dict(
+                                            title="Pořadí položek",
+                                            rangeslider=dict(visible=False),
+                                        )
+                                        if tickvals and ticktext:
+                                            xaxis_config.update(
+                                                tickmode="array",
+                                                tickvals=tickvals,
+                                                ticktext=ticktext,
+                                                tickangle=-45 if len(tickvals) > 3 else 0,
+                                            )
+
+                                        fig_cumulative = px.line(
+                                            cumulative_df,
+                                            x="__curve_position__",
+                                            y="__cumulative_total__",
+                                            color="supplier",
+                                            markers=True,
+                                            hover_data={
+                                                "code": True,
+                                                "description": True,
+                                                "supplier": True,
+                                                "__curve_position__": False,
+                                                "item_total": True,
+                                            },
+                                            color_discrete_map=color_mapping,
+                                            labels={
+                                                "__cumulative_total__": f"Kumulativní cena ({currency})",
+                                                "item_total": f"Cena položky ({currency})",
+                                                "__curve_position__": "Pořadí položek",
+                                            },
+                                        )
+                                        fig_cumulative.update_traces(
+                                            marker=dict(size=5), line=dict(width=1.5)
+                                        )
+                                        fig_cumulative.update_layout(
+                                            xaxis=dict(**xaxis_config),
+                                            yaxis=dict(
+                                                title=f"Kumulativní cena ({currency})"
+                                            ),
+                                            legend_title="Dodavatel",
+                                            hovermode="x unified",
+                                            margin=dict(t=50, b=80, l=40, r=20),
+                                        )
+                                        fig_cumulative.update_yaxes(tickformat=".0f")
+
+                                        st.markdown(
+                                            "#### Kumulativní spojitá nabídková křivka"
+                                        )
+                                        st.plotly_chart(
+                                            fig_cumulative, use_container_width=True
+                                        )
+                                        st.caption(
+                                            "Graf zobrazuje kumulativní spojitou nabídkovou křivku v pořadí položek z tabulky."
+                                        )
 
                                         fig = px.line(
                                             curve_df,
@@ -9718,21 +9780,8 @@ with tab_curve:
                                         fig.update_traces(
                                             marker=dict(size=5), line=dict(width=1.5)
                                         )
-
-                                        xaxis_config = dict(
-                                            title="Pořadí položek",
-                                            rangeslider=dict(visible=False),
-                                        )
-                                        if tickvals and ticktext:
-                                            xaxis_config.update(
-                                                tickmode="array",
-                                                tickvals=tickvals,
-                                                ticktext=ticktext,
-                                                tickangle=-45 if len(tickvals) > 3 else 0,
-                                            )
-
                                         fig.update_layout(
-                                            xaxis=xaxis_config,
+                                            xaxis=dict(**xaxis_config),
                                             yaxis=dict(
                                                 title=f"Celková cena ({currency})"
                                             ),
@@ -9742,6 +9791,7 @@ with tab_curve:
                                         )
                                         fig.update_yaxes(tickformat=".0f")
 
+                                        st.markdown("#### Spojitá nabídková křivka")
                                         st.plotly_chart(
                                             fig, use_container_width=True
                                         )
