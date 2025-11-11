@@ -5803,162 +5803,176 @@ def run_supplier_only_comparison(offer_storage: OfferStorage) -> None:
                             st.dataframe(duplicate_table, use_container_width=True)
 
             st.markdown("### Výtah nenaceněných položek")
-            if dataset.long_df.empty:
-                st.info("Nenaceněné položky nebyly nalezeny.")
-            else:
-                unpriced_working = dataset.long_df.copy()
-                desc_series = unpriced_working.get("description")
-                if desc_series is None:
-                    desc_series = pd.Series(
-                        "", index=unpriced_working.index, dtype=str
-                    )
-                unpriced_working["description"] = desc_series.astype(str)
-                desc_mask = unpriced_working["description"].str.strip() != ""
-                total_raw = unpriced_working.get("total")
-                if total_raw is None:
-                    total_raw = pd.Series(
-                        np.nan, index=unpriced_working.index, dtype=float
-                    )
-                total_series = pd.to_numeric(total_raw, errors="coerce")
-                unpriced_mask = desc_mask & (
-                    total_series.isna() | (total_series.abs() < 1e-9)
+            unpriced_detail_records: List[Tuple[str, pd.DataFrame]] = []
+            unpriced_summary_rows: List[Dict[str, Any]] = []
+            unpriced_export_tables: List[Tuple[str, pd.DataFrame]] = []
+
+            for alias in dataset.supplier_order:
+                supplier_info = sheet_checks.get(alias)
+                if not supplier_info:
+                    continue
+                supplier_table = supplier_info.get("table", pd.DataFrame())
+                if not isinstance(supplier_table, pd.DataFrame) or supplier_table.empty:
+                    continue
+
+                supplier_working = supplier_table.reset_index(drop=True).copy()
+                desc_source = supplier_working.get(
+                    "description",
+                    pd.Series("", index=supplier_working.index, dtype=str),
                 )
+                supplier_working["__desc_norm__"] = desc_source.astype(str).map(
+                    normalize_description_key
+                )
+
+                supplier_summary_mask: Optional[pd.Series] = None
+                if "is_summary" in supplier_working.columns:
+                    supplier_summary_mask = (
+                        supplier_working["is_summary"].fillna(False).astype(bool)
+                    )
+                    include_summary_other = summary_rows_included_as_items(
+                        supplier_working
+                    )
+                    if isinstance(include_summary_other, pd.Series):
+                        supplier_summary_mask &= ~include_summary_other.reindex(
+                            supplier_working.index, fill_value=False
+                        )
+                    if supplier_summary_mask.any():
+                        supplier_working.loc[supplier_summary_mask, "__desc_norm__"] = ""
+
+                desc_series = supplier_working.get(
+                    "__desc_norm__",
+                    pd.Series("", index=supplier_working.index, dtype=str),
+                )
+                desc_mask = desc_series.astype(str).str.strip() != ""
+
+                total_series = supplier_working.get("total_price")
+                if total_series is None:
+                    total_series = supplier_working.get("total")
+                if total_series is None:
+                    total_series = pd.Series(
+                        np.nan, index=supplier_working.index, dtype=float
+                    )
+                totals_numeric = pd.to_numeric(total_series, errors="coerce")
+                zero_mask = totals_numeric.isna() | (totals_numeric.abs() < 1e-9)
+                unpriced_mask = zero_mask & desc_mask
+                if supplier_summary_mask is not None:
+                    unpriced_mask &= ~supplier_summary_mask
+
                 if not unpriced_mask.any():
-                    st.info("Všechny položky dodavatelů mají vyplněnou cenu celkem.")
-                else:
-                    unpriced_rows = unpriced_working.loc[unpriced_mask].copy()
-                    quantity_raw = unpriced_rows.get("quantity")
-                    if quantity_raw is not None:
-                        unpriced_rows["quantity"] = pd.to_numeric(
-                            quantity_raw, errors="coerce"
-                        )
-                    else:
-                        unpriced_rows["quantity"] = pd.Series(
-                            np.nan, index=unpriced_rows.index, dtype=float
-                        )
-                    total_raw = unpriced_rows.get("total")
-                    if total_raw is not None:
-                        unpriced_rows["total"] = pd.to_numeric(
-                            total_raw, errors="coerce"
-                        )
-                    else:
-                        unpriced_rows["total"] = pd.Series(
-                            np.nan, index=unpriced_rows.index, dtype=float
-                        )
-                    supplier_order_map = {
-                        supplier: idx for idx, supplier in enumerate(dataset.supplier_order)
+                    continue
+
+                unpriced_subset = supplier_working.loc[unpriced_mask].copy()
+                prepared_unpriced = prepare_preview_table(unpriced_subset)
+                numeric_source = unpriced_subset.reset_index(drop=True)
+                numeric_cols = [
+                    col
+                    for col in prepared_unpriced.columns
+                    if col in numeric_source.columns
+                    and pd.api.types.is_numeric_dtype(numeric_source[col])
+                ]
+                formatted_unpriced = format_preview_numbers(
+                    prepared_unpriced, numeric_source, numeric_cols
+                )
+                display_columns = [
+                    col
+                    for col in [
+                        "code",
+                        "description",
+                        "unit",
+                        "quantity",
+                        "total_price",
+                    ]
+                    if col in formatted_unpriced.columns
+                ]
+                if display_columns:
+                    formatted_unpriced = formatted_unpriced.loc[:, display_columns]
+                rename_map = {
+                    "code": "Kód",
+                    "description": "Popis",
+                    "unit": "Jednotka",
+                    "quantity": "Množství",
+                    "total_price": f"Cena celkem ({currency})",
+                }
+                formatted_unpriced = formatted_unpriced.rename(
+                    columns={
+                        col: rename_map.get(col, col)
+                        for col in formatted_unpriced.columns
                     }
-                    unpriced_rows["__supplier_order__"] = unpriced_rows["supplier"].map(
-                        supplier_order_map
-                    )
-                    unpriced_rows["__supplier_order__"].fillna(len(supplier_order_map), inplace=True)
-                    unpriced_rows.sort_values(
-                        by=["__supplier_order__", "source_order", "code", "description"],
-                        inplace=True,
-                        kind="stable",
-                    )
-
-                    detail_df = unpriced_rows.assign(
-                        Dodavatel=unpriced_rows["supplier"].astype(str),
-                        List=dataset.sheet,
-                    )
-                    rename_map = {
-                        "code": "Kód",
-                        "description": "Popis",
-                        "unit": "Jednotka",
-                        "quantity": "Množství",
-                        "total": f"Cena celkem ({currency})",
+                )
+                formatted_unpriced.insert(0, "Dodavatel", alias)
+                formatted_unpriced.insert(0, "List", selected_sheet)
+                unpriced_detail_records.append((alias, formatted_unpriced))
+                unpriced_summary_rows.append(
+                    {
+                        "Dodavatel": alias,
+                        "Počet nenaceněných položek": int(len(formatted_unpriced)),
                     }
-                    detail_df = detail_df.rename(columns=rename_map)
-                    display_columns = [
-                        "List",
-                        "Dodavatel",
-                        "Kód",
-                        "Popis",
-                        "Jednotka",
-                        "Množství",
-                        f"Cena celkem ({currency})",
-                    ]
-                    detail_columns = [
-                        col
-                        for col in display_columns
-                        if col in detail_df.columns
-                    ]
-                    detail_display = detail_df.loc[:, detail_columns]
-                    summary_df = (
-                        detail_display.groupby("Dodavatel", as_index=False)
-                        .size()
-                        .rename(columns={"size": "Počet nenaceněných položek"})
+                )
+                unpriced_export_tables.append(
+                    (
+                        f"{alias} — Nenaceněné položky",
+                        formatted_unpriced.copy(),
                     )
-                    if not summary_df.empty:
-                        summary_df["Dodavatel"] = summary_df["Dodavatel"].astype(str)
-                        summary_df["__order__"] = summary_df["Dodavatel"].map(
-                            supplier_order_map
-                        )
-                        summary_df.sort_values(
-                            by=["__order__", "Dodavatel"], inplace=True, kind="stable"
-                        )
-                        summary_df.drop(columns=["__order__"], inplace=True)
-                        summary_df["Počet nenaceněných položek"] = summary_df[
-                            "Počet nenaceněných položek"
-                        ].astype(int)
-                        summary_df.reset_index(drop=True, inplace=True)
-                        st.dataframe(summary_df, use_container_width=True)
+                )
 
-                    detail_display = detail_display.reset_index(drop=True)
-                    detail_height = min(900, 220 + max(len(detail_display), 1) * 28)
-                    st.dataframe(
-                        detail_display,
-                        use_container_width=True,
-                        height=detail_height,
-                    )
+            if not unpriced_detail_records:
+                st.info("Všechny položky dodavatelů mají vyplněnou cenu celkem.")
+            else:
+                unpriced_summary_df = pd.DataFrame(unpriced_summary_rows)
+                if not unpriced_summary_df.empty:
+                    unpriced_summary_df = unpriced_summary_df.sort_values(
+                        by=["Dodavatel"]
+                    ).reset_index(drop=True)
+                    st.dataframe(unpriced_summary_df, use_container_width=True)
 
-                    export_payload: List[Tuple[str, pd.DataFrame]] = []
-                    if not summary_df.empty:
-                        export_payload.append(("Souhrn", summary_df.copy()))
-                    for supplier in dataset.supplier_order:
-                        supplier_detail = detail_display[
-                            detail_display["Dodavatel"] == supplier
-                        ]
-                        if not supplier_detail.empty:
-                            export_payload.append(
-                                (
-                                    f"{supplier} — Nenaceněné položky",
-                                    supplier_detail.copy(),
-                                )
-                            )
-                    export_payload.append(
-                        ("Všechny nenaceněné položky", detail_display.copy())
+                unpriced_combined = pd.concat(
+                    [df for _, df in unpriced_detail_records],
+                    ignore_index=True,
+                    sort=False,
+                )
+                unpriced_height = min(900, 220 + max(len(unpriced_combined), 1) * 28)
+                st.dataframe(
+                    unpriced_combined,
+                    use_container_width=True,
+                    height=unpriced_height,
+                )
+
+                export_payload: List[Tuple[str, pd.DataFrame]] = []
+                if not unpriced_summary_df.empty:
+                    export_payload.append(("Souhrn", unpriced_summary_df.copy()))
+                export_payload.extend(unpriced_export_tables)
+                export_payload.append(
+                    ("Všechny nenaceněné položky", unpriced_combined.copy())
+                )
+                export_payload = [
+                    (title, table)
+                    for title, table in export_payload
+                    if isinstance(table, pd.DataFrame) and not table.empty
+                ]
+                if export_payload:
+                    export_stub = sanitize_filename(
+                        f"nenacenene_{selected_sheet}"
                     )
-                    export_payload = [
-                        (title, table)
-                        for title, table in export_payload
-                        if isinstance(table, pd.DataFrame) and not table.empty
-                    ]
-                    if export_payload:
-                        export_stub = sanitize_filename(
-                            f"nenacenene_{dataset.sheet}"
-                        )
-                        excel_bytes = dataframes_to_excel_bytes(export_payload)
-                        pdf_bytes = generate_tables_pdf(
-                            f"Výtah nenaceněných položek — {dataset.sheet}",
-                            export_payload,
-                        )
-                        export_cols = st.columns(2)
-                        export_cols[0].download_button(
-                            "⬇️ Export výtahu XLSX",
-                            data=excel_bytes,
-                            file_name=f"{export_stub}.xlsx",
-                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                            key=f"{dataset.sheet}_unpriced_supplier_only_xlsx",
-                        )
-                        export_cols[1].download_button(
-                            "⬇️ Export výtahu PDF",
-                            data=pdf_bytes,
-                            file_name=f"{export_stub}.pdf",
-                            mime="application/pdf",
-                            key=f"{dataset.sheet}_unpriced_supplier_only_pdf",
-                        )
+                    excel_bytes = dataframes_to_excel_bytes(export_payload)
+                    pdf_bytes = generate_tables_pdf(
+                        f"Výtah nenaceněných položek — {selected_sheet}",
+                        export_payload,
+                    )
+                    export_cols = st.columns(2)
+                    export_cols[0].download_button(
+                        "⬇️ Export výtahu XLSX",
+                        data=excel_bytes,
+                        file_name=f"{export_stub}.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        key=f"{selected_sheet}_unpriced_supplier_only_xlsx",
+                    )
+                    export_cols[1].download_button(
+                        "⬇️ Export výtahu PDF",
+                        data=pdf_bytes,
+                        file_name=f"{export_stub}.pdf",
+                        mime="application/pdf",
+                        key=f"{selected_sheet}_unpriced_supplier_only_pdf",
+                    )
             stored_templates = offer_storage.list_templates()
             template_display_map = {"": "— žádná šablona —"}
             template_options = [""]
