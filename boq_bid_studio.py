@@ -4609,42 +4609,6 @@ def compare(master: WorkbookData, bids: Dict[str, WorkbookData], join_mode: str 
         if supplier_totals:
             comp.attrs.setdefault("supplier_totals", {}).update(supplier_totals)
 
-        total_cols = [c for c in comp.columns if c.endswith(" total") and c != "Master total"]
-        if total_cols:
-            comp["LOWEST total"] = comp[total_cols].min(axis=1, skipna=True)
-            highest_total = comp[total_cols].max(axis=1, skipna=True)
-            comp["MIDRANGE total"] = (comp["LOWEST total"] + highest_total) / 2
-            for c in total_cols:
-                comp[f"{c} Δ vs LOWEST"] = comp[c] - comp["LOWEST total"]
-
-            def _valid_supplier_totals(row: pd.Series) -> Dict[str, Any]:
-                values = {}
-                for col in total_cols:
-                    value = row[col]
-                    if pd.notna(value):
-                        values[col.replace(" total", "")] = value
-                return values
-
-            # Which supplier is the lowest per row?
-            def lowest_supplier(row: pd.Series) -> Optional[str]:
-                values = _valid_supplier_totals(row)
-                if not values:
-                    return None
-                return min(values, key=values.get)
-
-            def supplier_range(row: pd.Series) -> Optional[str]:
-                values = _valid_supplier_totals(row)
-                if not values:
-                    return None
-                lowest = min(values, key=values.get)
-                highest = max(values, key=values.get)
-                if lowest == highest:
-                    return lowest
-                return f"{lowest} – {highest}"
-
-            comp["LOWEST supplier"] = comp.apply(lowest_supplier, axis=1)
-            comp["MIDRANGE supplier range"] = comp.apply(supplier_range, axis=1)
-
         comp.attrs["master_total_sum"] = master_total_sum
         try:
             sections_view, _, _, _, _ = overview_comparison(master, bids, sheet)
@@ -4682,7 +4646,6 @@ def rename_comparison_columns(df: pd.DataFrame, mapping: Dict[str, str]) -> pd.D
         rename_map[f"{raw} unit_price_install"] = f"{alias} unit_price_install"
         rename_map[f"{raw} total"] = f"{alias} total"
         rename_map[f"{raw} Δ qty"] = f"{alias} Δ qty"
-        rename_map[f"{raw} Δ vs LOWEST"] = f"{alias} Δ vs LOWEST"
         join_key_col = f"__join_key__::{raw}"
         if join_key_col in df.columns:
             rename_map[join_key_col] = f"__join_key__::{alias}"
@@ -4715,43 +4678,6 @@ def rename_comparison_columns(df: pd.DataFrame, mapping: Dict[str, str]) -> pd.D
                 "supplier": supplier_copy,
             }
         renamed.attrs["comparison_join_keys"] = renamed_join_attr
-    if "LOWEST supplier" in renamed.columns or "MIDRANGE supplier range" in renamed.columns:
-
-        def _map_supplier_name(value: Any) -> Any:
-            if pd.isna(value):
-                return value
-            return mapping.get(value, value)
-
-        if "LOWEST supplier" in renamed.columns:
-            renamed["LOWEST supplier"] = renamed["LOWEST supplier"].apply(
-                _map_supplier_name
-            )
-
-        if "MIDRANGE supplier range" in renamed.columns:
-
-            def _map_supplier_range(value: Any) -> Any:
-                if pd.isna(value):
-                    return value
-                if isinstance(value, (list, tuple)) and len(value) == 2:
-                    low = _map_supplier_name(value[0])
-                    high = _map_supplier_name(value[1])
-                elif isinstance(value, str):
-                    parts = [p.strip() for p in re.split(r"[–-]", value) if p.strip()]
-                    if not parts:
-                        return value
-                    if len(parts) == 1:
-                        return _map_supplier_name(parts[0])
-                    low = _map_supplier_name(parts[0])
-                    high = _map_supplier_name(parts[-1])
-                else:
-                    return value
-                if low == high:
-                    return low
-                return f"{low} – {high}"
-
-            renamed["MIDRANGE supplier range"] = renamed["MIDRANGE supplier range"].apply(
-                _map_supplier_range
-            )
     if "description" in renamed.columns:
 
         def _replace_unmapped_description(value: Any) -> Any:

@@ -34,10 +34,8 @@ Porovnání pracuje s instancemi `WorkbookData`, které uchovávají pojmenovan�
 
 ## Výpočty odchylek a metrik
 
-- Z celkových cen jednotlivých dodavatelů se dopočítá minimum (`LOWEST total`) a midrange (`MIDRANGE total`).
-- Vznikne sloupec `LOWEST supplier` s názvem nejlevnějšího dodavatele na řádku a `MIDRANGE supplier range` s rozpětím dodavatelů mezi minimem a maximem.
-- Pro každý dodavatelský sloupec `total` se dopočítá rozdíl vůči nejnižší ceně (`<Dodavatel> Δ vs LOWEST`).
-- Metadata uložená v atributech DataFrame obsahují součty celkových cen pro kontrolu (`supplier_totals`) a součet master cen (`master_total_sum`).
+- Pro každý dodavatelský sloupec `total` se uchovávají součty celkových cen pro kontrolu (`supplier_totals`).
+- Atribut `master_total_sum` obsahuje celkovou hodnotu masteru pro daný list.
 
 ## Výstup pro záložku Porovnání
 
@@ -45,6 +43,6 @@ Finální `DataFrame` pro každý list tak obsahuje:
 
 - referenční informace (`code`, `description`, `unit`, `Master quantity`, `Master total` a případné jednotkové ceny),
 - sadu sloupců pro každého dodavatele (množství, jednotková cena, celková cena, rozdíly množství a případné komponentní ceny),
-- agregované metriky napříč dodavateli (`LOWEST total`, `MIDRANGE total`, `LOWEST supplier`, `MIDRANGE supplier range`).
+- metadata v atributech DataFrame pro následnou kontrolu (součty dodavatelů a součet masteru).
 
 Tyto hodnoty se dále využívají při zobrazení tabulky v uživatelském rozhraní a pro výpočet procentuálních odchylek vůči master cenám.
