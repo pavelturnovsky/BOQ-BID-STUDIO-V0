@@ -490,6 +490,25 @@ class SupplierOnlyDataset:
 
 SUPPLIER_ONLY_DEVIATION_THRESHOLD = 0.1
 
+DEFAULT_SUPPLIER_ONLY_TRIM_PERCENT = 0.1
+DEFAULT_SUPPLIER_ONLY_IQR_MULTIPLIER = 1.5
+SUPPLIER_ONLY_TRIM_STATE_KEY = "supplier_only_trim_percent"
+SUPPLIER_ONLY_IQR_STATE_KEY = "supplier_only_iqr_multiplier"
+SUPPLIER_ONLY_BASKET_MODE_KEY = "supplier_only_basket_mode"
+SUPPLIER_ONLY_QUANTITY_MODE_KEY = "supplier_only_quantity_mode"
+SUPPLIER_ONLY_BASKET_MODES = ("union", "majority", "intersection")
+SUPPLIER_ONLY_QUANTITY_MODES = ("offer", "consensus", "unitary")
+SUPPLIER_ONLY_BASKET_LABELS = {
+    "union": "Unie (všechny položky)",
+    "majority": "Většina dodavatelů",
+    "intersection": "Průnik (společné položky)",
+}
+SUPPLIER_ONLY_QUANTITY_LABELS = {
+    "offer": "Množství dle nabídky",
+    "consensus": "Mediánové množství",
+    "unitary": "Jednotkové množství (1)",
+}
+
 
 def is_master_column(column_name: str) -> bool:
     """Return True if the provided column represents Master totals."""
@@ -825,6 +844,8 @@ def build_supplier_only_dataset(
     for join_key, group in grouped:
         totals_numeric = pd.to_numeric(group.get("total"), errors="coerce")
         totals_numeric = totals_numeric.dropna()
+        quantity_numeric = pd.to_numeric(group.get("quantity"), errors="coerce")
+        quantity_numeric = quantity_numeric.dropna()
         best_supplier = ""
         best_value = np.nan
         if not totals_numeric.empty:
@@ -836,6 +857,18 @@ def build_supplier_only_dataset(
         mean_total = float(totals_numeric.mean()) if not totals_numeric.empty else np.nan
         min_total = float(totals_numeric.min()) if not totals_numeric.empty else np.nan
         max_total = float(totals_numeric.max()) if not totals_numeric.empty else np.nan
+        median_quantity = (
+            float(quantity_numeric.median()) if not quantity_numeric.empty else np.nan
+        )
+        mean_quantity = (
+            float(quantity_numeric.mean()) if not quantity_numeric.empty else np.nan
+        )
+        min_quantity = (
+            float(quantity_numeric.min()) if not quantity_numeric.empty else np.nan
+        )
+        max_quantity = (
+            float(quantity_numeric.max()) if not quantity_numeric.empty else np.nan
+        )
         order_hint = pd.to_numeric(group.get("source_order"), errors="coerce")
         order_value = float(order_hint.median()) if order_hint.notna().any() else np.nan
 
@@ -849,6 +882,10 @@ def build_supplier_only_dataset(
                 "mean_total": mean_total,
                 "min_total": min_total,
                 "max_total": max_total,
+                "median_quantity": median_quantity,
+                "mean_quantity": mean_quantity,
+                "min_quantity": min_quantity,
+                "max_quantity": max_quantity,
                 "supplier_count": int(group["supplier"].nunique()),
                 "best_supplier": best_supplier,
                 "best_total": best_value,
@@ -966,6 +1003,589 @@ def build_supplier_only_summary(
     summary_df["Delta vs medián"] = summary_df["Celkem"] - median_total
     summary_df["Pořadí"] = summary_df["Celkem"].rank(method="min")
     return summary_df
+
+
+def compute_trimmed_mean(values: pd.Series, trim_percent: float) -> float:
+    """Return a symmetric trimmed mean for the provided numeric values."""
+
+    if not isinstance(values, pd.Series):
+        values = pd.Series(values)
+    clean = pd.to_numeric(values, errors="coerce").dropna()
+    if clean.empty:
+        return np.nan
+
+    trimmed_fraction = max(0.0, min(0.5, float(trim_percent)))
+    if trimmed_fraction <= 0.0:
+        return float(clean.mean())
+
+    count = len(clean)
+    trim_count = int(math.floor(count * trimmed_fraction))
+    if trim_count <= 0:
+        return float(clean.mean())
+
+    sorted_values = clean.sort_values(ignore_index=True)
+    trimmed = sorted_values.iloc[trim_count : count - trim_count]
+    if trimmed.empty:
+        trimmed = sorted_values
+    return float(trimmed.mean())
+
+
+def build_supplier_only_master_bucket(
+    dataset: SupplierOnlyDataset,
+    *,
+    basket_mode: str = "union",
+    quantity_mode: str = "offer",
+    trim_percent: float = DEFAULT_SUPPLIER_ONLY_TRIM_PERCENT,
+    iqr_multiplier: float = DEFAULT_SUPPLIER_ONLY_IQR_MULTIPLIER,
+) -> Dict[str, Any]:
+    """Build a master bucket view with aggregated statistics for supplier-only mode."""
+
+    if dataset.long_df.empty:
+        return {
+            "bucket": pd.DataFrame(),
+            "detail": pd.DataFrame(),
+            "basket_mode": basket_mode,
+            "quantity_mode": quantity_mode,
+            "trim_percent": trim_percent,
+            "iqr_multiplier": iqr_multiplier,
+            "total_suppliers": len(dataset.supplier_order),
+            "join_keys": [],
+        }
+
+    if basket_mode not in SUPPLIER_ONLY_BASKET_MODES:
+        basket_mode = "union"
+    if quantity_mode not in SUPPLIER_ONLY_QUANTITY_MODES:
+        quantity_mode = "offer"
+
+    trim_percent = max(0.0, min(0.5, float(trim_percent)))
+    iqr_multiplier = max(0.0, float(iqr_multiplier))
+
+    working = dataset.long_df.copy()
+    working["total"] = pd.to_numeric(working.get("total"), errors="coerce")
+    working["quantity"] = pd.to_numeric(working.get("quantity"), errors="coerce")
+    working["supplier"] = working.get("supplier").astype(str)
+
+    consensus_lookup = (
+        dataset.consensus_df.copy()
+        if isinstance(dataset.consensus_df, pd.DataFrame)
+        else pd.DataFrame()
+    )
+
+    detail_frames: List[pd.DataFrame] = []
+    bucket_rows: List[Dict[str, Any]] = []
+    total_suppliers = (
+        int(len(dataset.supplier_order))
+        if dataset.supplier_order
+        else int(working["supplier"].nunique())
+    )
+
+    grouped = working.groupby("join_key", sort=False)
+
+    for join_key, group in grouped:
+        consensus_row = (
+            consensus_lookup.loc[join_key]
+            if join_key in consensus_lookup.index
+            else None
+        )
+        consensus_dict = (
+            consensus_row.to_dict() if isinstance(consensus_row, pd.Series) else {}
+        )
+
+        code = consensus_dict.get("code") or _first_nonempty(group.get("code", []))
+        description = (
+            consensus_dict.get("description")
+            or _first_nonempty(group.get("description", []))
+        )
+        unit = consensus_dict.get("unit") or _first_nonempty(group.get("unit", []))
+        supplier_count = int(
+            consensus_dict.get("supplier_count") or group["supplier"].nunique()
+        )
+        order_value = consensus_dict.get("order") or consensus_dict.get("order_hint")
+
+        quantity_series = pd.to_numeric(group.get("quantity"), errors="coerce")
+        total_series = pd.to_numeric(group.get("total"), errors="coerce")
+
+        with np.errstate(divide="ignore", invalid="ignore"):
+            unit_price_series = total_series / quantity_series
+        unit_price_series = unit_price_series.replace([np.inf, -np.inf], np.nan)
+        clean_unit_prices = unit_price_series.dropna()
+
+        median_unit_price = (
+            float(clean_unit_prices.median()) if not clean_unit_prices.empty else np.nan
+        )
+        trimmed_unit_price = compute_trimmed_mean(
+            clean_unit_prices, trim_percent
+        )
+        q1_unit_price = (
+            float(clean_unit_prices.quantile(0.25))
+            if not clean_unit_prices.empty
+            else np.nan
+        )
+        q3_unit_price = (
+            float(clean_unit_prices.quantile(0.75))
+            if not clean_unit_prices.empty
+            else np.nan
+        )
+        iqr_unit_price = (
+            q3_unit_price - q1_unit_price
+            if np.isfinite(q3_unit_price) and np.isfinite(q1_unit_price)
+            else np.nan
+        )
+
+        outlier_mask = pd.Series(False, index=group.index)
+        if (
+            np.isfinite(iqr_unit_price)
+            and iqr_unit_price > 0
+            and iqr_multiplier > 0
+            and np.isfinite(q1_unit_price)
+            and np.isfinite(q3_unit_price)
+        ):
+            lower_bound = q1_unit_price - iqr_multiplier * iqr_unit_price
+            upper_bound = q3_unit_price + iqr_multiplier * iqr_unit_price
+            candidate_mask = (unit_price_series < lower_bound) | (
+                unit_price_series > upper_bound
+            )
+            outlier_mask = candidate_mask.fillna(False)
+
+        consensus_quantity = consensus_dict.get("median_quantity")
+        if pd.isna(consensus_quantity):
+            consensus_quantity = quantity_series.median()
+        consensus_quantity = (
+            float(consensus_quantity) if pd.notna(consensus_quantity) else np.nan
+        )
+
+        section_token, section_label = resolve_section_label(code, description)
+
+        if quantity_mode == "offer":
+            selected_quantity = quantity_series
+        elif quantity_mode == "consensus":
+            selected_quantity = pd.Series(consensus_quantity, index=group.index)
+        else:
+            selected_quantity = pd.Series(1.0, index=group.index)
+
+        detail_frame = group.copy()
+        detail_frame["code"] = code
+        detail_frame["description"] = description
+        detail_frame["unit"] = unit
+        detail_frame["total"] = total_series
+        detail_frame["quantity"] = quantity_series
+        detail_frame["unit_price"] = unit_price_series
+        detail_frame["median_unit_price"] = median_unit_price
+        detail_frame["trimmed_unit_price"] = trimmed_unit_price
+        detail_frame["q1_unit_price"] = q1_unit_price
+        detail_frame["q3_unit_price"] = q3_unit_price
+        detail_frame["iqr_unit_price"] = iqr_unit_price
+        detail_frame["consensus_quantity"] = consensus_quantity
+        detail_frame["selected_quantity"] = pd.to_numeric(
+            selected_quantity, errors="coerce"
+        )
+        detail_frame["is_outlier"] = outlier_mask.astype(bool)
+        detail_frame["section_token"] = section_token
+        detail_frame["section_label"] = section_label
+
+        detail_frames.append(detail_frame)
+
+        median_total = consensus_dict.get("median_total")
+        if pd.isna(median_total):
+            median_total = (
+                float(total_series.median()) if total_series.notna().any() else np.nan
+            )
+        min_total = consensus_dict.get("min_total")
+        if pd.isna(min_total):
+            min_total = (
+                float(total_series.min()) if total_series.notna().any() else np.nan
+            )
+        max_total = consensus_dict.get("max_total")
+        if pd.isna(max_total):
+            max_total = (
+                float(total_series.max()) if total_series.notna().any() else np.nan
+            )
+
+        bucket_rows.append(
+            {
+                "join_key": join_key,
+                "code": code,
+                "description": description,
+                "unit": unit,
+                "section_token": section_token,
+                "section_label": section_label,
+                "supplier_count": supplier_count,
+                "coverage_pct": (
+                    supplier_count / total_suppliers * 100.0
+                    if total_suppliers
+                    else np.nan
+                ),
+                "median_total": median_total,
+                "min_total": min_total,
+                "max_total": max_total,
+                "median_unit_price": median_unit_price,
+                "trimmed_unit_price": trimmed_unit_price,
+                "q1_unit_price": q1_unit_price,
+                "q3_unit_price": q3_unit_price,
+                "iqr_unit_price": iqr_unit_price,
+                "consensus_quantity": consensus_quantity,
+                "order": order_value,
+                "variation_pct": consensus_dict.get("variation_pct"),
+            }
+        )
+
+    bucket_df = pd.DataFrame(bucket_rows)
+    detail_df = (
+        pd.concat(detail_frames, ignore_index=True, sort=False)
+        if detail_frames
+        else pd.DataFrame()
+    )
+
+    join_keys: Set[Any] = set()
+
+    if not bucket_df.empty:
+        bucket_df["order"] = pd.to_numeric(bucket_df.get("order"), errors="coerce")
+        threshold = 1
+        if basket_mode == "intersection":
+            threshold = max(total_suppliers, 1)
+        elif basket_mode == "majority":
+            threshold = max(int(math.ceil(total_suppliers / 2)), 1)
+
+        supplier_counts = pd.to_numeric(
+            bucket_df.get("supplier_count"), errors="coerce"
+        ).fillna(0)
+        valid_mask = supplier_counts >= threshold
+        bucket_df = bucket_df.loc[valid_mask].reset_index(drop=True)
+        join_keys = set(bucket_df["join_key"].tolist())
+        bucket_df.sort_values(
+            by=["order", "code", "description"],
+            kind="stable",
+            inplace=True,
+            na_position="last",
+        )
+
+    if not detail_df.empty and join_keys:
+        detail_df = detail_df[detail_df["join_key"].isin(join_keys)].copy()
+        detail_df.sort_values(
+            by=["section_token", "code", "supplier"],
+            kind="stable",
+            inplace=True,
+        )
+        detail_df.reset_index(drop=True, inplace=True)
+
+    return {
+        "bucket": bucket_df.reset_index(drop=True),
+        "detail": detail_df,
+        "basket_mode": basket_mode,
+        "quantity_mode": quantity_mode,
+        "trim_percent": trim_percent,
+        "iqr_multiplier": iqr_multiplier,
+        "total_suppliers": total_suppliers,
+        "join_keys": list(join_keys),
+    }
+
+
+def compute_supplier_only_scenarios(
+    master_data: Mapping[str, Any],
+    *,
+    currency_label: str,
+) -> Dict[str, Any]:
+    """Compute scenario totals (A/B/C) for supplier-only comparisons."""
+
+    bucket_df = master_data.get("bucket", pd.DataFrame())
+    detail_df = master_data.get("detail", pd.DataFrame())
+
+    if bucket_df.empty or detail_df.empty:
+        return {
+            "summary": pd.DataFrame(),
+            "detail": detail_df.copy(),
+            "sections": pd.DataFrame(),
+            "total_items": 0,
+            "currency": currency_label,
+        }
+
+    detail = detail_df.copy()
+
+    numeric_cols = [
+        "total",
+        "quantity",
+        "unit_price",
+        "median_unit_price",
+        "consensus_quantity",
+    ]
+    for col in numeric_cols:
+        detail[col] = pd.to_numeric(detail.get(col), errors="coerce")
+
+    if "unit_price" not in detail.columns:
+        with np.errstate(divide="ignore", invalid="ignore"):
+            detail["unit_price"] = detail["total"] / detail["quantity"]
+        detail["unit_price"] = detail["unit_price"].replace([np.inf, -np.inf], np.nan)
+
+    consensus_quantity_series = detail["consensus_quantity"].where(
+        detail["consensus_quantity"].notna(), detail["quantity"]
+    )
+
+    detail["scenario_a_total"] = detail["total"]
+    detail["scenario_b_total"] = detail["quantity"] * detail["median_unit_price"]
+    detail["scenario_c_total"] = consensus_quantity_series * detail["unit_price"]
+
+    for column in ["scenario_b_total", "scenario_c_total"]:
+        detail[column] = detail[column].where(np.isfinite(detail[column]), np.nan)
+
+    total_items = int(bucket_df["join_key"].nunique())
+
+    summary = detail.groupby("supplier", sort=False).agg(
+        scenario_a_total=("scenario_a_total", lambda s: float(np.nansum(s))),
+        scenario_b_total=("scenario_b_total", lambda s: float(np.nansum(s))),
+        scenario_c_total=("scenario_c_total", lambda s: float(np.nansum(s))),
+        priced_items=("total", lambda s: int(s.notna().sum())),
+        item_count=("join_key", "nunique"),
+        outlier_count=(
+            "is_outlier",
+            lambda s: int(pd.Series(s, dtype="boolean").fillna(False).sum()),
+        ),
+    )
+
+    summary["coverage_pct"] = summary["priced_items"] / total_items * 100.0 if total_items else np.nan
+
+    median_a = float(np.nanmedian(summary["scenario_a_total"])) if not summary.empty else np.nan
+    median_b = float(np.nanmedian(summary["scenario_b_total"])) if not summary.empty else np.nan
+    median_c = float(np.nanmedian(summary["scenario_c_total"])) if not summary.empty else np.nan
+
+    summary["delta_vs_median_a"] = summary["scenario_a_total"] - median_a
+    summary["delta_vs_median_b"] = summary["scenario_b_total"] - median_b
+    summary["delta_vs_median_c"] = summary["scenario_c_total"] - median_c
+    summary["rank_c"] = summary["scenario_c_total"].rank(method="min")
+
+    summary_df = summary.reset_index().rename(columns={"supplier": "Dodavatel"})
+
+    section_rows: List[Dict[str, Any]] = []
+    grouped_sections = detail.groupby(
+        ["section_token", "section_label"], sort=False, dropna=False
+    )
+    for (section_token, section_label), section_group in grouped_sections:
+        section_items = int(section_group["join_key"].nunique())
+        for supplier, supplier_group in section_group.groupby("supplier", sort=False):
+            coverage_items = int(supplier_group["join_key"].nunique())
+            priced_items = int(supplier_group["total"].notna().sum())
+            section_rows.append(
+                {
+                    "section_token": section_token,
+                    "section_label": section_label or "Nezařazeno",
+                    "Dodavatel": supplier,
+                    "items_total": section_items,
+                    "items_supplier": coverage_items,
+                    "priced_items": priced_items,
+                    "coverage_pct": (
+                        coverage_items / section_items * 100.0 if section_items else np.nan
+                    ),
+                    "scenario_a_total": float(
+                        np.nansum(supplier_group["scenario_a_total"])
+                    ),
+                    "scenario_b_total": float(
+                        np.nansum(supplier_group["scenario_b_total"])
+                    ),
+                    "scenario_c_total": float(
+                        np.nansum(supplier_group["scenario_c_total"])
+                    ),
+                    "outlier_count": int(
+                        pd.Series(
+                            supplier_group["is_outlier"], dtype="boolean"
+                        ).fillna(False)
+                        .sum()
+                    ),
+                }
+            )
+
+    sections_df = (
+        pd.DataFrame(section_rows).sort_values(
+            by=["section_token", "Dodavatel"], kind="stable"
+        )
+        if section_rows
+        else pd.DataFrame()
+    )
+
+    return {
+        "summary": summary_df,
+        "detail": detail,
+        "sections": sections_df,
+        "total_items": total_items,
+        "currency": currency_label,
+    }
+
+
+def detect_supplier_only_anomalies(
+    master_data: Mapping[str, Any]
+) -> Dict[str, Any]:
+    """Identify anomalous rows for supplier-only datasets."""
+
+    detail_df = master_data.get("detail", pd.DataFrame())
+    if detail_df.empty:
+        return {"summary": pd.DataFrame(), "tables": {}}
+
+    working = detail_df.copy()
+    working["total"] = pd.to_numeric(working.get("total"), errors="coerce")
+    working["quantity"] = pd.to_numeric(working.get("quantity"), errors="coerce")
+
+    anomalies: Dict[str, pd.DataFrame] = {}
+
+    total_mask = working["total"].isna() | (working["total"].abs() < 1e-9)
+    if total_mask.any():
+        anomalies["Nulová nebo chybějící cena"] = working.loc[total_mask].copy()
+
+    quantity_mask = working["quantity"].isna() | (working["quantity"].abs() < 1e-9)
+    if quantity_mask.any():
+        anomalies["Nulové nebo chybějící množství"] = working.loc[
+            quantity_mask
+        ].copy()
+
+    if "unit" in working.columns:
+        normalized_units = (
+            working["unit"].astype(str).str.strip().str.casefold().replace({"nan": ""})
+        )
+        unit_counts = normalized_units.groupby(working["join_key"]).nunique(dropna=False)
+        unit_issues = unit_counts[unit_counts > 1].index
+        if len(unit_issues):
+            anomalies["Nesoulad měrných jednotek"] = working[
+                working["join_key"].isin(unit_issues)
+            ].copy()
+
+    if "is_outlier" in working.columns:
+        outlier_mask = pd.Series(working["is_outlier"], dtype="boolean").fillna(False)
+        if outlier_mask.any():
+            anomalies["Cenové outliery (IQR)"] = working.loc[outlier_mask].copy()
+
+    vat_columns = [
+        col
+        for col in working.columns
+        if str(col).strip().lower() in {"vat", "vat_rate", "tax_rate", "dph"}
+    ]
+    if vat_columns:
+        vat_col = vat_columns[0]
+        vat_series = working[vat_col].astype(str).str.strip().replace({"": "∅"})
+        vat_counts = vat_series.groupby(working["join_key"]).nunique(dropna=False)
+        vat_issue_keys = vat_counts[vat_counts > 1].index
+        if len(vat_issue_keys):
+            anomalies["Nesoulad sazby DPH"] = working[
+                working["join_key"].isin(vat_issue_keys)
+            ].copy()
+
+    summary_rows = [
+        {"Kontrola": name, "Počet záznamů": len(df)}
+        for name, df in anomalies.items()
+        if isinstance(df, pd.DataFrame) and not df.empty
+    ]
+    summary_df = (
+        pd.DataFrame(summary_rows).sort_values("Počet záznamů", ascending=False)
+        if summary_rows
+        else pd.DataFrame(columns=["Kontrola", "Počet záznamů"])
+    )
+
+    return {"summary": summary_df, "tables": anomalies}
+
+
+def build_supplier_only_metadata(
+    *,
+    basket_mode: str,
+    quantity_mode: str,
+    trim_percent: float,
+    iqr_multiplier: float,
+    currency: str,
+    dph_filter: Optional[str],
+    dataset: SupplierOnlyDataset,
+    join_key_count: int,
+    sheet: str,
+    build_duration: float,
+) -> pd.DataFrame:
+    """Compose metadata dataframe for supplier-only exports."""
+
+    timestamp = datetime.now().isoformat(timespec="seconds")
+    rows = [
+        {"Parametr": "Čas exportu", "Hodnota": timestamp},
+        {"Parametr": "List", "Hodnota": sheet},
+        {
+            "Parametr": "Režim koše",
+            "Hodnota": SUPPLIER_ONLY_BASKET_LABELS.get(basket_mode, basket_mode),
+        },
+        {
+            "Parametr": "Režim množství",
+            "Hodnota": SUPPLIER_ONLY_QUANTITY_LABELS.get(
+                quantity_mode, quantity_mode
+            ),
+        },
+        {
+            "Parametr": "Trimovaný podíl",
+            "Hodnota": f"{format_preview_number(trim_percent * 100.0, decimals=2)} %",
+        },
+        {
+            "Parametr": "Koeficient IQR",
+            "Hodnota": format_preview_number(iqr_multiplier, decimals=2),
+        },
+        {"Parametr": "Měna", "Hodnota": currency},
+        {"Parametr": "Filtr DPH", "Hodnota": dph_filter or "Neuvedeno"},
+        {
+            "Parametr": "Počet dodavatelů",
+            "Hodnota": str(len(dataset.supplier_order)),
+        },
+        {
+            "Parametr": "Počet řádků (long_df)",
+            "Hodnota": str(len(dataset.long_df)),
+        },
+        {
+            "Parametr": "Počet položek v koši",
+            "Hodnota": str(int(join_key_count)),
+        },
+    ]
+
+    if build_duration and build_duration > 0:
+        rows.append(
+            {
+                "Parametr": "Doba načtení datasetu (s)",
+                "Hodnota": format_preview_number(build_duration, decimals=2),
+            }
+        )
+
+    return pd.DataFrame(rows)
+
+
+def prepare_supplier_only_export_tables(
+    master_data: Mapping[str, Any],
+    scenario_data: Mapping[str, Any],
+    anomaly_data: Mapping[str, Any],
+    metadata_df: pd.DataFrame,
+) -> List[Tuple[str, pd.DataFrame]]:
+    """Collect dataframes for supplier-only export workbook."""
+
+    tables: List[Tuple[str, pd.DataFrame]] = []
+
+    summary_df = scenario_data.get("summary")
+    if isinstance(summary_df, pd.DataFrame) and not summary_df.empty:
+        tables.append(("Summary", summary_df.copy()))
+
+    detail_df = scenario_data.get("detail")
+    if isinstance(detail_df, pd.DataFrame) and not detail_df.empty:
+        tables.append(("Items Comparison", detail_df.copy()))
+
+    sections_df = scenario_data.get("sections")
+    if isinstance(sections_df, pd.DataFrame) and not sections_df.empty:
+        tables.append(("Sections Breakdown", sections_df.copy()))
+
+    bucket_df = master_data.get("bucket")
+    if isinstance(bucket_df, pd.DataFrame) and not bucket_df.empty:
+        tables.append(("Mapping Audit", bucket_df.copy()))
+
+    anomalies_tables = anomaly_data.get("tables", {}) if isinstance(anomaly_data, dict) else {}
+    if isinstance(anomalies_tables, dict) and anomalies_tables:
+        combined: List[pd.DataFrame] = []
+        for label, table in anomalies_tables.items():
+            if not isinstance(table, pd.DataFrame) or table.empty:
+                continue
+            temp = table.copy()
+            temp.insert(0, "Kontrola", label)
+            combined.append(temp)
+        if combined:
+            anomalies_df = pd.concat(combined, ignore_index=True, sort=False)
+            tables.append(("Anomalies Log", anomalies_df))
+
+    if isinstance(metadata_df, pd.DataFrame) and not metadata_df.empty:
+        tables.append(("Metadata", metadata_df.copy()))
+
+    return tables
 def normalize_identifier(values: Any) -> pd.Series:
     """Return normalized textual identifiers for row-level matching."""
 
@@ -5426,6 +6046,56 @@ def run_supplier_only_comparison(offer_storage: OfferStorage) -> None:
             metadata[raw_name]["alias"] = alias_clean
             metadata[raw_name]["color"] = color_value or color_default
 
+    if SUPPLIER_ONLY_TRIM_STATE_KEY not in st.session_state:
+        st.session_state[SUPPLIER_ONLY_TRIM_STATE_KEY] = (
+            DEFAULT_SUPPLIER_ONLY_TRIM_PERCENT
+        )
+    if SUPPLIER_ONLY_IQR_STATE_KEY not in st.session_state:
+        st.session_state[SUPPLIER_ONLY_IQR_STATE_KEY] = (
+            DEFAULT_SUPPLIER_ONLY_IQR_MULTIPLIER
+        )
+    if SUPPLIER_ONLY_BASKET_MODE_KEY not in st.session_state:
+        st.session_state[SUPPLIER_ONLY_BASKET_MODE_KEY] = SUPPLIER_ONLY_BASKET_MODES[0]
+    if SUPPLIER_ONLY_QUANTITY_MODE_KEY not in st.session_state:
+        st.session_state[SUPPLIER_ONLY_QUANTITY_MODE_KEY] = (
+            SUPPLIER_ONLY_QUANTITY_MODES[0]
+        )
+
+    with st.sidebar.expander("Statistické nastavení", expanded=False):
+        st.caption(
+            "Úprava parametrů pro trimovaný průměr a detekci outlierů v režimu bez Master BoQ."
+        )
+        trim_percent_display = st.slider(
+            "Trimovaný podíl pro průměr (%)",
+            min_value=0.0,
+            max_value=25.0,
+            value=float(
+                st.session_state.get(
+                    SUPPLIER_ONLY_TRIM_STATE_KEY,
+                    DEFAULT_SUPPLIER_ONLY_TRIM_PERCENT,
+                )
+                * 100.0
+            ),
+            step=1.0,
+            key="supplier_only_trim_slider",
+        )
+        st.session_state[SUPPLIER_ONLY_TRIM_STATE_KEY] = trim_percent_display / 100.0
+
+        iqr_multiplier_value = st.slider(
+            "Koeficient IQR pro outliery",
+            min_value=0.5,
+            max_value=5.0,
+            value=float(
+                st.session_state.get(
+                    SUPPLIER_ONLY_IQR_STATE_KEY,
+                    DEFAULT_SUPPLIER_ONLY_IQR_MULTIPLIER,
+                )
+            ),
+            step=0.1,
+            key="supplier_only_iqr_slider",
+        )
+        st.session_state[SUPPLIER_ONLY_IQR_STATE_KEY] = iqr_multiplier_value
+
     display_names = {raw: metadata[raw]["alias"] for raw in current_suppliers}
     display_names = ensure_unique_aliases(display_names)
     for raw, alias in display_names.items():
@@ -5505,13 +6175,29 @@ def run_supplier_only_comparison(offer_storage: OfferStorage) -> None:
         """
     )
 
-    tab_map, tab_check, tab_compare, tab_curve, tab_recap = st.tabs(
+    (
+        tab_map,
+        tab_check,
+        tab_compare,
+        tab_curve,
+        tab_recap,
+        tab_master,
+        tab_scenarios,
+        tab_sections,
+        tab_anomalies,
+        tab_export,
+    ) = st.tabs(
         [
             "📑 Mapování",
             "🧾 Kontrola dat",
             "⚖️ Porovnání 2",
             "📈 Spojitá nabídková křivka",
             "📊 Rekapitulace",
+            "🧮 Master koš",
+            "🏁 Scénáře A/B/C",
+            "📂 Sekce",
+            "🛡️ Audit/Anomálie",
+            "⬇️ Export",
         ]
     )
 
@@ -5531,11 +6217,31 @@ def run_supplier_only_comparison(offer_storage: OfferStorage) -> None:
                     )
             st.success("Mapování připraveno. Pokračuj na další záložky pro porovnání.")
 
+    dataset_start = time.perf_counter()
     dataset = build_supplier_only_dataset(selected_sheet, bids_dict, display_names)
+    dataset_duration = time.perf_counter() - dataset_start
     qa_summary = supplier_only_qa_checks(bids_dict, display_names)
     dataset_ready = not dataset.long_df.empty
     consensus_df = dataset.consensus_df if dataset_ready else pd.DataFrame()
     consensus_index = consensus_df.index.tolist() if not consensus_df.empty else []
+    trim_percent = st.session_state.get(
+        SUPPLIER_ONLY_TRIM_STATE_KEY, DEFAULT_SUPPLIER_ONLY_TRIM_PERCENT
+    )
+    iqr_multiplier = st.session_state.get(
+        SUPPLIER_ONLY_IQR_STATE_KEY, DEFAULT_SUPPLIER_ONLY_IQR_MULTIPLIER
+    )
+    basket_mode = st.session_state.get(
+        SUPPLIER_ONLY_BASKET_MODE_KEY, SUPPLIER_ONLY_BASKET_MODES[0]
+    )
+    quantity_mode = st.session_state.get(
+        SUPPLIER_ONLY_QUANTITY_MODE_KEY, SUPPLIER_ONLY_QUANTITY_MODES[0]
+    )
+    master_data: Dict[str, Any] = {}
+    scenario_data: Dict[str, Any] = {}
+    anomalies_data: Dict[str, Any] = {}
+    metadata_df = pd.DataFrame()
+    export_tables: List[Tuple[str, pd.DataFrame]] = []
+    dataset_row_count = int(len(dataset.long_df))
 
     with tab_check:
         st.subheader("Pokrytí položek")
@@ -6359,6 +7065,386 @@ def run_supplier_only_comparison(offer_storage: OfferStorage) -> None:
                     ),
                     use_container_width=True,
                 )
+
+    with tab_master:
+        st.subheader("Master koš dodavatelských nabídek")
+        if not dataset_ready:
+            st.info(
+                "Nejprve nahraj alespoň dvě nabídky a vyber list, který obsahuje položky."
+            )
+        else:
+            basket_mode = st.selectbox(
+                "Režim master koše",
+                options=list(SUPPLIER_ONLY_BASKET_MODES),
+                index=list(SUPPLIER_ONLY_BASKET_MODES).index(basket_mode)
+                if basket_mode in SUPPLIER_ONLY_BASKET_MODES
+                else 0,
+                format_func=lambda value: SUPPLIER_ONLY_BASKET_LABELS.get(
+                    value, value
+                ),
+                key=SUPPLIER_ONLY_BASKET_MODE_KEY,
+            )
+            quantity_mode = st.selectbox(
+                "Režim množství",
+                options=list(SUPPLIER_ONLY_QUANTITY_MODES),
+                index=list(SUPPLIER_ONLY_QUANTITY_MODES).index(quantity_mode)
+                if quantity_mode in SUPPLIER_ONLY_QUANTITY_MODES
+                else 0,
+                format_func=lambda value: SUPPLIER_ONLY_QUANTITY_LABELS.get(
+                    value, value
+                ),
+                key=SUPPLIER_ONLY_QUANTITY_MODE_KEY,
+            )
+
+            master_data = build_supplier_only_master_bucket(
+                dataset,
+                basket_mode=basket_mode,
+                quantity_mode=quantity_mode,
+                trim_percent=trim_percent,
+                iqr_multiplier=iqr_multiplier,
+            )
+            scenario_data = compute_supplier_only_scenarios(
+                master_data, currency_label=currency
+            )
+            anomalies_data = detect_supplier_only_anomalies(master_data)
+            metadata_df = build_supplier_only_metadata(
+                basket_mode=basket_mode,
+                quantity_mode=quantity_mode,
+                trim_percent=trim_percent,
+                iqr_multiplier=iqr_multiplier,
+                currency=currency,
+                dph_filter=st.session_state.get("supplier_only_dph_filter"),
+                dataset=dataset,
+                join_key_count=len(master_data.get("join_keys", [])),
+                sheet=selected_sheet,
+                build_duration=dataset_duration,
+            )
+            export_tables = prepare_supplier_only_export_tables(
+                master_data, scenario_data, anomalies_data, metadata_df
+            )
+
+            metrics_cols = st.columns(3)
+            metrics_cols[0].metric(
+                "Položky v koši",
+                len(master_data.get("join_keys", [])),
+            )
+            metrics_cols[1].metric(
+                "Počet dodavatelů",
+                master_data.get("total_suppliers", len(dataset.supplier_order)),
+            )
+            metrics_cols[2].metric(
+                "Doba zpracování",
+                f"{float(np.round(dataset_duration, 2))} s",
+            )
+            if basket_mode == "union" and dataset_row_count >= 10000:
+                st.warning(
+                    "Režim Union zpracovává více než 10 000 řádků. Zkontroluj výkon na svém zařízení; "
+                    f"aktuální běh trval {format_preview_number(dataset_duration, decimals=2)} s."
+                )
+
+            bucket_df = master_data.get("bucket", pd.DataFrame())
+            if bucket_df.empty:
+                st.info("Master koš je prázdný — žádné položky nesplňují zvolené podmínky.")
+            else:
+                display_bucket = bucket_df.copy()
+                unit_cols = [
+                    "median_unit_price",
+                    "trimmed_unit_price",
+                    "q1_unit_price",
+                    "q3_unit_price",
+                    "iqr_unit_price",
+                ]
+                total_cols = ["median_total", "min_total", "max_total"]
+                for col in unit_cols:
+                    if col in display_bucket.columns:
+                        display_bucket[col] = display_bucket[col].apply(
+                            lambda value: format_preview_number(value, decimals=4)
+                            if pd.notna(value)
+                            else "–"
+                        )
+                for col in total_cols:
+                    if col in display_bucket.columns:
+                        display_bucket[col] = display_bucket[col].apply(
+                            lambda value: format_currency_label(value, currency)
+                            if pd.notna(value)
+                            else "–"
+                        )
+                if "coverage_pct" in display_bucket.columns:
+                    display_bucket["coverage_pct"] = display_bucket["coverage_pct"].apply(
+                        lambda value: f"{float(value):.1f} %"
+                        if pd.notna(value)
+                        else "–"
+                    )
+                display_bucket = display_bucket.rename(
+                    columns={
+                        "code": "Kód",
+                        "description": "Popis",
+                        "unit": "MJ",
+                        "section_label": "Sekce",
+                        "supplier_count": "Dodavatelé",
+                        "coverage_pct": "Pokrytí",
+                        "median_total": f"Medián cena ({currency})",
+                        "min_total": f"Min cena ({currency})",
+                        "max_total": f"Max cena ({currency})",
+                        "median_unit_price": f"Medián JC ({currency})",
+                        "trimmed_unit_price": f"Trimovaný JC ({currency})",
+                        "q1_unit_price": f"Q1 JC ({currency})",
+                        "q3_unit_price": f"Q3 JC ({currency})",
+                        "iqr_unit_price": f"IQR JC ({currency})",
+                        "consensus_quantity": "Medián množství",
+                    }
+                )
+                st.dataframe(display_bucket, use_container_width=True)
+
+    with tab_scenarios:
+        st.subheader("Scénáře A/B/C")
+        if not dataset_ready:
+            st.info("Nejprve sestav master koš v předchozí záložce.")
+        else:
+            summary_df = scenario_data.get("summary", pd.DataFrame())
+            if summary_df.empty:
+                st.info("Scénáře zatím neobsahují žádná čísla k zobrazení.")
+            else:
+                display_summary = summary_df.copy()
+                rename_map = {
+                    "scenario_a_total": f"Cena A — As-Is ({currency})",
+                    "scenario_b_total": f"Cena B — Medián ({currency})",
+                    "scenario_c_total": f"Cena C — Konsensus ({currency})",
+                    "delta_vs_median_a": f"Δ vs medián A ({currency})",
+                    "delta_vs_median_b": f"Δ vs medián B ({currency})",
+                    "delta_vs_median_c": f"Δ vs medián C ({currency})",
+                    "priced_items": "Oceněné položky",
+                    "item_count": "Celkem položek",
+                    "coverage_pct": "Pokrytí",
+                    "outlier_count": "Počet outlierů",
+                    "rank_c": "Pořadí (scénář C)",
+                }
+                display_summary = display_summary.rename(columns=rename_map)
+                for col in [
+                    f"Cena A — As-Is ({currency})",
+                    f"Cena B — Medián ({currency})",
+                    f"Cena C — Konsensus ({currency})",
+                    f"Δ vs medián A ({currency})",
+                    f"Δ vs medián B ({currency})",
+                    f"Δ vs medián C ({currency})",
+                ]:
+                    if col in display_summary.columns:
+                        display_summary[col] = display_summary[col].apply(
+                            lambda value: format_currency_label(value, currency)
+                            if pd.notna(value)
+                            else "–"
+                        )
+                if "Pokrytí" in display_summary.columns:
+                    display_summary["Pokrytí"] = display_summary["Pokrytí"].apply(
+                        lambda value: f"{float(value):.1f} %"
+                        if pd.notna(value)
+                        else "–"
+                    )
+                st.dataframe(display_summary, use_container_width=True)
+
+                detail_tab, items_tab = st.tabs(["Detail dodavatelů", "Položky"])
+
+                with detail_tab:
+                    detail_df = scenario_data.get("detail", pd.DataFrame())
+                    if detail_df.empty:
+                        st.info("Detailní tabulka je prázdná.")
+                    else:
+                        detail_display = detail_df.copy()
+                        detail_display = detail_display.rename(
+                            columns={
+                                "supplier": "Dodavatel",
+                                "code": "Kód",
+                                "description": "Popis",
+                                "unit": "MJ",
+                                "quantity": "Množství nabídka",
+                                "consensus_quantity": "Medián množství",
+                                "total": f"Cena A ({currency})",
+                                "scenario_b_total": f"Cena B ({currency})",
+                                "scenario_c_total": f"Cena C ({currency})",
+                                "unit_price": f"JC nabídka ({currency})",
+                                "median_unit_price": f"JC medián ({currency})",
+                                "section_label": "Sekce",
+                                "is_outlier": "Outlier",
+                            }
+                        )
+                        for col in [
+                            f"Cena A ({currency})",
+                            f"Cena B ({currency})",
+                            f"Cena C ({currency})",
+                        ]:
+                            if col in detail_display.columns:
+                                detail_display[col] = detail_display[col].apply(
+                                    lambda value: format_currency_label(value, currency)
+                                    if pd.notna(value)
+                                    else "–"
+                                )
+                        for col in [
+                            f"JC nabídka ({currency})",
+                            f"JC medián ({currency})",
+                        ]:
+                            if col in detail_display.columns:
+                                detail_display[col] = detail_display[col].apply(
+                                    lambda value: f"{format_preview_number(value, decimals=4)}"
+                                    if pd.notna(value)
+                                    else "–"
+                                )
+                        for col in ["Množství nabídka", "Medián množství"]:
+                            if col in detail_display.columns:
+                                detail_display[col] = detail_display[col].apply(
+                                    lambda value: format_preview_number(value, decimals=3)
+                                    if pd.notna(value)
+                                    else "–"
+                                )
+                        if "Outlier" in detail_display.columns:
+                            detail_display["Outlier"] = detail_display["Outlier"].apply(
+                                lambda value: "⚠️" if bool(value) else ""
+                            )
+                        st.dataframe(detail_display, use_container_width=True, height=480)
+
+                with items_tab:
+                    sections_df = scenario_data.get("sections", pd.DataFrame())
+                    if sections_df.empty:
+                        st.info("Sekční přehled pro scénáře není dostupný.")
+                    else:
+                        section_display = sections_df.copy()
+                        section_display = section_display.rename(
+                            columns={
+                                "section_label": "Sekce",
+                                "Dodavatel": "Dodavatel",
+                                "items_total": "Položek celkem",
+                                "items_supplier": "Položky dodavatele",
+                                "coverage_pct": "Pokrytí",
+                                "scenario_a_total": f"Cena A ({currency})",
+                                "scenario_b_total": f"Cena B ({currency})",
+                                "scenario_c_total": f"Cena C ({currency})",
+                                "outlier_count": "Outliery",
+                            }
+                        )
+                        for col in [
+                            f"Cena A ({currency})",
+                            f"Cena B ({currency})",
+                            f"Cena C ({currency})",
+                        ]:
+                            if col in section_display.columns:
+                                section_display[col] = section_display[col].apply(
+                                    lambda value: format_currency_label(value, currency)
+                                    if pd.notna(value)
+                                    else "–"
+                                )
+                        if "Pokrytí" in section_display.columns:
+                            section_display["Pokrytí"] = section_display["Pokrytí"].apply(
+                                lambda value: f"{float(value):.1f} %"
+                                if pd.notna(value)
+                                else "–"
+                            )
+                        st.dataframe(section_display, use_container_width=True)
+
+    with tab_sections:
+        st.subheader("Přehled podle sekcí")
+        sections_df = scenario_data.get("sections", pd.DataFrame())
+        if not dataset_ready:
+            st.info("Sekce se zobrazí po výpočtu master koše.")
+        elif sections_df.empty:
+            st.info("Sekční přehled je prázdný.")
+        else:
+            section_display = sections_df.copy()
+            section_display = section_display.rename(
+                columns={
+                    "section_label": "Sekce",
+                    "Dodavatel": "Dodavatel",
+                    "items_total": "Položek celkem",
+                    "items_supplier": "Položky dodavatele",
+                    "coverage_pct": "Pokrytí",
+                    "scenario_a_total": f"Cena A ({currency})",
+                    "scenario_b_total": f"Cena B ({currency})",
+                    "scenario_c_total": f"Cena C ({currency})",
+                    "outlier_count": "Outliery",
+                }
+            )
+            for col in [
+                f"Cena A ({currency})",
+                f"Cena B ({currency})",
+                f"Cena C ({currency})",
+            ]:
+                if col in section_display.columns:
+                    section_display[col] = section_display[col].apply(
+                        lambda value: format_currency_label(value, currency)
+                        if pd.notna(value)
+                        else "–"
+                    )
+            if "Pokrytí" in section_display.columns:
+                section_display["Pokrytí"] = section_display["Pokrytí"].apply(
+                    lambda value: f"{float(value):.1f} %"
+                    if pd.notna(value)
+                    else "–"
+                )
+            st.dataframe(section_display, use_container_width=True)
+
+    with tab_anomalies:
+        st.subheader("Audit a anomálie")
+        if not dataset_ready:
+            st.info("Anomálie budou k dispozici po sestavení master koše.")
+        else:
+            summary_df = anomalies_data.get("summary", pd.DataFrame())
+            if summary_df.empty:
+                st.success("Nenalezeny žádné anomálie.")
+            else:
+                st.dataframe(summary_df, use_container_width=True)
+
+            tables = anomalies_data.get("tables", {}) if isinstance(anomalies_data, dict) else {}
+            if tables:
+                detail_tabs = st.tabs(list(tables.keys()))
+                for tab_obj, (label, table) in zip(detail_tabs, tables.items()):
+                    with tab_obj:
+                        if not isinstance(table, pd.DataFrame) or table.empty:
+                            st.info("Žádná data k zobrazení.")
+                        else:
+                            detail_table = table.copy()
+                            if "total" in detail_table.columns:
+                                detail_table["total"] = detail_table["total"].apply(
+                                    lambda value: format_currency_label(value, currency)
+                                    if pd.notna(value)
+                                    else "–"
+                                )
+                            if "quantity" in detail_table.columns:
+                                detail_table["quantity"] = detail_table["quantity"].apply(
+                                    lambda value: format_preview_number(value, decimals=3)
+                                    if pd.notna(value)
+                                    else "–"
+                                )
+                            st.dataframe(detail_table, use_container_width=True)
+
+    with tab_export:
+        st.subheader("Export dat")
+        if not dataset_ready:
+            st.info("Export je dostupný až po sestavení master koše.")
+        elif not export_tables:
+            st.info("Není co exportovat — zkontroluj nastavení master koše.")
+        else:
+            excel_bytes = dataframes_to_excel_bytes(export_tables)
+            export_name = sanitize_filename(
+                f"supplier_only_{selected_sheet}_{datetime.now().strftime('%Y%m%d_%H%M')}"
+            )
+            st.download_button(
+                "⬇️ Stáhnout export (XLSX)",
+                data=excel_bytes,
+                file_name=f"{export_name}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key="supplier_only_export_master",
+            )
+            summary_df = scenario_data.get("summary", pd.DataFrame())
+            if isinstance(summary_df, pd.DataFrame) and not summary_df.empty:
+                csv_bytes = summary_df.to_csv(index=False).encode("utf-8-sig")
+                st.download_button(
+                    "⬇️ Export souhrnu (CSV)",
+                    data=csv_bytes,
+                    file_name=f"{export_name}_summary.csv",
+                    mime="text/csv",
+                    key="supplier_only_export_csv",
+                )
+            st.caption(
+                "Export obsahuje listy Summary, Items Comparison, Sections Breakdown, Mapping Audit, Anomalies Log a Metadata."
+            )
 
 def validate_totals(df: pd.DataFrame) -> float:
     """Return cumulative absolute difference between summaries and items.
