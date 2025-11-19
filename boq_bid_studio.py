@@ -1307,6 +1307,7 @@ def compute_supplier_only_scenarios(
         "unit_price",
         "median_unit_price",
         "consensus_quantity",
+        "selected_quantity",
     ]
     for col in numeric_cols:
         detail[col] = pd.to_numeric(detail.get(col), errors="coerce")
@@ -1316,13 +1317,28 @@ def compute_supplier_only_scenarios(
             detail["unit_price"] = detail["total"] / detail["quantity"]
         detail["unit_price"] = detail["unit_price"].replace([np.inf, -np.inf], np.nan)
 
-    consensus_quantity_series = detail["consensus_quantity"].where(
-        detail["consensus_quantity"].notna(), detail["quantity"]
+    selected_quantity_series = pd.to_numeric(
+        detail.get("selected_quantity"), errors="coerce"
+    )
+    if not isinstance(selected_quantity_series, pd.Series):
+        selected_quantity_series = pd.Series(selected_quantity_series, index=detail.index)
+
+    consensus_quantity_series = pd.to_numeric(
+        detail.get("consensus_quantity"), errors="coerce"
+    )
+    if not isinstance(consensus_quantity_series, pd.Series):
+        consensus_quantity_series = pd.Series(consensus_quantity_series, index=detail.index)
+
+    effective_quantity = selected_quantity_series.where(
+        selected_quantity_series.notna(), consensus_quantity_series
+    )
+    effective_quantity = effective_quantity.where(
+        effective_quantity.notna(), detail["quantity"]
     )
 
     detail["scenario_a_total"] = detail["total"]
-    detail["scenario_b_total"] = detail["quantity"] * detail["median_unit_price"]
-    detail["scenario_c_total"] = consensus_quantity_series * detail["unit_price"]
+    detail["scenario_b_total"] = effective_quantity * detail["median_unit_price"]
+    detail["scenario_c_total"] = effective_quantity * detail["unit_price"]
 
     for column in ["scenario_b_total", "scenario_c_total"]:
         detail[column] = detail[column].where(np.isfinite(detail[column]), np.nan)
