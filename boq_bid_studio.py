@@ -124,6 +124,29 @@ def compute_config_fingerprint(
         fingerprint.update(extra)
     return fingerprint
 
+
+def describe_fingerprint_reason(
+    current: Optional[Mapping[str, Any]], reference: Optional[Mapping[str, Any]]
+) -> List[str]:
+    """Return human-friendly reasons for fingerprint differences."""
+
+    reasons: List[str] = []
+    if not isinstance(current, Mapping) or not isinstance(reference, Mapping):
+        return reasons
+
+    if current.get("dph_mode") != reference.get("dph_mode"):
+        reasons.append("Režim DPH se změnil")
+    if current.get("currency") != reference.get("currency"):
+        reasons.append("Měnová značka se změnila")
+    if current.get("exchange_rate") != reference.get("exchange_rate"):
+        reasons.append("Měnový kurz je jiný")
+    if current.get("engine_version") != reference.get("engine_version"):
+        reasons.append("Výpočtový engine byl aktualizován")
+    if current.get("schema_version") != reference.get("schema_version"):
+        reasons.append("Schéma dat není shodné")
+
+    return reasons
+
 HEADER_HINTS = {
     "code": [
         "code",
@@ -2623,6 +2646,17 @@ class ProjectStorageManager:
     def _metadata_path(self, *parts: Union[str, Path]) -> Path:
         return Path(*parts) / "metadata.json"
 
+    def _normalize_project_meta(self, meta: Mapping[str, Any]) -> Dict[str, Any]:
+        if not isinstance(meta, Mapping):
+            return {}
+        normalized = dict(meta)
+        created = meta.get("project_created_at") or meta.get("created_at") or time.time()
+        normalized.setdefault("project_created_at", created)
+        normalized.setdefault("created_at", created)
+        normalized.setdefault("last_opened_at", meta.get("last_opened_at"))
+        normalized.setdefault("project_note", meta.get("project_note", meta.get("notes", "")))
+        return normalized
+
     def _load_metadata(self, path: Path) -> Dict[str, Any]:
         if not path.exists():
             return {}
@@ -2646,19 +2680,27 @@ class ProjectStorageManager:
         for proj_dir in self.projects_dir.iterdir():
             if not proj_dir.is_dir():
                 continue
-            meta = self._load_metadata(self._metadata_path(proj_dir))
+            meta = self._normalize_project_meta(
+                self._load_metadata(self._metadata_path(proj_dir))
+            )
             if meta:
                 projects.append(meta)
         projects.sort(key=lambda item: item.get("project_name", ""))
         return projects
 
-    def create_project(self, name: str, *, notes: str = "") -> Dict[str, Any]:
+    def create_project(
+        self, name: str, *, notes: str = "", project_note: Optional[str] = None
+    ) -> Dict[str, Any]:
         project_id = generate_stable_id("project")
+        created = time.time()
         meta = {
             "project_id": project_id,
             "project_name": name,
-            "created_at": time.time(),
+            "created_at": created,
+            "project_created_at": created,
+            "last_opened_at": created,
             "notes": notes,
+            "project_note": project_note if project_note is not None else notes,
             "schema_version": SCHEMA_VERSION,
             "round_count": 0,
             "last_round_id": None,
@@ -2669,7 +2711,17 @@ class ProjectStorageManager:
         return meta
 
     def load_project(self, project_id: str) -> Dict[str, Any]:
-        return self._load_metadata(self._metadata_path(self._project_dir(project_id)))
+        return self._normalize_project_meta(
+            self._load_metadata(self._metadata_path(self._project_dir(project_id)))
+        )
+
+    def touch_project_last_opened(self, project_id: str) -> Dict[str, Any]:
+        meta = self.load_project(project_id)
+        if not meta:
+            return {}
+        meta["last_opened_at"] = time.time()
+        self._write_metadata(self._metadata_path(self._project_dir(project_id)), meta)
+        return meta
 
     # ----------- rounds -----------
     def list_rounds(self, project_id: str) -> List[Dict[str, Any]]:
@@ -2762,6 +2814,13 @@ class ProjectStorageManager:
     ) -> Dict[str, Any]:
         round_id = generate_stable_id("round")
         saved_inputs = self._write_round_inputs(project_id, round_id, master=master, bids=bids)
+        currency = config_fingerprint.get("currency") if isinstance(config_fingerprint, Mapping) else None
+        exchange_rate = (
+            config_fingerprint.get("exchange_rate")
+            if isinstance(config_fingerprint, Mapping)
+            else None
+        )
+        dph_mode = config_fingerprint.get("dph_mode") if isinstance(config_fingerprint, Mapping) else None
         meta = {
             "round_id": round_id,
             "round_name": round_name,
@@ -2774,6 +2833,9 @@ class ProjectStorageManager:
             "basket_mode": basket_mode,
             "quantity_mode": quantity_mode,
             "schema_version": SCHEMA_VERSION,
+            "currency": currency,
+            "exchange_rate": exchange_rate,
+            "dph_mode": dph_mode,
             "inputs": saved_inputs,
         }
         rnd_dir = self._round_dir(project_id, round_id)
@@ -2814,6 +2876,14 @@ class ProjectStorageManager:
             locked=source_meta.get("locked", False),
         )
 
+    def set_round_locked(self, project_id: str, round_id: str, locked: bool) -> Optional[Dict[str, Any]]:
+        meta = self._load_metadata(self._metadata_path(self._round_dir(project_id, round_id)))
+        if not meta:
+            return None
+        meta["locked"] = locked
+        self._write_metadata(self._metadata_path(self._round_dir(project_id, round_id)), meta)
+        return meta
+
     # ----------- snapshots -----------
     def save_snapshot(
         self,
@@ -2837,6 +2907,7 @@ class ProjectStorageManager:
             "basket_mode": basket_mode,
             "quantity_mode": quantity_mode,
             "schema_version": SCHEMA_VERSION,
+            "engine_version": ENGINE_VERSION,
             "config_fingerprint": dict(fingerprint or {}),
             "created_at": time.time(),
         }
@@ -7912,17 +7983,33 @@ def run_supplier_only_comparison(
                     left_df = _normalize_supplier_column(left_df)
                     right_df = _normalize_supplier_column(right_df)
 
-                    joined = left_df.set_index("supplier").join(
-                        right_df.set_index("supplier"),
-                        lsuffix="_A",
-                        rsuffix="_B",
-                        how="outer",
+                    schema_match = left_meta.get("schema_version") == right_meta.get("schema_version")
+                    if not schema_match:
+                        st.error(
+                            "Porovnání je zablokováno: snapshoty mají rozdílné verze schématu."
+                        )
+                    else:
+                        joined = left_df.set_index("supplier").join(
+                            right_df.set_index("supplier"),
+                            lsuffix="_A",
+                            rsuffix="_B",
+                            how="outer",
+                        )
+                        joined = joined.reset_index().rename(columns={"index": "Dodavatel"})
+                        st.markdown("**Δ souhrn mezi snapshoty**")
+                        st.dataframe(joined, use_container_width=True)
+                    fingerprint_reasons = describe_fingerprint_reason(
+                        left_meta.get("config_fingerprint"),
+                        right_meta.get("config_fingerprint"),
                     )
-                    joined = joined.reset_index().rename(columns={"index": "Dodavatel"})
-                    st.markdown("**Δ souhrn mezi snapshoty**")
-                    st.dataframe(joined, use_container_width=True)
+                    if fingerprint_reasons:
+                        st.warning(
+                            " | ".join(fingerprint_reasons),
+                            icon="ℹ️",
+                        )
                     st.caption(
-                        f"Schema verze A: {left_meta.get('schema_version')} — Schema verze B: {right_meta.get('schema_version')}"
+                        f"Schema verze A: {left_meta.get('schema_version')} — Schema verze B: {right_meta.get('schema_version')}\n"
+                        f"Engine A: {left_meta.get('engine_version')} — Engine B: {right_meta.get('engine_version')}"
                     )
             if "supplier_only_snapshot_candidate" in st.session_state:
                 candidate = st.session_state.get("supplier_only_snapshot_candidate", {})
@@ -7932,6 +8019,9 @@ def run_supplier_only_comparison(
                         "Název snapshotu", key="supplier_only_snapshot_name"
                     )
                     if st.button("💾 Uložit snapshot souhrnu") and snap_name:
+                        if round_locked and (candidate.get("round_id") == round_id):
+                            st.warning("Kolo je uzamčené, snapshot nelze uložit.")
+                            return
                         meta = project_storage.save_snapshot(
                             project_id,
                             candidate.get("round_id") or round_id or "",
@@ -8191,7 +8281,9 @@ if "active_project_id" not in st.session_state and project_options:
 new_project_name = st.sidebar.text_input("Název nového projektu", key="new_project_name")
 new_project_notes = st.sidebar.text_area("Poznámka k projektu", key="new_project_notes", height=60)
 if st.sidebar.button("Vytvořit projekt") and new_project_name:
-    meta = project_storage.create_project(new_project_name, notes=new_project_notes)
+    meta = project_storage.create_project(
+        new_project_name, notes=new_project_notes, project_note=new_project_notes
+    )
     st.session_state["active_project_id"] = meta["project_id"]
     trigger_rerun()
 
@@ -8201,6 +8293,23 @@ project_selection = st.sidebar.selectbox(
     format_func=lambda value: project_labels.get(value, "— žádný projekt —"),
     key="active_project_id",
 )
+
+active_project_meta: Dict[str, Any] = {}
+if project_selection:
+    active_project_meta = project_storage.touch_project_last_opened(project_selection)
+    with st.sidebar.expander("Metadata projektu", expanded=False):
+        st.write(
+            {
+                "Název": active_project_meta.get("project_name"),
+                "Vytvořeno": format_timestamp(
+                    active_project_meta.get("project_created_at")
+                ),
+                "Naposledy otevřeno": format_timestamp(
+                    active_project_meta.get("last_opened_at")
+                ),
+                "Poznámka": active_project_meta.get("project_note"),
+            }
+        )
 
 round_options = (
     project_storage.list_rounds(project_selection) if project_selection else []
@@ -8222,17 +8331,69 @@ round_selection = st.sidebar.selectbox(
 if round_selection:
     round_meta = next((r for r in round_options if r.get("round_id") == round_selection), {})
     with st.sidebar.expander("Metadata kola", expanded=True):
+        fingerprint = round_meta.get("config_fingerprint", {})
+        locked = bool(round_meta.get("locked"))
         st.write(
             {
                 "Název": round_meta.get("round_name"),
                 "Režim": round_meta.get("mode"),
                 "Koš": round_meta.get("basket_mode"),
                 "Množství": round_meta.get("quantity_mode"),
+                "Režim DPH": fingerprint.get("dph_mode") or round_meta.get("dph_mode"),
+                "Měna": fingerprint.get("currency") or round_meta.get("currency"),
+                "Kurz": fingerprint.get("exchange_rate") or round_meta.get("exchange_rate"),
+                "Uzamčeno": "Ano" if locked else "Ne",
                 "Vytvořeno": format_timestamp(round_meta.get("created_at")),
                 "Poznámka": round_meta.get("notes"),
                 "schema_version": round_meta.get("schema_version"),
             }
         )
+        lock_label = "🔓 Odemknout kolo" if locked else "🔒 Zamknout kolo"
+        if st.button(lock_label, key="toggle_round_lock"):
+            project_storage.set_round_locked(
+                project_selection, round_selection, not locked
+            )
+            trigger_rerun()
+    round_locked = bool(round_meta.get("locked"))
+else:
+    round_locked = False
+
+if project_selection and round_options:
+    st.subheader("📈 Porovnat všechna kola najednou")
+    rounds_df = pd.DataFrame(round_options)
+    if not rounds_df.empty:
+        rounds_df["start"] = pd.to_datetime(rounds_df.get("created_at"), unit="s", errors="coerce")
+        rounds_df["finish"] = rounds_df["start"] + pd.to_timedelta(5, unit="m")
+        rounds_df["label"] = rounds_df.get("round_name").fillna(rounds_df.get("round_id"))
+        rounds_df["dph_mode"] = rounds_df.get("dph_mode").fillna("?")
+        if "currency" not in rounds_df.columns:
+            rounds_df["currency"] = None
+        if "config_fingerprint" in rounds_df.columns:
+            rounds_df["currency"] = rounds_df["currency"].fillna(
+                rounds_df["config_fingerprint"].map(
+                    lambda x: x.get("currency") if isinstance(x, Mapping) else None
+                )
+            )
+        fig = px.timeline(
+            rounds_df,
+            x_start="start",
+            x_end="finish",
+            y="label",
+            color="mode",
+            hover_data={
+                "dph_mode": True,
+                "currency": True,
+                "exchange_rate": True,
+                "schema_version": True,
+            },
+        )
+        fig.update_yaxes(autorange="reversed")
+        st.plotly_chart(fig, use_container_width=True)
+    else:
+        st.info("Žádná uložená kola nejsou k dispozici pro timeline.")
+
+if round_locked:
+    st.info("Aktuální kolo je uzamčené. Nahrávání i ukládání probíhá pouze pro čtení.")
 
 comparison_mode = st.radio(
     "Výběr režimu porovnání",
@@ -8243,6 +8404,14 @@ comparison_mode = st.radio(
     index=0,
     horizontal=True,
     key="comparison_mode_selector",
+)
+
+mode_tag_color = "#2563eb" if comparison_mode == "Porovnání s Master BoQ" else "#16a34a"
+mode_tag_label = "Master" if comparison_mode == "Porovnání s Master BoQ" else "Supplier-Only"
+st.markdown(
+    f"<div style='display:inline-block;padding:4px 10px;border-radius:999px;"
+    f"background:{mode_tag_color};color:white;font-weight:600;'>Aktivní režim: {mode_tag_label}</div>",
+    unsafe_allow_html=True,
 )
 
 round_loaded_master: Optional[io.BytesIO] = None
@@ -10203,6 +10372,10 @@ with tab_compare:
                                         if master_total_col in missing_df.columns:
                                             rename_map[master_total_col] = f"Master celkem ({currency})"
                                         missing_df.rename(columns=rename_map, inplace=True)
+                                        missing_df["is_missing"] = True
+                                        missing_df["unit_price"] = None
+                                        missing_df["qty"] = 0
+                                        missing_df["total"] = 0
 
                                     if "total" in metric_column_map:
                                         total_cols = metric_column_map["total"]
