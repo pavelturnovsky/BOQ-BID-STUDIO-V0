@@ -3171,11 +3171,11 @@ class ProjectStorageManager:
         master_obj: Optional[io.BytesIO] = None
         if master_path.exists():
             master_obj = io.BytesIO(master_path.read_bytes())
-            master_obj.name = getattr(master_obj, "name", "master.xlsx")  # type: ignore[attr-defined]
+            master_obj.name = str(master_path)  # type: ignore[attr-defined]
         bids: List[io.BytesIO] = []
         for bid_path in sorted(inputs_dir.glob("bid_*.xlsx")):
             payload = io.BytesIO(bid_path.read_bytes())
-            payload.name = bid_path.name  # type: ignore[attr-defined]
+            payload.name = str(bid_path)  # type: ignore[attr-defined]
             bids.append(payload)
         return master_obj, bids
 
