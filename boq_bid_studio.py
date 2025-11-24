@@ -6866,7 +6866,7 @@ def run_supplier_only_comparison(
                     basket_mode=fingerprint.get("basket_mode"),
                     quantity_mode=fingerprint.get("quantity_mode"),
                 )
-                st.session_state["active_round_id"] = meta.get("round_id")
+                st.session_state["pending_round_id"] = meta.get("round_id")
                 st.success("Kolo bylo uloženo.")
                 trigger_rerun()
 
@@ -8771,6 +8771,11 @@ round_labels = {
     r["round_id"]: f"{r.get('round_name', r['round_id'])}"
     for r in round_options
 }
+pending_round_id = st.session_state.pop("pending_round_id", None)
+if pending_round_id:
+    round_ids = [r.get("round_id") for r in round_options]
+    if pending_round_id in round_ids:
+        st.session_state["active_round_id"] = pending_round_id
 if "active_round_id" not in st.session_state and round_options:
     st.session_state["active_round_id"] = round_options[-1]["round_id"]
 
@@ -9019,7 +9024,7 @@ with st.sidebar.expander("Uložit nebo duplikovat kolo", expanded=False):
                 basket_mode=fingerprint.get("basket_mode"),
                 quantity_mode=fingerprint.get("quantity_mode"),
             )
-            st.session_state["active_round_id"] = meta["round_id"]
+            st.session_state["pending_round_id"] = meta["round_id"]
             st.success(f"Kolo '{new_round_name}' bylo uloženo.")
             trigger_rerun()
 
