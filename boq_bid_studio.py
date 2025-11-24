@@ -16,12 +16,13 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple, Union
 from string import Template
 
-import bcrypt
 import numpy as np
 import pandas as pd
 import plotly.express as px
 import streamlit as st
 import streamlit.components.v1 as components
+from auth_models import User
+from auth_service import AuthService
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4, landscape
 from reportlab.lib.enums import TA_CENTER, TA_LEFT
@@ -65,30 +66,6 @@ def trigger_rerun() -> None:
         return
 
     raise AttributeError("Streamlit rerun function is not available")
-
-
-def render_login(authenticator: "LocalAuthenticator") -> Optional["User"]:
-    st.header("Přihlášení do aplikace BoQ Bid Studio")
-    st.caption("Prosím přihlaste se pro práci se svými projekty a nabídkami.")
-    username = st.text_input("Uživatelské jméno", key="login_username")
-    password = st.text_input("Heslo", type="password", key="login_password")
-    remember = st.checkbox("Zapamatovat si mě", value=False, key="remember_me")
-    error_placeholder = st.empty()
-
-    if st.button("Přihlásit se", key="login_submit"):
-        user = authenticator.authenticate(username.strip(), password)
-        if user:
-            st.session_state[CURRENT_USER_KEY] = user.to_dict()
-            st.session_state["remember_me"] = remember
-            st.session_state["last_activity_at"] = time.time()
-            trigger_rerun()
-        else:
-            error_placeholder.error("Neplatné přihlašovací údaje.")
-    st.divider()
-    st.caption(
-        "Správce systému: kontaktujte admin@example.com v případě problémů s přihlášením."
-    )
-    return None
 
 
 def generate_stable_id(prefix: str = "id") -> str:
@@ -232,6 +209,7 @@ SCHEMA_VERSION = "1.0"
 ENGINE_VERSION = "0.4"
 SESSION_TIMEOUT_SECONDS = 30 * 60
 CURRENT_USER_KEY = "current_user"
+AUTH_VIEW_KEY = "auth_view"
 
 try:
     MODULE_DIR = Path(__file__).resolve().parent
@@ -243,84 +221,10 @@ PDF_FONT_BOLD = "NotoSans-Bold"
 _PDF_FONT_STATE: Optional[Tuple[str, str]] = None
 
 
-@dataclass(frozen=True)
-class User:
-    """Simple authenticated user representation."""
-
-    user_id: str
-    username: str
-    email: str
-    full_name: str
-    roles: List[str]
-
-    def to_dict(self) -> Dict[str, Any]:
-        return {
-            "user_id": self.user_id,
-            "username": self.username,
-            "email": self.email,
-            "full_name": self.full_name,
-            "roles": list(self.roles),
-        }
-
-
-def _default_user_store() -> List[Dict[str, Any]]:
-    return [
-        {
-            "user_id": "u_demo_user",
-            "username": "demo",
-            "email": "demo@example.com",
-            "full_name": "Demo uživatel",
-            "roles": ["user"],
-            # password: demo123
-            "password_hash": "$2b$12$dHLsayywk474U1ZZyDgcDOLoHUHjz4yqpB5YEU4JQ5f4h0VnA9qsG",
-        }
-    ]
-
-
-class LocalAuthenticator:
-    """Config-driven authenticator with bcrypt hashed passwords."""
-
-    def __init__(self, config_path: Optional[Path] = None) -> None:
-        global_dir = (DEFAULT_STORAGE_DIR / "global").expanduser()
-        self.config_path = Path(config_path) if config_path else global_dir / "users.json"
-        self._users = self._load_users()
-
-    def _load_users(self) -> List[Dict[str, Any]]:
-        if self.config_path.exists():
-            try:
-                data = json.loads(self.config_path.read_text(encoding="utf-8"))
-                if isinstance(data, list):
-                    return data
-            except (OSError, json.JSONDecodeError):
-                pass
-        return _default_user_store()
-
-    def _find_user(self, username: str) -> Optional[Dict[str, Any]]:
-        for item in self._users:
-            if item.get("username") == username:
-                return item
-        return None
-
-    def authenticate(self, username: str, password: str) -> Optional["User"]:
-        record = self._find_user(username)
-        if not record:
-            return None
-        password_hash = record.get("password_hash")
-        if not password_hash:
-            return None
-        try:
-            if not bcrypt.checkpw(password.encode("utf-8"), password_hash.encode("utf-8")):
-                return None
-        except ValueError:
-            return None
-        user_id = record.get("user_id") or f"u_{hashlib.sha1(username.encode('utf-8')).hexdigest()}"
-        return User(
-            user_id=user_id,
-            username=record.get("username", username),
-            email=record.get("email", ""),
-            full_name=record.get("full_name", record.get("username", username)),
-            roles=list(record.get("roles", [])),
-        )
+def user_session_payload(user: User) -> Dict[str, Any]:
+    payload = user.to_dict()
+    payload.pop("password_hash", None)
+    return payload
 
 
 def get_current_user() -> Optional["User"]:
@@ -328,13 +232,7 @@ def get_current_user() -> Optional["User"]:
     if not isinstance(data, Mapping):
         return None
     try:
-        return User(
-            user_id=str(data.get("user_id")),
-            username=str(data.get("username")),
-            email=str(data.get("email", "")),
-            full_name=str(data.get("full_name", "")),
-            roles=list(data.get("roles", [])),
-        )
+        return User.from_dict(dict(data))
     except Exception:
         return None
 
@@ -348,6 +246,7 @@ def clear_user_session() -> None:
         "comparison_mode_selector",
     ]:
         st.session_state.pop(key, None)
+    st.session_state[AUTH_VIEW_KEY] = "login"
 
 
 def enforce_session_timeout() -> None:
@@ -361,6 +260,304 @@ def enforce_session_timeout() -> None:
             st.stop()
     if user:
         st.session_state["last_activity_at"] = now
+
+
+def set_auth_view(view: str) -> None:
+    st.session_state[AUTH_VIEW_KEY] = view
+
+
+def ensure_auth_view(default: str = "login") -> None:
+    if AUTH_VIEW_KEY not in st.session_state:
+        st.session_state[AUTH_VIEW_KEY] = default
+
+
+def render_login_view(auth_service: AuthService) -> None:
+    st.header("Přihlášení do aplikace")
+    st.caption("Pro přístup ke svým projektům se prosím přihlaste.")
+    username = st.text_input("Uživatelské jméno nebo e-mail", key="login_username")
+    password = st.text_input("Heslo", type="password", key="login_password")
+    error_placeholder = st.empty()
+
+    if st.button("Přihlásit se", key="login_submit"):
+        user = auth_service.authenticate(username.strip(), password)
+        if user:
+            st.session_state[CURRENT_USER_KEY] = user_session_payload(user)
+            st.session_state["last_activity_at"] = time.time()
+            if user.must_change_password:
+                set_auth_view("must_change_password")
+            else:
+                set_auth_view("login")
+            trigger_rerun()
+        else:
+            error_placeholder.error("Neplatné přihlašovací údaje nebo účet není aktivní.")
+
+    st.markdown(
+        """
+        _Nemáte účet?_
+        """
+    )
+    st.button("Zaregistrovat se", on_click=set_auth_view, args=("register",), key="goto_register")
+    st.button(
+        "Zapomněli jste heslo? Kontaktujte správce / Mám reset kód",
+        on_click=set_auth_view,
+        args=("forgot",),
+        key="goto_forgot",
+    )
+
+
+def render_register_view(auth_service: AuthService) -> None:
+    st.header("Registrace nového účtu")
+    with st.form(key="register_form"):
+        full_name = st.text_input("Jméno a příjmení")
+        username = st.text_input("Uživatelské jméno")
+        email = st.text_input("E-mail")
+        password = st.text_input("Heslo", type="password")
+        password_confirm = st.text_input("Potvrdit heslo", type="password")
+        submit = st.form_submit_button("Vytvořit účet")
+
+    if submit:
+        if password != password_confirm:
+            st.error("Hesla se neshodují.")
+        else:
+            try:
+                user = auth_service.create_user(
+                    full_name=full_name,
+                    username=username,
+                    email=email,
+                    password=password,
+                )
+                st.success("Účet vytvořen, můžete se přihlásit.")
+                set_auth_view("login")
+            except ValueError as exc:
+                st.error(str(exc))
+
+    st.button("Zpět na přihlášení", on_click=set_auth_view, args=("login",), key="register_back")
+
+
+def render_forgot_view() -> None:
+    st.header("Zapomněli jste heslo?")
+    st.info(
+        "Zapomněli jste heslo? Kontaktujte správce systému, který vám ho může resetovat,"
+        " nebo použijte reset kód, pokud jste jej již obdrželi."
+    )
+    st.button("Mám reset kód", on_click=set_auth_view, args=("reset_with_token",), key="to_reset_token")
+    st.button("Zpět na přihlášení", on_click=set_auth_view, args=("login",), key="forgot_back")
+
+
+def render_reset_with_token_view(auth_service: AuthService) -> None:
+    st.header("Reset hesla pomocí kódu")
+    with st.form(key="reset_token_form"):
+        username = st.text_input("Uživatelské jméno")
+        token = st.text_input("Reset kód")
+        new_password = st.text_input("Nové heslo", type="password")
+        confirm_password = st.text_input("Potvrzení nového hesla", type="password")
+        submit = st.form_submit_button("Nastavit nové heslo")
+    if submit:
+        if new_password != confirm_password:
+            st.error("Hesla se neshodují.")
+        else:
+            try:
+                if auth_service.reset_password_with_token(username.strip(), token.strip(), new_password):
+                    st.success("Heslo bylo změněno, můžete se přihlásit.")
+                    set_auth_view("login")
+                else:
+                    st.error("Reset kód je neplatný nebo expiroval.")
+            except ValueError as exc:
+                st.error(str(exc))
+    st.button("Zpět na přihlášení", on_click=set_auth_view, args=("login",), key="reset_token_back")
+
+
+def render_must_change_password_view(auth_service: AuthService, user: User) -> None:
+    st.warning("Před pokračováním si prosím nastavte nové heslo.")
+    with st.form(key="force_change_form"):
+        old_password = st.text_input("Současné heslo", type="password")
+        new_password = st.text_input("Nové heslo", type="password")
+        confirm_password = st.text_input("Potvrdit nové heslo", type="password")
+        submit = st.form_submit_button("Změnit heslo")
+    if submit:
+        if new_password != confirm_password:
+            st.error("Hesla se neshodují.")
+            return
+        try:
+            if auth_service.change_password(user, old_password, new_password):
+                updated = auth_service.store.get_user_by_id(user.user_id) or user
+                st.session_state[CURRENT_USER_KEY] = user_session_payload(updated)
+                st.success("Heslo bylo úspěšně změněno.")
+                set_auth_view("login")
+                trigger_rerun()
+            else:
+                st.error("Nepodařilo se změnit heslo. Zkontrolujte údaje.")
+        except ValueError as exc:
+            st.error(str(exc))
+
+
+def render_account_section(auth_service: AuthService, user: User) -> None:
+    with st.sidebar.expander("Můj účet", expanded=False):
+        st.caption(f"Přihlášen: {user.full_name or user.username}")
+        with st.form(key="change_password_form"):
+            old_password = st.text_input("Současné heslo", type="password", key="change_old")
+            new_password = st.text_input("Nové heslo", type="password", key="change_new")
+            confirm_password = st.text_input("Potvrdit nové heslo", type="password", key="change_confirm")
+            submit = st.form_submit_button("Změnit heslo")
+        if submit:
+            if new_password != confirm_password:
+                st.error("Hesla se neshodují.")
+            else:
+                try:
+                    if auth_service.change_password(user, old_password, new_password):
+                        updated = auth_service.store.get_user_by_id(user.user_id) or user
+                        st.session_state[CURRENT_USER_KEY] = user_session_payload(updated)
+                        st.success("Heslo bylo úspěšně změněno.")
+                    else:
+                        st.error("Nepodařilo se změnit heslo.")
+                except ValueError as exc:
+                    st.error(str(exc))
+
+
+def render_admin_dashboard(auth_service: AuthService, admin_user: User) -> None:
+    st.subheader("Admin / Správa uživatelů")
+    users = auth_service.list_users()
+    if not auth_service.is_admin(admin_user):
+        st.error("Nemáte oprávnění k této akci.")
+        auth_service.store.log_event(
+            event_type="admin_action_denied",
+            admin_user_id=admin_user.user_id,
+            detail="view_dashboard",
+        )
+        return
+
+    data = [
+        {
+            "username": u.username,
+            "email": u.email,
+            "full_name": u.full_name,
+            "roles": ", ".join(u.roles),
+            "is_active": u.is_active,
+            "must_change_password": u.must_change_password,
+            "created_at": u.created_at,
+            "last_login_at": u.last_login_at or "—",
+        }
+        for u in users
+    ]
+    st.dataframe(pd.DataFrame(data))
+
+    st.markdown("### Vytvořit nový účet")
+    with st.form(key="admin_create_user_form"):
+        full_name = st.text_input("Jméno a příjmení", key="admin_full_name")
+        username = st.text_input("Uživatelské jméno", key="admin_username")
+        email = st.text_input("E-mail", key="admin_email")
+        password = st.text_input("Heslo", type="password", key="admin_password")
+        roles = st.multiselect("Role", options=["user", "admin"], default=["user"], key="admin_roles")
+        submit = st.form_submit_button("Vytvořit účet", use_container_width=True)
+    if submit:
+        try:
+            auth_service.create_user(
+                full_name=full_name,
+                username=username,
+                email=email,
+                password=password,
+                roles=roles,
+            )
+            st.success("Uživatel vytvořen.")
+            trigger_rerun()
+        except ValueError as exc:
+            st.error(str(exc))
+
+    st.markdown("### Akce nad existujícími uživateli")
+    for user in users:
+        with st.expander(f"{user.username} ({', '.join(user.roles)})"):
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                active_flag = st.checkbox(
+                    "Aktivní účet", value=user.is_active, key=f"active_{user.user_id}"
+                )
+                roles_value = st.multiselect(
+                    "Role", ["user", "admin"], default=user.roles, key=f"roles_{user.user_id}"
+                )
+                if st.button("Uložit změny", key=f"save_{user.user_id}"):
+                    user.is_active = active_flag
+                    user.roles = roles_value
+                    auth_service.store.update_user(user)
+                    auth_service.store.log_event(
+                        event_type="admin_update_user",
+                        admin_user_id=admin_user.user_id,
+                        target_user_id=user.user_id,
+                    )
+                    st.success("Uloženo.")
+            with col2:
+                temp_password = st.text_input(
+                    "Dočasné heslo", value="", key=f"temp_pass_{user.user_id}", type="password"
+                )
+                if st.button(
+                    "Reset hesla – dočasné heslo",
+                    key=f"temp_btn_{user.user_id}",
+                ):
+                    if not temp_password:
+                        st.error("Zadejte dočasné heslo.")
+                    else:
+                        try:
+                            if auth_service.admin_set_password(admin_user, user.user_id, temp_password):
+                                st.info("Dočasné heslo nastaveno. Uživatel musí heslo změnit.")
+                            else:
+                                st.error("Nebylo možné nastavit dočasné heslo.")
+                        except ValueError as exc:
+                            st.error(str(exc))
+            with col3:
+                if st.button("Generovat reset kód", key=f"token_{user.user_id}"):
+                    token = auth_service.generate_reset_token(admin_user, user.user_id)
+                    if token:
+                        st.success(f"Reset kód: {token.token} (platnost do {token.expires_at})")
+                    else:
+                        st.error("Reset kód nelze vytvořit.")
+
+
+def render_admin_stats(auth_service: AuthService) -> None:
+    st.subheader("Admin / Statistiky")
+    users = auth_service.list_users()
+    active = len([u for u in users if u.is_active])
+    inactive = len(users) - active
+    st.metric("Počet uživatelů", len(users))
+    st.metric("Aktivní účty", active)
+    st.metric("Neaktivní účty", inactive)
+
+    st.markdown("#### Poslední přihlášení")
+    data = [
+        {
+            "username": u.username,
+            "last_login": u.last_login_at or "—",
+        }
+        for u in users
+    ]
+    st.table(pd.DataFrame(data))
+
+    st.markdown("#### Nedávné události")
+    events = auth_service.store.recent_events()
+    if events:
+        st.table(pd.DataFrame(events))
+    else:
+        st.info("Zatím nejsou k dispozici žádné události.")
+
+
+def render_auth_router(auth_service: AuthService) -> None:
+    view = st.session_state.get(AUTH_VIEW_KEY, "login")
+    if view == "login":
+        render_login_view(auth_service)
+    elif view == "register":
+        render_register_view(auth_service)
+    elif view == "forgot":
+        render_forgot_view()
+    elif view == "reset_with_token":
+        render_reset_with_token_view(auth_service)
+    elif view == "must_change_password":
+        user = get_current_user()
+        if user:
+            render_must_change_password_view(auth_service, user)
+        else:
+            set_auth_view("login")
+            render_login_view(auth_service)
+    else:
+        set_auth_view("login")
+        render_login_view(auth_service)
 
 RECAP_CATEGORY_CONFIG = [
     {
@@ -8468,29 +8665,53 @@ def build_item_display_table(
 # ------------- Auth & Session -------------
 
 test_mode = os.environ.get("BOQ_BID_TEST_MODE") == "1"
+auth_service = AuthService()
+ensure_auth_view()
 if test_mode:
     st.session_state.setdefault(
         CURRENT_USER_KEY,
-        User(
-            user_id="u_test",
-            username="tester",
-            email="tester@example.com",
-            full_name="Test User",
-            roles=["admin"],
-        ).to_dict(),
+        user_session_payload(
+            User(
+                user_id="u_test",
+                username="tester",
+                email="tester@example.com",
+                full_name="Test User",
+                roles=["admin"],
+            )
+        ),
     )
 
-authenticator = LocalAuthenticator()
 enforce_session_timeout()
 current_user = get_current_user()
+
 if not current_user:
-    render_login(authenticator)
+    render_auth_router(auth_service)
     st.stop()
 
+if current_user.must_change_password:
+    set_auth_view("must_change_password")
+    render_auth_router(auth_service)
+    st.stop()
+
+render_account_section(auth_service, current_user)
 st.sidebar.markdown(f"**Přihlášen:** {current_user.full_name or current_user.username}")
 if st.sidebar.button("Odhlásit se"):
     clear_user_session()
     trigger_rerun()
+
+admin_view = None
+if auth_service.is_admin(current_user):
+    admin_view = st.sidebar.selectbox(
+        "Admin nástroje",
+        ["—", "Správa uživatelů", "Statistiky"],
+        key="admin_view_selector",
+    )
+    if admin_view == "Správa uživatelů":
+        render_admin_dashboard(auth_service, current_user)
+        st.divider()
+    elif admin_view == "Statistiky":
+        render_admin_stats(auth_service)
+        st.divider()
 
 # ------------- Sidebar Inputs -------------
 
