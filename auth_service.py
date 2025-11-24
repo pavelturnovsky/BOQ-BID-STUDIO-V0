@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import secrets
 import string
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import List, Optional
 
 import bcrypt
@@ -219,7 +219,7 @@ class AuthService:
             expires_at = datetime.fromisoformat(token.expires_at.replace("Z", "+00:00"))
         except ValueError:
             return False
-        if datetime.utcnow() > expires_at:
+        if datetime.now(timezone.utc) > expires_at:
             return False
         validation_error = self._validate_password(new_password)
         if validation_error:
