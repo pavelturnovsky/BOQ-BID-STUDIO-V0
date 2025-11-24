@@ -3,6 +3,7 @@ import hashlib
 import logging
 import io
 import math
+import os
 import re
 import json
 import tempfile
@@ -15,6 +16,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple, Union
 from string import Template
 
+import bcrypt
 import numpy as np
 import pandas as pd
 import plotly.express as px
@@ -63,6 +65,30 @@ def trigger_rerun() -> None:
         return
 
     raise AttributeError("Streamlit rerun function is not available")
+
+
+def render_login(authenticator: "LocalAuthenticator") -> Optional["User"]:
+    st.header("Přihlášení do aplikace BoQ Bid Studio")
+    st.caption("Prosím přihlaste se pro práci se svými projekty a nabídkami.")
+    username = st.text_input("Uživatelské jméno", key="login_username")
+    password = st.text_input("Heslo", type="password", key="login_password")
+    remember = st.checkbox("Zapamatovat si mě", value=False, key="remember_me")
+    error_placeholder = st.empty()
+
+    if st.button("Přihlásit se", key="login_submit"):
+        user = authenticator.authenticate(username.strip(), password)
+        if user:
+            st.session_state[CURRENT_USER_KEY] = user.to_dict()
+            st.session_state["remember_me"] = remember
+            st.session_state["last_activity_at"] = time.time()
+            trigger_rerun()
+        else:
+            error_placeholder.error("Neplatné přihlašovací údaje.")
+    st.divider()
+    st.caption(
+        "Správce systému: kontaktujte admin@example.com v případě problémů s přihlášením."
+    )
+    return None
 
 
 def generate_stable_id(prefix: str = "id") -> str:
@@ -204,6 +230,8 @@ RESERVED_ALIAS_NAMES = {"Master", "LOWEST"}
 DEFAULT_STORAGE_DIR = Path.home() / ".boq_bid_studio"
 SCHEMA_VERSION = "1.0"
 ENGINE_VERSION = "0.4"
+SESSION_TIMEOUT_SECONDS = 30 * 60
+CURRENT_USER_KEY = "current_user"
 
 try:
     MODULE_DIR = Path(__file__).resolve().parent
@@ -213,6 +241,126 @@ except NameError:
 PDF_FONT_REGULAR = "NotoSans"
 PDF_FONT_BOLD = "NotoSans-Bold"
 _PDF_FONT_STATE: Optional[Tuple[str, str]] = None
+
+
+@dataclass(frozen=True)
+class User:
+    """Simple authenticated user representation."""
+
+    user_id: str
+    username: str
+    email: str
+    full_name: str
+    roles: List[str]
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "user_id": self.user_id,
+            "username": self.username,
+            "email": self.email,
+            "full_name": self.full_name,
+            "roles": list(self.roles),
+        }
+
+
+def _default_user_store() -> List[Dict[str, Any]]:
+    return [
+        {
+            "user_id": "u_demo_user",
+            "username": "demo",
+            "email": "demo@example.com",
+            "full_name": "Demo uživatel",
+            "roles": ["user"],
+            # password: demo123
+            "password_hash": "$2b$12$dHLsayywk474U1ZZyDgcDOLoHUHjz4yqpB5YEU4JQ5f4h0VnA9qsG",
+        }
+    ]
+
+
+class LocalAuthenticator:
+    """Config-driven authenticator with bcrypt hashed passwords."""
+
+    def __init__(self, config_path: Optional[Path] = None) -> None:
+        global_dir = (DEFAULT_STORAGE_DIR / "global").expanduser()
+        self.config_path = Path(config_path) if config_path else global_dir / "users.json"
+        self._users = self._load_users()
+
+    def _load_users(self) -> List[Dict[str, Any]]:
+        if self.config_path.exists():
+            try:
+                data = json.loads(self.config_path.read_text(encoding="utf-8"))
+                if isinstance(data, list):
+                    return data
+            except (OSError, json.JSONDecodeError):
+                pass
+        return _default_user_store()
+
+    def _find_user(self, username: str) -> Optional[Dict[str, Any]]:
+        for item in self._users:
+            if item.get("username") == username:
+                return item
+        return None
+
+    def authenticate(self, username: str, password: str) -> Optional["User"]:
+        record = self._find_user(username)
+        if not record:
+            return None
+        password_hash = record.get("password_hash")
+        if not password_hash:
+            return None
+        try:
+            if not bcrypt.checkpw(password.encode("utf-8"), password_hash.encode("utf-8")):
+                return None
+        except ValueError:
+            return None
+        user_id = record.get("user_id") or f"u_{hashlib.sha1(username.encode('utf-8')).hexdigest()}"
+        return User(
+            user_id=user_id,
+            username=record.get("username", username),
+            email=record.get("email", ""),
+            full_name=record.get("full_name", record.get("username", username)),
+            roles=list(record.get("roles", [])),
+        )
+
+
+def get_current_user() -> Optional["User"]:
+    data = st.session_state.get(CURRENT_USER_KEY)
+    if not isinstance(data, Mapping):
+        return None
+    try:
+        return User(
+            user_id=str(data.get("user_id")),
+            username=str(data.get("username")),
+            email=str(data.get("email", "")),
+            full_name=str(data.get("full_name", "")),
+            roles=list(data.get("roles", [])),
+        )
+    except Exception:
+        return None
+
+
+def clear_user_session() -> None:
+    for key in [
+        CURRENT_USER_KEY,
+        "last_activity_at",
+        "active_project_id",
+        "active_round_id",
+        "comparison_mode_selector",
+    ]:
+        st.session_state.pop(key, None)
+
+
+def enforce_session_timeout() -> None:
+    now = time.time()
+    last_active = st.session_state.get("last_activity_at")
+    user = get_current_user()
+    if user and isinstance(last_active, (int, float)):
+        if now - float(last_active) > SESSION_TIMEOUT_SECONDS:
+            clear_user_session()
+            st.warning("Vaše relace vypršela, přihlaste se znovu.")
+            st.stop()
+    if user:
+        st.session_state["last_activity_at"] = now
 
 RECAP_CATEGORY_CONFIG = [
     {
@@ -2452,8 +2600,9 @@ def ensure_unique_aliases(
 class OfferStorage:
     """Persist uploaded workbooks on disk for reuse between sessions."""
 
-    def __init__(self, base_dir: Optional[Path] = None) -> None:
-        self.base_dir = Path(base_dir) if base_dir else DEFAULT_STORAGE_DIR
+    def __init__(self, user_id: str, base_dir: Optional[Path] = None) -> None:
+        self.user_id = user_id
+        self.base_dir = (Path(base_dir) if base_dir else DEFAULT_STORAGE_DIR) / "users" / user_id
         self.index_file = self.base_dir / "index.json"
         self.base_dir.mkdir(parents=True, exist_ok=True)
         self._index = self._load_index()
@@ -2629,8 +2778,13 @@ class OfferStorage:
 class ProjectStorageManager:
     """Manage project/round/snapshot hierarchy on top of OfferStorage."""
 
-    def __init__(self, base_dir: Optional[Path] = None) -> None:
-        self.base_dir = Path(base_dir) if base_dir else DEFAULT_STORAGE_DIR
+    def __init__(
+        self, user_id: str, roles: Optional[Sequence[str]] = None, base_dir: Optional[Path] = None
+    ) -> None:
+        self.user_id = user_id
+        self.roles: Set[str] = set(roles or [])
+        user_root = (Path(base_dir) if base_dir else DEFAULT_STORAGE_DIR) / "users" / user_id
+        self.base_dir = user_root
         self.projects_dir = self.base_dir / "projects"
         self.projects_dir.mkdir(parents=True, exist_ok=True)
 
@@ -2646,6 +2800,17 @@ class ProjectStorageManager:
     def _metadata_path(self, *parts: Union[str, Path]) -> Path:
         return Path(*parts) / "metadata.json"
 
+    def _is_admin(self) -> bool:
+        return "admin" in self.roles
+
+    def _validate_owner(self, meta: Mapping[str, Any]) -> bool:
+        owner = meta.get("owner_user_id") or meta.get("created_by")
+        if owner is None:
+            return True
+        if owner == self.user_id:
+            return True
+        return self._is_admin()
+
     def _normalize_project_meta(self, meta: Mapping[str, Any]) -> Dict[str, Any]:
         if not isinstance(meta, Mapping):
             return {}
@@ -2655,6 +2820,12 @@ class ProjectStorageManager:
         normalized.setdefault("created_at", created)
         normalized.setdefault("last_opened_at", meta.get("last_opened_at"))
         normalized.setdefault("project_note", meta.get("project_note", meta.get("notes", "")))
+        normalized.setdefault("owner_user_id", self.user_id)
+        normalized.setdefault("created_by", self.user_id)
+        normalized.setdefault("last_modified_by", self.user_id)
+        normalized.setdefault("schema_version", SCHEMA_VERSION)
+        if not self._validate_owner(normalized):
+            return {}
         return normalized
 
     def _load_metadata(self, path: Path) -> Dict[str, Any]:
@@ -2704,6 +2875,13 @@ class ProjectStorageManager:
             "schema_version": SCHEMA_VERSION,
             "round_count": 0,
             "last_round_id": None,
+            "owner_user_id": self.user_id,
+            "created_by": self.user_id,
+            "last_modified_by": self.user_id,
+            "access_control": {
+                "owner": self.user_id,
+                "shared_with": [],
+            },
         }
         proj_dir = self._project_dir(project_id)
         proj_dir.mkdir(parents=True, exist_ok=True)
@@ -2733,7 +2911,7 @@ class ProjectStorageManager:
             if not rnd_dir.is_dir():
                 continue
             meta = self._load_metadata(self._metadata_path(rnd_dir))
-            if meta:
+            if meta and self._validate_owner(meta):
                 rounds.append(meta)
         rounds.sort(key=lambda item: item.get("created_at", 0))
         return rounds
@@ -2782,6 +2960,9 @@ class ProjectStorageManager:
     def load_round_inputs(
         self, project_id: str, round_id: str
     ) -> Tuple[Optional[io.BytesIO], List[io.BytesIO]]:
+        round_meta = self._load_metadata(self._metadata_path(self._round_dir(project_id, round_id)))
+        if round_meta and not self._validate_owner(round_meta):
+            raise PermissionError("Projekt nenalezen nebo k němu nemáte přístup.")
         inputs_dir = self._round_dir(project_id, round_id) / "inputs"
         if not inputs_dir.exists():
             return None, []
@@ -2812,6 +2993,9 @@ class ProjectStorageManager:
         quantity_mode: Optional[str] = None,
         locked: bool = False,
     ) -> Dict[str, Any]:
+        project_meta = self.load_project(project_id)
+        if not project_meta:
+            raise PermissionError("Projekt nenalezen nebo k němu nemáte přístup.")
         round_id = generate_stable_id("round")
         saved_inputs = self._write_round_inputs(project_id, round_id, master=master, bids=bids)
         currency = config_fingerprint.get("currency") if isinstance(config_fingerprint, Mapping) else None
@@ -2825,6 +3009,9 @@ class ProjectStorageManager:
             "round_id": round_id,
             "round_name": round_name,
             "created_at": time.time(),
+            "created_by": self.user_id,
+            "last_modified_by": self.user_id,
+            "owner_user_id": self.user_id,
             "mode": mode,
             "config_fingerprint": dict(config_fingerprint),
             "input_hashes": dict(input_hashes),
@@ -2856,6 +3043,8 @@ class ProjectStorageManager:
         round_name: str,
         notes: str = "",
     ) -> Optional[Dict[str, Any]]:
+        if not self.load_project(project_id):
+            raise PermissionError("Projekt nenalezen nebo k němu nemáte přístup.")
         source_meta = self._load_metadata(
             self._metadata_path(self._round_dir(project_id, source_round_id))
         )
@@ -2877,10 +3066,13 @@ class ProjectStorageManager:
         )
 
     def set_round_locked(self, project_id: str, round_id: str, locked: bool) -> Optional[Dict[str, Any]]:
+        if not self.load_project(project_id):
+            raise PermissionError("Projekt nenalezen nebo k němu nemáte přístup.")
         meta = self._load_metadata(self._metadata_path(self._round_dir(project_id, round_id)))
         if not meta:
             return None
         meta["locked"] = locked
+        meta["last_modified_by"] = self.user_id
         self._write_metadata(self._metadata_path(self._round_dir(project_id, round_id)), meta)
         return meta
 
@@ -2897,6 +3089,8 @@ class ProjectStorageManager:
         quantity_mode: Optional[str] = None,
         fingerprint: Optional[Mapping[str, Any]] = None,
     ) -> Dict[str, Any]:
+        if not self.load_project(project_id):
+            raise PermissionError("Projekt nenalezen nebo k němu nemáte přístup.")
         snapshot_id = generate_stable_id("snapshot")
         meta = {
             "snapshot_id": snapshot_id,
@@ -2910,6 +3104,9 @@ class ProjectStorageManager:
             "engine_version": ENGINE_VERSION,
             "config_fingerprint": dict(fingerprint or {}),
             "created_at": time.time(),
+            "created_by": self.user_id,
+            "last_modified_by": self.user_id,
+            "owner_user_id": self.user_id,
         }
         snap_dir = self._snapshot_dir(project_id, round_id, snapshot_id)
         snap_dir.mkdir(parents=True, exist_ok=True)
@@ -2942,7 +3139,7 @@ class ProjectStorageManager:
                 if not snap_dir.is_dir():
                     continue
                 meta = self._load_metadata(self._metadata_path(snap_dir))
-                if meta:
+                if meta and self._validate_owner(meta):
                     meta.setdefault("round_id", rid)
                     snapshots.append(meta)
         snapshots.sort(key=lambda item: item.get("created_at", 0))
@@ -2954,6 +3151,8 @@ class ProjectStorageManager:
         snap_dir = self._snapshot_dir(project_id, round_id, snapshot_id)
         df_path = snap_dir / "data.parquet"
         meta = self._load_metadata(self._metadata_path(snap_dir))
+        if meta and not self._validate_owner(meta):
+            raise PermissionError("Projekt nenalezen nebo k němu nemáte přístup.")
         if not df_path.exists():
             raise FileNotFoundError(snapshot_id)
         df = pd.read_parquet(df_path)
@@ -8266,10 +8465,39 @@ def build_item_display_table(
 
     return subset.reset_index(drop=True)
 
+# ------------- Auth & Session -------------
+
+test_mode = os.environ.get("BOQ_BID_TEST_MODE") == "1"
+if test_mode:
+    st.session_state.setdefault(
+        CURRENT_USER_KEY,
+        User(
+            user_id="u_test",
+            username="tester",
+            email="tester@example.com",
+            full_name="Test User",
+            roles=["admin"],
+        ).to_dict(),
+    )
+
+authenticator = LocalAuthenticator()
+enforce_session_timeout()
+current_user = get_current_user()
+if not current_user:
+    render_login(authenticator)
+    st.stop()
+
+st.sidebar.markdown(f"**Přihlášen:** {current_user.full_name or current_user.username}")
+if st.sidebar.button("Odhlásit se"):
+    clear_user_session()
+    trigger_rerun()
+
 # ------------- Sidebar Inputs -------------
 
-offer_storage = OfferStorage()
-project_storage = ProjectStorageManager(base_dir=offer_storage.base_dir)
+offer_storage = OfferStorage(current_user.user_id)
+project_storage = ProjectStorageManager(
+    current_user.user_id, roles=current_user.roles, base_dir=DEFAULT_STORAGE_DIR
+)
 
 st.sidebar.header("Projekt a kola")
 
@@ -8425,6 +8653,9 @@ if project_selection and round_selection:
         )
     except FileNotFoundError:
         round_loaded_master, round_loaded_bids = None, []
+    except PermissionError:
+        st.error("Projekt nenalezen nebo k němu nemáte přístup.")
+        st.stop()
 
 if comparison_mode == "Porovnání nabídek bez Master BoQ":
     run_supplier_only_comparison(
