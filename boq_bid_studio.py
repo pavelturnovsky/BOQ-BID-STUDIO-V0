@@ -8365,7 +8365,9 @@ if project_selection and round_options:
         rounds_df["start"] = pd.to_datetime(rounds_df.get("created_at"), unit="s", errors="coerce")
         rounds_df["finish"] = rounds_df["start"] + pd.to_timedelta(5, unit="m")
         rounds_df["label"] = rounds_df.get("round_name").fillna(rounds_df.get("round_id"))
-        rounds_df["dph_mode"] = rounds_df.get("dph_mode").fillna("?")
+
+        dph_series = rounds_df.get("dph_mode")
+        rounds_df["dph_mode"] = dph_series.fillna("?") if dph_series is not None else "?"
         if "currency" not in rounds_df.columns:
             rounds_df["currency"] = None
         if "config_fingerprint" in rounds_df.columns:
