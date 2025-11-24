@@ -6,3 +6,4 @@ numpy
 cloudpickle
 reportlab
 kaleido
+bcrypt
