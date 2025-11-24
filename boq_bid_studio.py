@@ -2884,7 +2884,11 @@ class OfferStorage:
         if not path.exists():
             raise FileNotFoundError(display_name)
         buffer = io.BytesIO(path.read_bytes())
-        buffer.name = display_name  # type: ignore[attr-defined]
+        try:
+            buffer.name = str(path)  # type: ignore[attr-defined]
+        except Exception:
+            pass
+        buffer.original_name = display_name  # type: ignore[attr-defined]
         buffer.seek(0)
         return buffer
 
