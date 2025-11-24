@@ -8,6 +8,7 @@ import json
 import tempfile
 import time
 import unicodedata
+import uuid
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -62,6 +63,66 @@ def trigger_rerun() -> None:
         return
 
     raise AttributeError("Streamlit rerun function is not available")
+
+
+def generate_stable_id(prefix: str = "id") -> str:
+    """Return a stable-ish identifier for projects, rounds or snapshots."""
+
+    token = uuid.uuid4().hex
+    return f"{prefix}_{token}"
+
+
+def hash_fileobj(file_obj: Any) -> str:
+    """Hash a file-like object without mutating its position."""
+
+    sha = hashlib.sha256()
+    try:
+        pos = file_obj.tell()
+    except Exception:
+        pos = None
+    try:
+        if hasattr(file_obj, "seek"):
+            file_obj.seek(0)
+        chunk = file_obj.read()
+        if isinstance(chunk, str):
+            chunk = chunk.encode("utf-8")
+        sha.update(bytes(chunk))
+    finally:
+        if pos is not None and hasattr(file_obj, "seek"):
+            try:
+                file_obj.seek(pos)
+            except Exception:
+                pass
+    return sha.hexdigest()
+
+
+def compute_config_fingerprint(
+    *,
+    mode: str,
+    basket_mode: Optional[str] = None,
+    quantity_mode: Optional[str] = None,
+    dph_mode: Optional[str] = None,
+    currency: Optional[str] = None,
+    exchange_rate: Optional[float] = None,
+    input_hashes: Optional[Mapping[str, str]] = None,
+    extra: Optional[Mapping[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Compose a fingerprint for a project round including required attributes."""
+
+    fingerprint: Dict[str, Any] = {
+        "mode": mode,
+        "basket_mode": basket_mode,
+        "quantity_mode": quantity_mode,
+        "dph_mode": dph_mode,
+        "currency": currency,
+        "exchange_rate": exchange_rate,
+        "engine_version": ENGINE_VERSION,
+        "schema_version": SCHEMA_VERSION,
+        "input_hashes": dict(input_hashes or {}),
+    }
+    if extra:
+        fingerprint.update(extra)
+    return fingerprint
 
 HEADER_HINTS = {
     "code": [
@@ -118,6 +179,8 @@ EXCHANGE_RATE_WIDGET_KEYS = {
 }
 RESERVED_ALIAS_NAMES = {"Master", "LOWEST"}
 DEFAULT_STORAGE_DIR = Path.home() / ".boq_bid_studio"
+SCHEMA_VERSION = "1.0"
+ENGINE_VERSION = "0.4"
 
 try:
     MODULE_DIR = Path(__file__).resolve().parent
@@ -2538,6 +2601,292 @@ class OfferStorage:
 
     def list_templates(self) -> List[Dict[str, Any]]:
         return self.list_entries("templates")
+
+
+class ProjectStorageManager:
+    """Manage project/round/snapshot hierarchy on top of OfferStorage."""
+
+    def __init__(self, base_dir: Optional[Path] = None) -> None:
+        self.base_dir = Path(base_dir) if base_dir else DEFAULT_STORAGE_DIR
+        self.projects_dir = self.base_dir / "projects"
+        self.projects_dir.mkdir(parents=True, exist_ok=True)
+
+    def _project_dir(self, project_id: str) -> Path:
+        return self.projects_dir / project_id
+
+    def _round_dir(self, project_id: str, round_id: str) -> Path:
+        return self._project_dir(project_id) / "rounds" / round_id
+
+    def _snapshot_dir(self, project_id: str, round_id: str, snapshot_id: str) -> Path:
+        return self._round_dir(project_id, round_id) / "snapshots" / snapshot_id
+
+    def _metadata_path(self, *parts: Union[str, Path]) -> Path:
+        return Path(*parts) / "metadata.json"
+
+    def _load_metadata(self, path: Path) -> Dict[str, Any]:
+        if not path.exists():
+            return {}
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {}
+
+    def _write_metadata(self, path: Path, data: Mapping[str, Any]) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        except OSError:
+            pass
+
+    # ----------- projects -----------
+    def list_projects(self) -> List[Dict[str, Any]]:
+        projects: List[Dict[str, Any]] = []
+        if not self.projects_dir.exists():
+            return projects
+        for proj_dir in self.projects_dir.iterdir():
+            if not proj_dir.is_dir():
+                continue
+            meta = self._load_metadata(self._metadata_path(proj_dir))
+            if meta:
+                projects.append(meta)
+        projects.sort(key=lambda item: item.get("project_name", ""))
+        return projects
+
+    def create_project(self, name: str, *, notes: str = "") -> Dict[str, Any]:
+        project_id = generate_stable_id("project")
+        meta = {
+            "project_id": project_id,
+            "project_name": name,
+            "created_at": time.time(),
+            "notes": notes,
+            "schema_version": SCHEMA_VERSION,
+            "round_count": 0,
+            "last_round_id": None,
+        }
+        proj_dir = self._project_dir(project_id)
+        proj_dir.mkdir(parents=True, exist_ok=True)
+        self._write_metadata(self._metadata_path(proj_dir), meta)
+        return meta
+
+    def load_project(self, project_id: str) -> Dict[str, Any]:
+        return self._load_metadata(self._metadata_path(self._project_dir(project_id)))
+
+    # ----------- rounds -----------
+    def list_rounds(self, project_id: str) -> List[Dict[str, Any]]:
+        base = self._project_dir(project_id) / "rounds"
+        rounds: List[Dict[str, Any]] = []
+        if not base.exists():
+            return rounds
+        for rnd_dir in base.iterdir():
+            if not rnd_dir.is_dir():
+                continue
+            meta = self._load_metadata(self._metadata_path(rnd_dir))
+            if meta:
+                rounds.append(meta)
+        rounds.sort(key=lambda item: item.get("created_at", 0))
+        return rounds
+
+    def _write_round_inputs(
+        self,
+        project_id: str,
+        round_id: str,
+        *,
+        master: Optional[Any],
+        bids: Sequence[Any],
+    ) -> Dict[str, Any]:
+        inputs_dir = self._round_dir(project_id, round_id) / "inputs"
+        inputs_dir.mkdir(parents=True, exist_ok=True)
+        saved: Dict[str, Any] = {}
+        if master is not None:
+            dest = inputs_dir / "master.xlsx"
+            if hasattr(master, "seek"):
+                try:
+                    master.seek(0)
+                except Exception:
+                    pass
+            data = master.read()
+            if isinstance(data, str):
+                data = data.encode("utf-8")
+            dest.write_bytes(bytes(data))
+            saved["master"] = dest.name
+        for idx, bid in enumerate(bids):
+            dest = inputs_dir / f"bid_{idx+1}.xlsx"
+            if hasattr(bid, "seek"):
+                try:
+                    bid.seek(0)
+                except Exception:
+                    pass
+            data = bid.read()
+            if isinstance(data, str):
+                data = data.encode("utf-8")
+            dest.write_bytes(bytes(data))
+            saved.setdefault("bids", [])
+            saved.setdefault("bid_names", [])
+            saved["bids"].append(dest.name)
+            bid_name = getattr(bid, "name", dest.name)
+            saved["bid_names"].append(bid_name)
+        return saved
+
+    def load_round_inputs(
+        self, project_id: str, round_id: str
+    ) -> Tuple[Optional[io.BytesIO], List[io.BytesIO]]:
+        inputs_dir = self._round_dir(project_id, round_id) / "inputs"
+        if not inputs_dir.exists():
+            return None, []
+        master_path = inputs_dir / "master.xlsx"
+        master_obj: Optional[io.BytesIO] = None
+        if master_path.exists():
+            master_obj = io.BytesIO(master_path.read_bytes())
+            master_obj.name = getattr(master_obj, "name", "master.xlsx")  # type: ignore[attr-defined]
+        bids: List[io.BytesIO] = []
+        for bid_path in sorted(inputs_dir.glob("bid_*.xlsx")):
+            payload = io.BytesIO(bid_path.read_bytes())
+            payload.name = bid_path.name  # type: ignore[attr-defined]
+            bids.append(payload)
+        return master_obj, bids
+
+    def create_round(
+        self,
+        project_id: str,
+        *,
+        round_name: str,
+        mode: str,
+        config_fingerprint: Mapping[str, Any],
+        input_hashes: Mapping[str, str],
+        master: Optional[Any],
+        bids: Sequence[Any],
+        notes: str = "",
+        basket_mode: Optional[str] = None,
+        quantity_mode: Optional[str] = None,
+        locked: bool = False,
+    ) -> Dict[str, Any]:
+        round_id = generate_stable_id("round")
+        saved_inputs = self._write_round_inputs(project_id, round_id, master=master, bids=bids)
+        meta = {
+            "round_id": round_id,
+            "round_name": round_name,
+            "created_at": time.time(),
+            "mode": mode,
+            "config_fingerprint": dict(config_fingerprint),
+            "input_hashes": dict(input_hashes),
+            "notes": notes,
+            "locked": locked,
+            "basket_mode": basket_mode,
+            "quantity_mode": quantity_mode,
+            "schema_version": SCHEMA_VERSION,
+            "inputs": saved_inputs,
+        }
+        rnd_dir = self._round_dir(project_id, round_id)
+        rnd_dir.mkdir(parents=True, exist_ok=True)
+        self._write_metadata(self._metadata_path(rnd_dir), meta)
+
+        proj_meta = self.load_project(project_id)
+        proj_meta["round_count"] = proj_meta.get("round_count", 0) + 1
+        proj_meta["last_round_id"] = round_id
+        self._write_metadata(self._metadata_path(self._project_dir(project_id)), proj_meta)
+        return meta
+
+    def duplicate_round(
+        self,
+        project_id: str,
+        source_round_id: str,
+        *,
+        round_name: str,
+        notes: str = "",
+    ) -> Optional[Dict[str, Any]]:
+        source_meta = self._load_metadata(
+            self._metadata_path(self._round_dir(project_id, source_round_id))
+        )
+        if not source_meta:
+            return None
+        master, bids = self.load_round_inputs(project_id, source_round_id)
+        return self.create_round(
+            project_id,
+            round_name=round_name,
+            mode=source_meta.get("mode", "unknown"),
+            config_fingerprint=source_meta.get("config_fingerprint", {}),
+            input_hashes=source_meta.get("input_hashes", {}),
+            master=master,
+            bids=bids,
+            notes=notes or source_meta.get("notes", ""),
+            basket_mode=source_meta.get("basket_mode"),
+            quantity_mode=source_meta.get("quantity_mode"),
+            locked=source_meta.get("locked", False),
+        )
+
+    # ----------- snapshots -----------
+    def save_snapshot(
+        self,
+        project_id: str,
+        round_id: str,
+        *,
+        snapshot_name: str,
+        dataframe: pd.DataFrame,
+        scenario: Optional[str] = None,
+        basket_mode: Optional[str] = None,
+        quantity_mode: Optional[str] = None,
+        fingerprint: Optional[Mapping[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        snapshot_id = generate_stable_id("snapshot")
+        meta = {
+            "snapshot_id": snapshot_id,
+            "snapshot_name": snapshot_name,
+            "project_id": project_id,
+            "round_id": round_id,
+            "scenario": scenario,
+            "basket_mode": basket_mode,
+            "quantity_mode": quantity_mode,
+            "schema_version": SCHEMA_VERSION,
+            "config_fingerprint": dict(fingerprint or {}),
+            "created_at": time.time(),
+        }
+        snap_dir = self._snapshot_dir(project_id, round_id, snapshot_id)
+        snap_dir.mkdir(parents=True, exist_ok=True)
+        df_path = snap_dir / "data.parquet"
+        dataframe.to_parquet(df_path, index=False)
+        self._write_metadata(self._metadata_path(snap_dir), meta)
+        return meta
+
+    def list_snapshots(
+        self, project_id: str, round_id: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
+        rounds: List[Tuple[str, Path]] = []
+        if round_id:
+            rounds = [(round_id, self._round_dir(project_id, round_id))]
+        else:
+            rounds = [
+                (
+                    meta.get("round_id", ""),
+                    self._round_dir(project_id, meta.get("round_id", "")),
+                )
+                for meta in self.list_rounds(project_id)
+            ]
+
+        snapshots: List[Dict[str, Any]] = []
+        for rid, rnd_dir in rounds:
+            snap_base = rnd_dir / "snapshots"
+            if not snap_base.exists():
+                continue
+            for snap_dir in snap_base.iterdir():
+                if not snap_dir.is_dir():
+                    continue
+                meta = self._load_metadata(self._metadata_path(snap_dir))
+                if meta:
+                    meta.setdefault("round_id", rid)
+                    snapshots.append(meta)
+        snapshots.sort(key=lambda item: item.get("created_at", 0))
+        return snapshots
+
+    def load_snapshot(
+        self, project_id: str, round_id: str, snapshot_id: str
+    ) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+        snap_dir = self._snapshot_dir(project_id, round_id, snapshot_id)
+        df_path = snap_dir / "data.parquet"
+        meta = self._load_metadata(self._metadata_path(snap_dir))
+        if not df_path.exists():
+            raise FileNotFoundError(snapshot_id)
+        df = pd.read_parquet(df_path)
+        return df, meta
 
 
 def format_timestamp(timestamp: Optional[float]) -> str:
@@ -5942,7 +6291,13 @@ def convert_detail_groups(
     return converted
 
 
-def run_supplier_only_comparison(offer_storage: OfferStorage) -> None:
+def run_supplier_only_comparison(
+    offer_storage: OfferStorage,
+    *,
+    project_storage: Optional[ProjectStorageManager] = None,
+    project_id: Optional[str] = None,
+    round_id: Optional[str] = None,
+) -> None:
     st.sidebar.header("Vstupy")
     st.sidebar.caption(
         "Režim bez Master BoQ — nahraj pouze nabídky dodavatelů."
@@ -5950,6 +6305,12 @@ def run_supplier_only_comparison(offer_storage: OfferStorage) -> None:
 
     stored_bid_entries = offer_storage.list_bids()
     bid_files: List[Any] = []
+    if project_storage and project_id and round_id:
+        try:
+            _, loaded_bids = project_storage.load_round_inputs(project_id, round_id)
+            bid_files.extend(loaded_bids)
+        except FileNotFoundError:
+            pass
 
     uploaded_bids = st.sidebar.file_uploader(
         "Nabídky dodavatelů (max 7)",
@@ -5998,6 +6359,45 @@ def run_supplier_only_comparison(offer_storage: OfferStorage) -> None:
         value="CZK",
         key="supplier_only_currency",
     )
+
+    with st.sidebar.expander("Uložit kolo", expanded=False):
+        round_name = st.text_input("Název kola", key="supplier_only_round_name")
+        round_note = st.text_area("Poznámka", key="supplier_only_round_note", height=60)
+        if st.button("💾 Uložit kolo bez Master"):
+            if not project_storage or not project_id:
+                st.warning("Nejprve vytvoř nebo vyber projekt v horní části.")
+            elif not bid_files:
+                st.warning("Není co uložit, nejprve nahraj nabídky.")
+            elif not round_name:
+                st.warning("Zadej název kola.")
+            else:
+                hashes: Dict[str, str] = {}
+                for idx, f in enumerate(bid_files):
+                    hashes[f"bid_{idx}"] = hash_fileobj(f)
+                fingerprint = compute_config_fingerprint(
+                    mode="supplier_only",
+                    basket_mode=st.session_state.get(SUPPLIER_ONLY_BASKET_MODE_KEY),
+                    quantity_mode=st.session_state.get(SUPPLIER_ONLY_QUANTITY_MODE_KEY),
+                    dph_mode=st.session_state.get("supplier_only_dph_filter"),
+                    currency=currency,
+                    exchange_rate=st.session_state.get(EXCHANGE_RATE_STATE_KEY),
+                    input_hashes=hashes,
+                )
+                meta = project_storage.create_round(
+                    project_id,
+                    round_name=round_name,
+                    mode="supplier_only",
+                    config_fingerprint=fingerprint,
+                    input_hashes=hashes,
+                    master=None,
+                    bids=bid_files,
+                    notes=round_note,
+                    basket_mode=fingerprint.get("basket_mode"),
+                    quantity_mode=fingerprint.get("quantity_mode"),
+                )
+                st.session_state["active_round_id"] = meta.get("round_id")
+                st.success("Kolo bylo uloženo.")
+                trigger_rerun()
 
     bids_dict: Dict[str, WorkbookData] = {}
     if not bid_files:
@@ -7139,6 +7539,28 @@ def run_supplier_only_comparison(offer_storage: OfferStorage) -> None:
                 master_data, scenario_data, anomalies_data, metadata_df
             )
 
+            snapshot_candidate = scenario_data.get("summary")
+            if isinstance(snapshot_candidate, pd.DataFrame) and project_storage and project_id:
+                st.session_state["supplier_only_snapshot_candidate"] = {
+                    "df": snapshot_candidate,
+                    "round_id": round_id,
+                    "project_id": project_id,
+                    "basket_mode": basket_mode,
+                    "quantity_mode": quantity_mode,
+                    "scenario": "summary",
+                    "fingerprint": compute_config_fingerprint(
+                        mode="supplier_only",
+                        basket_mode=basket_mode,
+                        quantity_mode=quantity_mode,
+                        dph_mode=st.session_state.get("supplier_only_dph_filter"),
+                        currency=currency,
+                        exchange_rate=st.session_state.get(EXCHANGE_RATE_STATE_KEY),
+                        input_hashes={
+                            "bids": [hash_fileobj(b) for b in bid_files],
+                        },
+                    ),
+                }
+
             metrics_cols = st.columns(3)
             metrics_cols[0].metric(
                 "Položky v koši",
@@ -7462,6 +7884,57 @@ def run_supplier_only_comparison(offer_storage: OfferStorage) -> None:
                 "Export obsahuje listy Summary, Items Comparison, Sections Breakdown, Mapping Audit, Anomalies Log a Metadata."
             )
 
+    if project_storage and project_id:
+        with st.expander("Snapshoty a porovnání kol", expanded=False):
+            snapshots = project_storage.list_snapshots(project_id)
+            if snapshots:
+                options = {snap.get("snapshot_id"): snap for snap in snapshots}
+                selected = st.multiselect(
+                    "Vyber snapshoty pro porovnání",
+                    options=list(options.keys()),
+                    format_func=lambda value: options.get(value, {}).get("snapshot_name", value),
+                )
+                if len(selected) == 2:
+                    left_df, left_meta = project_storage.load_snapshot(
+                        project_id, options[selected[0]].get("round_id", round_id), selected[0]
+                    )
+                    right_df, right_meta = project_storage.load_snapshot(
+                        project_id, options[selected[1]].get("round_id", round_id), selected[1]
+                    )
+                    joined = left_df.set_index("supplier").join(
+                        right_df.set_index("supplier"),
+                        lsuffix="_A",
+                        rsuffix="_B",
+                        how="outer",
+                    )
+                    joined = joined.reset_index().rename(columns={"index": "supplier"})
+                    st.markdown("**Δ souhrn mezi snapshoty**")
+                    st.dataframe(joined, use_container_width=True)
+                    st.caption(
+                        f"Schema verze A: {left_meta.get('schema_version')} — Schema verze B: {right_meta.get('schema_version')}"
+                    )
+            if "supplier_only_snapshot_candidate" in st.session_state:
+                candidate = st.session_state.get("supplier_only_snapshot_candidate", {})
+                df = candidate.get("df")
+                if isinstance(df, pd.DataFrame) and not df.empty:
+                    snap_name = st.text_input(
+                        "Název snapshotu", key="supplier_only_snapshot_name"
+                    )
+                    if st.button("💾 Uložit snapshot souhrnu") and snap_name:
+                        meta = project_storage.save_snapshot(
+                            project_id,
+                            candidate.get("round_id") or round_id or "",
+                            snapshot_name=snap_name,
+                            dataframe=df,
+                            scenario=candidate.get("scenario"),
+                            basket_mode=candidate.get("basket_mode"),
+                            quantity_mode=candidate.get("quantity_mode"),
+                            fingerprint=candidate.get("fingerprint"),
+                        )
+                        st.success(
+                            f"Snapshot '{snap_name}' uložen (ID {meta.get('snapshot_id')})."
+                        )
+
 def validate_totals(df: pd.DataFrame) -> float:
     """Return cumulative absolute difference between summaries and items.
 
@@ -7695,6 +8168,60 @@ def build_item_display_table(
 # ------------- Sidebar Inputs -------------
 
 offer_storage = OfferStorage()
+project_storage = ProjectStorageManager(base_dir=offer_storage.base_dir)
+
+st.sidebar.header("Projekt a kola")
+
+project_options = project_storage.list_projects()
+project_labels = {p["project_id"]: p.get("project_name", p["project_id"]) for p in project_options}
+if "active_project_id" not in st.session_state and project_options:
+    st.session_state["active_project_id"] = project_options[0]["project_id"]
+
+new_project_name = st.sidebar.text_input("Název nového projektu", key="new_project_name")
+new_project_notes = st.sidebar.text_area("Poznámka k projektu", key="new_project_notes", height=60)
+if st.sidebar.button("Vytvořit projekt") and new_project_name:
+    meta = project_storage.create_project(new_project_name, notes=new_project_notes)
+    st.session_state["active_project_id"] = meta["project_id"]
+    trigger_rerun()
+
+project_selection = st.sidebar.selectbox(
+    "Vyber projekt",
+    options=[p["project_id"] for p in project_options] if project_options else [""],
+    format_func=lambda value: project_labels.get(value, "— žádný projekt —"),
+    key="active_project_id",
+)
+
+round_options = (
+    project_storage.list_rounds(project_selection) if project_selection else []
+)
+round_labels = {
+    r["round_id"]: f"{r.get('round_name', r['round_id'])}"
+    for r in round_options
+}
+if "active_round_id" not in st.session_state and round_options:
+    st.session_state["active_round_id"] = round_options[-1]["round_id"]
+
+round_selection = st.sidebar.selectbox(
+    "Vyber kolo",
+    options=[r["round_id"] for r in round_options] if round_options else [""],
+    format_func=lambda value: round_labels.get(value, "— žádné kolo —"),
+    key="active_round_id",
+)
+
+if round_selection:
+    round_meta = next((r for r in round_options if r.get("round_id") == round_selection), {})
+    with st.sidebar.expander("Metadata kola", expanded=True):
+        st.write(
+            {
+                "Název": round_meta.get("round_name"),
+                "Režim": round_meta.get("mode"),
+                "Koš": round_meta.get("basket_mode"),
+                "Množství": round_meta.get("quantity_mode"),
+                "Vytvořeno": format_timestamp(round_meta.get("created_at")),
+                "Poznámka": round_meta.get("notes"),
+                "schema_version": round_meta.get("schema_version"),
+            }
+        )
 
 comparison_mode = st.radio(
     "Výběr režimu porovnání",
@@ -7707,8 +8234,23 @@ comparison_mode = st.radio(
     key="comparison_mode_selector",
 )
 
+round_loaded_master: Optional[io.BytesIO] = None
+round_loaded_bids: List[io.BytesIO] = []
+if project_selection and round_selection:
+    try:
+        round_loaded_master, round_loaded_bids = project_storage.load_round_inputs(
+            project_selection, round_selection
+        )
+    except FileNotFoundError:
+        round_loaded_master, round_loaded_bids = None, []
+
 if comparison_mode == "Porovnání nabídek bez Master BoQ":
-    run_supplier_only_comparison(offer_storage)
+    run_supplier_only_comparison(
+        offer_storage,
+        project_storage=project_storage,
+        project_id=project_selection,
+        round_id=round_selection,
+    )
     st.stop()
 
 stored_master_entries = offer_storage.list_master()
@@ -7743,7 +8285,7 @@ if uploaded_master is not None:
     offer_storage.save_master(uploaded_master)
     master_file = uploaded_master
 else:
-    master_file = None
+    master_file = round_loaded_master
     if master_selection:
         try:
             master_file = offer_storage.load_master(master_selection)
@@ -7752,7 +8294,7 @@ else:
                 f"Uložený Master '{master_selection}' se nepodařilo načíst."
             )
 
-bid_files: List[Any] = []
+bid_files: List[Any] = list(round_loaded_bids)
 uploaded_bids = st.sidebar.file_uploader(
     "Nabídky dodavatelů (max 7)",
     type=["xlsx", "xlsm"],
@@ -7796,6 +8338,52 @@ if len(bid_files) > 7:
     bid_files = bid_files[:7]
 
 currency = st.sidebar.text_input("Popisek měny", value="CZK")
+
+with st.sidebar.expander("Uložit nebo duplikovat kolo", expanded=False):
+    new_round_name = st.text_input("Název kola", key="round_name_input")
+    new_round_notes = st.text_area("Poznámka ke kolu", key="round_note_input", height=80)
+    if st.button("💾 Uložit jako nové kolo"):
+        if not project_selection:
+            st.warning("Nejprve vytvoř nebo vyber projekt.")
+        elif not bid_files and comparison_mode != "Porovnání s Master BoQ":
+            st.warning("Není k dispozici žádná nabídka k uložení.")
+        elif comparison_mode == "Porovnání s Master BoQ" and master_file is None:
+            st.warning("Pro kolo s Master BoQ je potřeba mít načtený Master.")
+        elif not new_round_name:
+            st.warning("Zadej název kola.")
+        else:
+            hashes: Dict[str, str] = {}
+            if master_file is not None:
+                hashes["master"] = hash_fileobj(master_file)
+            for idx, f in enumerate(bid_files):
+                hashes[f"bid_{idx}"] = hash_fileobj(f)
+
+            fingerprint = compute_config_fingerprint(
+                mode="with_master"
+                if comparison_mode == "Porovnání s Master BoQ"
+                else "supplier_only",
+                basket_mode=st.session_state.get(SUPPLIER_ONLY_BASKET_MODE_KEY),
+                quantity_mode=st.session_state.get(SUPPLIER_ONLY_QUANTITY_MODE_KEY),
+                dph_mode=st.session_state.get("supplier_only_dph_filter"),
+                currency=currency,
+                exchange_rate=st.session_state.get(EXCHANGE_RATE_STATE_KEY),
+                input_hashes=hashes,
+            )
+            meta = project_storage.create_round(
+                project_selection,
+                round_name=new_round_name,
+                mode=fingerprint.get("mode", "unknown"),
+                config_fingerprint=fingerprint,
+                input_hashes=hashes,
+                master=master_file,
+                bids=bid_files,
+                notes=new_round_notes,
+                basket_mode=fingerprint.get("basket_mode"),
+                quantity_mode=fingerprint.get("quantity_mode"),
+            )
+            st.session_state["active_round_id"] = meta["round_id"]
+            st.success(f"Kolo '{new_round_name}' bylo uloženo.")
+            trigger_rerun()
 
 stored_master_entries = offer_storage.list_master()
 stored_bid_entries = offer_storage.list_bids()
