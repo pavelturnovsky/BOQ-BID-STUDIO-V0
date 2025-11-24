@@ -7901,13 +7901,24 @@ def run_supplier_only_comparison(
                     right_df, right_meta = project_storage.load_snapshot(
                         project_id, options[selected[1]].get("round_id", round_id), selected[1]
                     )
+
+                    def _normalize_supplier_column(df: pd.DataFrame) -> pd.DataFrame:
+                        if "supplier" in df.columns:
+                            return df
+                        if "Dodavatel" in df.columns:
+                            return df.rename(columns={"Dodavatel": "supplier"})
+                        return df
+
+                    left_df = _normalize_supplier_column(left_df)
+                    right_df = _normalize_supplier_column(right_df)
+
                     joined = left_df.set_index("supplier").join(
                         right_df.set_index("supplier"),
                         lsuffix="_A",
                         rsuffix="_B",
                         how="outer",
                     )
-                    joined = joined.reset_index().rename(columns={"index": "supplier"})
+                    joined = joined.reset_index().rename(columns={"index": "Dodavatel"})
                     st.markdown("**Δ souhrn mezi snapshoty**")
                     st.dataframe(joined, use_container_width=True)
                     st.caption(
