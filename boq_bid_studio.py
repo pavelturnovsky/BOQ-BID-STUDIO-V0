@@ -2794,6 +2794,62 @@ def ensure_unique_aliases(
     return unique
 
 
+def get_file_display_name(file_obj: Any, fallback_label: str) -> str:
+    """Return a user-friendly label for an uploaded file-like object."""
+
+    name = getattr(file_obj, "name", "") or ""
+    base = os.path.basename(str(name))
+    return base or fallback_label
+
+
+def render_bid_selection_controls(
+    bid_files: List[Any], *, context_key: str, fallback_prefix: str = "Nabídka"
+) -> List[Any]:
+    """Render sidebar controls that allow users to remove uploaded bids."""
+
+    state: Dict[str, Set[str]] = st.session_state.setdefault("bid_selection_state", {})
+    removed: Set[str] = state.setdefault(context_key, set())
+
+    labeled_items: List[Tuple[str, str, Any]] = []
+    for idx, file_obj in enumerate(bid_files, start=1):
+        label = get_file_display_name(file_obj, f"{fallback_prefix} {idx}")
+        identifier = f"{label}#{idx}"
+        labeled_items.append((identifier, label, file_obj))
+
+    active_items = [(ident, lbl, obj) for ident, lbl, obj in labeled_items if ident not in removed]
+
+    with st.sidebar.expander("Aktivní nabídky", expanded=True):
+        if labeled_items and removed:
+            st.caption(
+                f"Skryto: {len(removed)} souborů. Použij *Obnovit výběr* pro návrat."
+            )
+        restore_label = "Obnovit výběr" if removed else "Vyčistit výběr"
+        if st.button(restore_label, key=f"reset_bids_{context_key}"):
+            state[context_key] = set()
+            trigger_rerun()
+
+        if not active_items:
+            st.info("Žádné aktivní nabídky pro aktuální kolo.")
+            return []
+
+        st.caption("Odeber konkrétní soubory z aktuálního porovnání.")
+        for ident, label, _ in active_items:
+            cols = st.columns([4, 1])
+            cols[0].write(label)
+            if cols[1].button("Smazat", key=f"remove_bid_{ident}"):
+                removed.add(ident)
+                state[context_key] = removed
+                trigger_rerun()
+
+        if len(active_items) > 1:
+            if st.button("Vyčistit všechny nabídky", key=f"clear_all_bids_{context_key}"):
+                removed.update({ident for ident, _, _ in active_items})
+                state[context_key] = removed
+                trigger_rerun()
+
+    return [file_obj for ident, label, file_obj in active_items]
+
+
 class OfferStorage:
     """Persist uploaded workbooks on disk for reuse between sessions."""
 
@@ -6812,7 +6868,7 @@ def run_supplier_only_comparison(
             bid_options,
             format_func=lambda value: bid_display_map.get(value, value),
             key="supplier_only_stored_bids",
-        )
+            )
         for name in selected_stored:
             try:
                 bid_files.append(offer_storage.load_bid(name))
@@ -6820,6 +6876,11 @@ def run_supplier_only_comparison(
                 st.sidebar.warning(
                     f"Uloženou nabídku '{name}' se nepodařilo načíst."
                 )
+
+    bid_context_key = f"{project_id or 'no_project'}|{round_id or 'draft'}|supplier_only"
+    bid_files = render_bid_selection_controls(
+        bid_files, context_key=bid_context_key, fallback_prefix="Nabídka"
+    )
 
     if len(bid_files) > 7:
         st.sidebar.warning("Bylo vybráno více než 7 nabídek, zpracuje se prvních 7.")
@@ -8874,9 +8935,16 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+prefill_round_inputs = st.sidebar.checkbox(
+    "Načíst uložené vstupy kola",
+    value=True,
+    help="Vypni pro založení dalšího kola bez předvyplněných souborů.",
+    key="prefill_round_inputs",
+)
+
 round_loaded_master: Optional[io.BytesIO] = None
 round_loaded_bids: List[io.BytesIO] = []
-if project_selection and round_selection:
+if project_selection and round_selection and prefill_round_inputs:
     try:
         round_loaded_master, round_loaded_bids = project_storage.load_round_inputs(
             project_selection, round_selection
@@ -8975,6 +9043,11 @@ if stored_bid_entries:
             st.sidebar.warning(
                 f"Uloženou nabídku '{name}' se nepodařilo načíst."
             )
+
+bid_context_key = f"{project_selection or 'no_project'}|{round_selection or 'draft'}|master"
+bid_files = render_bid_selection_controls(
+    bid_files, context_key=bid_context_key, fallback_prefix="Nabídka"
+)
 
 if len(bid_files) > 7:
     st.sidebar.warning("Bylo vybráno více než 7 nabídek, zpracuje se prvních 7.")
