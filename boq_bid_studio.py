@@ -1,6 +1,7 @@
 
 import hashlib
 import logging
+import functools
 import io
 import math
 import os
@@ -5260,7 +5261,7 @@ def _read_workbook_cached(
             cleanup_path.unlink(missing_ok=True)
 
 
-def read_workbook(upload, limit_sheets: Optional[List[str]] = None) -> WorkbookData:
+def _read_workbook_loader(upload, limit_sheets: Optional[List[str]] = None) -> WorkbookData:
     file_name, suffix, data_bytes = _normalize_upload(upload)
 
     if data_bytes is not None:
@@ -5273,6 +5274,11 @@ def read_workbook(upload, limit_sheets: Optional[List[str]] = None) -> WorkbookD
             temp_path = path_obj
 
     return _parse_workbook(file_name, suffix, upload, temp_path, limit_sheets)
+
+
+@functools.wraps(_read_workbook_loader, assigned=("__doc__", "__annotations__"))
+def read_workbook(upload, limit_sheets: Optional[List[str]] = None) -> WorkbookData:
+    return _read_workbook_loader(upload, limit_sheets)
 
 def apply_master_mapping(master: WorkbookData, target: WorkbookData) -> None:
     """Copy mapping and align it with target workbook headers by column name."""
