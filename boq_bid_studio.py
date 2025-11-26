@@ -5090,14 +5090,16 @@ def show_df(df: pd.DataFrame) -> None:
         styler = styler.set_table_styles(header_styles, overwrite=False)
     st.dataframe(styler, **display_kwargs)
 
-@st.cache_data
-def read_workbook(upload, limit_sheets: Optional[List[str]] = None) -> WorkbookData:
+def _normalize_upload(upload: Any) -> Tuple[str, str, Optional[bytes]]:
+    """Convert various upload-like inputs into a consistent payload.
+
+    Returning raw bytes avoids Streamlit caching from hashing temporary file paths
+    that may disappear between sessions.
+    """
+
     file_name = getattr(upload, "name", "workbook")
     suffix = Path(file_name).suffix.lower()
     data_bytes: Optional[bytes] = None
-    source_for_pandas: Any = upload
-    temp_path: Optional[Path] = None
-    cleanup_path: Optional[Path] = None
 
     if isinstance(upload, (bytes, bytearray)):
         data_bytes = bytes(upload)
@@ -5120,22 +5122,17 @@ def read_workbook(upload, limit_sheets: Optional[List[str]] = None) -> WorkbookD
         path_obj = Path(upload)
         if path_obj.exists():
             data_bytes = path_obj.read_bytes()
-            temp_path = path_obj
 
-    if data_bytes is not None:
-        source_for_pandas = io.BytesIO(data_bytes)
-        source_for_pandas.seek(0)
-        if suffix in {".xlsx", ".xlsm"}:
-            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-                tmp.write(data_bytes)
-                tmp.flush()
-                temp_path = Path(tmp.name)
-                cleanup_path = Path(tmp.name)
-    elif isinstance(upload, (str, Path)):
-        path_obj = Path(upload)
-        if path_obj.exists():
-            temp_path = path_obj
+    return file_name, suffix, data_bytes
 
+
+def _parse_workbook(
+    file_name: str,
+    suffix: str,
+    source_for_pandas: Any,
+    temp_path: Optional[Path],
+    limit_sheets: Optional[List[str]],
+) -> WorkbookData:
     xl = pd.ExcelFile(source_for_pandas)
     sheet_names = (
         xl.sheet_names
@@ -5237,13 +5234,45 @@ def read_workbook(upload, limit_sheets: Optional[List[str]] = None) -> WorkbookD
                 "outline_tree": {"rows": [], "cols": []},
             }
 
-    if cleanup_path and cleanup_path.exists():
-        try:
-            cleanup_path.unlink()
-        except OSError:
-            pass
-
     return wb
+
+
+@st.cache_data
+def _read_workbook_cached(
+    file_name: str, suffix: str, data_bytes: bytes, limit_sheets: Optional[List[str]]
+) -> WorkbookData:
+    source_for_pandas: Any = io.BytesIO(data_bytes)
+    source_for_pandas.seek(0)
+
+    temp_path: Optional[Path] = None
+    cleanup_path: Optional[Path] = None
+    if suffix in {".xlsx", ".xlsm"}:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+            tmp.write(data_bytes)
+            tmp.flush()
+            temp_path = Path(tmp.name)
+            cleanup_path = Path(tmp.name)
+
+    try:
+        return _parse_workbook(file_name, suffix, source_for_pandas, temp_path, limit_sheets)
+    finally:
+        if cleanup_path:
+            cleanup_path.unlink(missing_ok=True)
+
+
+def read_workbook(upload, limit_sheets: Optional[List[str]] = None) -> WorkbookData:
+    file_name, suffix, data_bytes = _normalize_upload(upload)
+
+    if data_bytes is not None:
+        return _read_workbook_cached(file_name, suffix, data_bytes, limit_sheets)
+
+    temp_path: Optional[Path] = None
+    if isinstance(upload, (str, Path)):
+        path_obj = Path(upload)
+        if path_obj.exists():
+            temp_path = path_obj
+
+    return _parse_workbook(file_name, suffix, upload, temp_path, limit_sheets)
 
 def apply_master_mapping(master: WorkbookData, target: WorkbookData) -> None:
     """Copy mapping and align it with target workbook headers by column name."""
