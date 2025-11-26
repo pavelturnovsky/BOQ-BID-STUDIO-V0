@@ -3184,7 +3184,6 @@ class ProjectStorageManager:
         *,
         master: Optional[Any],
         bids: Sequence[Any],
-        *,
         supplier_metadata: Optional[Mapping[str, Any]] = None,
     ) -> Dict[str, Any]:
         inputs_dir = self._round_dir(project_id, round_id) / "inputs"
