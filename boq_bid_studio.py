@@ -2797,6 +2797,10 @@ def ensure_unique_aliases(
 def get_file_display_name(file_obj: Any, fallback_label: str) -> str:
     """Return a user-friendly label for an uploaded file-like object."""
 
+    original = getattr(file_obj, "original_name", "") or ""
+    if original:
+        return os.path.basename(str(original)) or fallback_label
+
     name = getattr(file_obj, "name", "") or ""
     base = os.path.basename(str(name))
     return base or fallback_label
@@ -3180,6 +3184,8 @@ class ProjectStorageManager:
         *,
         master: Optional[Any],
         bids: Sequence[Any],
+        *,
+        supplier_metadata: Optional[Mapping[str, Any]] = None,
     ) -> Dict[str, Any]:
         inputs_dir = self._round_dir(project_id, round_id) / "inputs"
         inputs_dir.mkdir(parents=True, exist_ok=True)
@@ -3210,30 +3216,45 @@ class ProjectStorageManager:
             saved.setdefault("bids", [])
             saved.setdefault("bid_names", [])
             saved["bids"].append(dest.name)
-            bid_name = getattr(bid, "name", dest.name)
+            bid_name = (
+                getattr(bid, "original_name", None)
+                or getattr(bid, "name", dest.name)
+                or dest.name
+            )
             saved["bid_names"].append(bid_name)
+        if supplier_metadata:
+            saved["supplier_metadata"] = supplier_metadata
         return saved
 
     def load_round_inputs(
         self, project_id: str, round_id: str
-    ) -> Tuple[Optional[io.BytesIO], List[io.BytesIO]]:
+    ) -> Tuple[Optional[io.BytesIO], List[io.BytesIO], Dict[str, Any]]:
         round_meta = self._load_metadata(self._metadata_path(self._round_dir(project_id, round_id)))
         if round_meta and not self._validate_owner(round_meta):
             raise PermissionError("Projekt nenalezen nebo k němu nemáte přístup.")
         inputs_dir = self._round_dir(project_id, round_id) / "inputs"
         if not inputs_dir.exists():
-            return None, []
+            return None, [], {}
+        input_meta = round_meta.get("inputs", {}) if isinstance(round_meta, Mapping) else {}
         master_path = inputs_dir / "master.xlsx"
         master_obj: Optional[io.BytesIO] = None
         if master_path.exists():
             master_obj = io.BytesIO(master_path.read_bytes())
             master_obj.name = str(master_path)  # type: ignore[attr-defined]
         bids: List[io.BytesIO] = []
-        for bid_path in sorted(inputs_dir.glob("bid_*.xlsx")):
+        bid_names: List[str] = []
+        if isinstance(input_meta, Mapping):
+            stored_names = input_meta.get("bid_names", [])
+            if isinstance(stored_names, list):
+                bid_names = [str(name) for name in stored_names]
+
+        for idx, bid_path in enumerate(sorted(inputs_dir.glob("bid_*.xlsx"))):
             payload = io.BytesIO(bid_path.read_bytes())
-            payload.name = str(bid_path)  # type: ignore[attr-defined]
+            display_name = bid_names[idx] if idx < len(bid_names) else bid_path.name
+            payload.name = str(display_name)  # type: ignore[attr-defined]
+            payload.original_name = display_name  # type: ignore[attr-defined]
             bids.append(payload)
-        return master_obj, bids
+        return master_obj, bids, input_meta
 
     def create_round(
         self,
@@ -3249,12 +3270,19 @@ class ProjectStorageManager:
         basket_mode: Optional[str] = None,
         quantity_mode: Optional[str] = None,
         locked: bool = False,
+        supplier_metadata: Optional[Mapping[str, Any]] = None,
     ) -> Dict[str, Any]:
         project_meta = self.load_project(project_id)
         if not project_meta:
             raise PermissionError("Projekt nenalezen nebo k němu nemáte přístup.")
         round_id = generate_stable_id("round")
-        saved_inputs = self._write_round_inputs(project_id, round_id, master=master, bids=bids)
+        saved_inputs = self._write_round_inputs(
+            project_id,
+            round_id,
+            master=master,
+            bids=bids,
+            supplier_metadata=supplier_metadata,
+        )
         currency = config_fingerprint.get("currency") if isinstance(config_fingerprint, Mapping) else None
         exchange_rate = (
             config_fingerprint.get("exchange_rate")
@@ -3307,7 +3335,7 @@ class ProjectStorageManager:
         )
         if not source_meta:
             return None
-        master, bids = self.load_round_inputs(project_id, source_round_id)
+        master, bids, input_meta = self.load_round_inputs(project_id, source_round_id)
         return self.create_round(
             project_id,
             round_name=round_name,
@@ -3320,6 +3348,7 @@ class ProjectStorageManager:
             basket_mode=source_meta.get("basket_mode"),
             quantity_mode=source_meta.get("quantity_mode"),
             locked=source_meta.get("locked", False),
+            supplier_metadata=input_meta.get("supplier_metadata"),
         )
 
     def set_round_locked(self, project_id: str, round_id: str, locked: bool) -> Optional[Dict[str, Any]]:
@@ -6834,8 +6863,12 @@ def run_supplier_only_comparison(
     bid_files: List[Any] = []
     if project_storage and project_id and round_id:
         try:
-            _, loaded_bids = project_storage.load_round_inputs(project_id, round_id)
+            _, loaded_bids, loaded_meta = project_storage.load_round_inputs(project_id, round_id)
             bid_files.extend(loaded_bids)
+            if loaded_meta.get("supplier_metadata"):
+                st.session_state["supplier_only_metadata"] = loaded_meta.get(
+                    "supplier_metadata", {}
+                )
         except FileNotFoundError:
             pass
 
@@ -6926,6 +6959,9 @@ def run_supplier_only_comparison(
                     notes=round_note,
                     basket_mode=fingerprint.get("basket_mode"),
                     quantity_mode=fingerprint.get("quantity_mode"),
+                    supplier_metadata=st.session_state.get(
+                        "supplier_only_metadata", {}
+                    ),
                 )
                 st.session_state["pending_round_id"] = meta.get("round_id")
                 st.success("Kolo bylo uloženo.")
@@ -8946,9 +8982,14 @@ round_loaded_master: Optional[io.BytesIO] = None
 round_loaded_bids: List[io.BytesIO] = []
 if project_selection and round_selection and prefill_round_inputs:
     try:
-        round_loaded_master, round_loaded_bids = project_storage.load_round_inputs(
-            project_selection, round_selection
+        round_loaded_master, round_loaded_bids, round_loaded_meta = (
+            project_storage.load_round_inputs(project_selection, round_selection)
         )
+        supplier_meta = {}
+        if isinstance(round_loaded_meta, Mapping):
+            supplier_meta = round_loaded_meta.get("supplier_metadata", {}) or {}
+        if supplier_meta:
+            st.session_state["supplier_metadata"] = supplier_meta
     except FileNotFoundError:
         round_loaded_master, round_loaded_bids = None, []
     except PermissionError:
@@ -9096,6 +9137,7 @@ with st.sidebar.expander("Uložit nebo duplikovat kolo", expanded=False):
                 notes=new_round_notes,
                 basket_mode=fingerprint.get("basket_mode"),
                 quantity_mode=fingerprint.get("quantity_mode"),
+                supplier_metadata=st.session_state.get("supplier_metadata", {}),
             )
             st.session_state["pending_round_id"] = meta["round_id"]
             st.success(f"Kolo '{new_round_name}' bylo uloženo.")
