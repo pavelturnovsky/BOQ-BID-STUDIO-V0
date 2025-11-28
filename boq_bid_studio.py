@@ -76,6 +76,60 @@ def generate_stable_id(prefix: str = "id") -> str:
     return f"{prefix}_{token}"
 
 
+def generate_supplier_id(source: str) -> str:
+    """Return a deterministic-ish supplier identifier derived from a name."""
+
+    normalized = unicodedata.normalize("NFKD", str(source)).encode("ascii", "ignore").decode()
+    slug = re.sub(r"[^a-zA-Z0-9]+", "-", normalized).strip("-").lower() or "supplier"
+    digest = hashlib.md5(str(source).encode("utf-8")).hexdigest()[:8]
+    return f"sup-{slug}-{digest}"
+
+
+def build_supplier_list(
+    supplier_metadata: Mapping[str, Mapping[str, Any]],
+    order: Optional[Sequence[str]] = None,
+) -> List[Dict[str, Any]]:
+    """Create a stable list of suppliers with IDs, names and ordering."""
+
+    ordered_names: List[str] = []
+    if order:
+        ordered_names.extend([name for name in order if name not in ordered_names])
+    for name in supplier_metadata.keys():
+        if name not in ordered_names:
+            ordered_names.append(name)
+
+    supplier_list: List[Dict[str, Any]] = []
+    for idx, raw_name in enumerate(ordered_names, start=1):
+        meta = supplier_metadata.get(raw_name, {}) or {}
+        supplier_id = meta.get("supplier_id") or generate_supplier_id(raw_name)
+        supplier_entry = {
+            "supplier_id": supplier_id,
+            "supplier_name": meta.get("alias_display")
+            or meta.get("alias")
+            or raw_name,
+            "order": meta.get("order", idx),
+            "alias": meta.get("alias_display") or meta.get("alias"),
+        }
+        supplier_list.append(supplier_entry)
+
+    return supplier_list
+
+
+def supplier_list_to_metadata(supplier_list: Sequence[Mapping[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    """Convert stored supplier list back to in-session metadata format."""
+
+    metadata: Dict[str, Dict[str, Any]] = {}
+    for entry in supplier_list:
+        name = str(entry.get("supplier_name") or entry.get("alias") or entry.get("supplier_id"))
+        metadata[name] = {
+            "alias": entry.get("alias") or name,
+            "alias_display": entry.get("alias") or name,
+            "supplier_id": entry.get("supplier_id"),
+            "order": entry.get("order"),
+        }
+    return metadata
+
+
 def hash_fileobj(file_obj: Any) -> str:
     """Hash a file-like object without mutating its position."""
 
@@ -3186,6 +3240,7 @@ class ProjectStorageManager:
         master: Optional[Any],
         bids: Sequence[Any],
         supplier_metadata: Optional[Mapping[str, Any]] = None,
+        supplier_list: Optional[Sequence[Mapping[str, Any]]] = None,
     ) -> Dict[str, Any]:
         inputs_dir = self._round_dir(project_id, round_id) / "inputs"
         inputs_dir.mkdir(parents=True, exist_ok=True)
@@ -3224,6 +3279,8 @@ class ProjectStorageManager:
             saved["bid_names"].append(bid_name)
         if supplier_metadata:
             saved["supplier_metadata"] = supplier_metadata
+        if supplier_list:
+            saved["supplier_list"] = list(supplier_list)
         return saved
 
     def load_round_inputs(
@@ -3236,6 +3293,8 @@ class ProjectStorageManager:
         if not inputs_dir.exists():
             return None, [], {}
         input_meta = round_meta.get("inputs", {}) if isinstance(round_meta, Mapping) else {}
+        if isinstance(round_meta, Mapping) and round_meta.get("supplier_list"):
+            input_meta.setdefault("supplier_list", round_meta.get("supplier_list"))
         master_path = inputs_dir / "master.xlsx"
         master_obj: Optional[io.BytesIO] = None
         if master_path.exists():
@@ -3271,6 +3330,7 @@ class ProjectStorageManager:
         quantity_mode: Optional[str] = None,
         locked: bool = False,
         supplier_metadata: Optional[Mapping[str, Any]] = None,
+        supplier_list: Optional[Sequence[Mapping[str, Any]]] = None,
     ) -> Dict[str, Any]:
         project_meta = self.load_project(project_id)
         if not project_meta:
@@ -3282,6 +3342,7 @@ class ProjectStorageManager:
             master=master,
             bids=bids,
             supplier_metadata=supplier_metadata,
+            supplier_list=supplier_list,
         )
         currency = config_fingerprint.get("currency") if isinstance(config_fingerprint, Mapping) else None
         exchange_rate = (
@@ -3309,6 +3370,7 @@ class ProjectStorageManager:
             "exchange_rate": exchange_rate,
             "dph_mode": dph_mode,
             "inputs": saved_inputs,
+            "supplier_list": list(supplier_list or []),
         }
         rnd_dir = self._round_dir(project_id, round_id)
         rnd_dir.mkdir(parents=True, exist_ok=True)
@@ -3349,6 +3411,7 @@ class ProjectStorageManager:
             quantity_mode=source_meta.get("quantity_mode"),
             locked=source_meta.get("locked", False),
             supplier_metadata=input_meta.get("supplier_metadata"),
+            supplier_list=source_meta.get("supplier_list"),
         )
 
     def set_round_locked(self, project_id: str, round_id: str, locked: bool) -> Optional[Dict[str, Any]]:
@@ -6899,10 +6962,14 @@ def run_supplier_only_comparison(
         try:
             _, loaded_bids, loaded_meta = project_storage.load_round_inputs(project_id, round_id)
             bid_files.extend(loaded_bids)
-            if loaded_meta.get("supplier_metadata"):
-                st.session_state["supplier_only_metadata"] = loaded_meta.get(
-                    "supplier_metadata", {}
-                )
+            supplier_meta = loaded_meta.get("supplier_metadata") or {}
+            supplier_list_meta = loaded_meta.get("supplier_list") or loaded_meta.get("inputs", {}).get(
+                "supplier_list", []
+            )
+            if supplier_list_meta and not supplier_meta:
+                supplier_meta = supplier_list_to_metadata(supplier_list_meta)
+            if supplier_meta:
+                st.session_state["supplier_only_metadata"] = supplier_meta
         except FileNotFoundError:
             pass
 
@@ -6982,6 +7049,10 @@ def run_supplier_only_comparison(
                     exchange_rate=st.session_state.get(EXCHANGE_RATE_STATE_KEY),
                     input_hashes=hashes,
                 )
+                supplier_list = build_supplier_list(
+                    st.session_state.get("supplier_only_metadata", {}),
+                    order=list(metadata.keys()),
+                )
                 meta = project_storage.create_round(
                     project_id,
                     round_name=round_name,
@@ -6996,6 +7067,7 @@ def run_supplier_only_comparison(
                     supplier_metadata=st.session_state.get(
                         "supplier_only_metadata", {}
                     ),
+                    supplier_list=supplier_list,
                 )
                 st.session_state["pending_round_id"] = meta.get("round_id")
                 st.success("Kolo bylo uloženo.")
@@ -7041,6 +7113,9 @@ def run_supplier_only_comparison(
             entry["alias"] = supplier_default_alias(raw_name)
         if not entry.get("color"):
             entry["color"] = palette[idx % len(palette)]
+        if not entry.get("supplier_id"):
+            entry["supplier_id"] = generate_supplier_id(raw_name)
+        entry.setdefault("order", idx + 1)
         metadata[raw_name] = entry
 
     with st.sidebar.expander("Alias a barvy dodavatelů", expanded=True):
@@ -9020,8 +9095,14 @@ if project_selection and round_selection and prefill_round_inputs:
             project_storage.load_round_inputs(project_selection, round_selection)
         )
         supplier_meta = {}
+        supplier_list_meta = []
         if isinstance(round_loaded_meta, Mapping):
             supplier_meta = round_loaded_meta.get("supplier_metadata", {}) or {}
+            supplier_list_meta = round_loaded_meta.get("supplier_list", []) or round_loaded_meta.get(
+                "inputs", {}
+            ).get("supplier_list", [])
+        if supplier_list_meta and not supplier_meta:
+            supplier_meta = supplier_list_to_metadata(supplier_list_meta)
         if supplier_meta:
             st.session_state["supplier_metadata"] = supplier_meta
     except FileNotFoundError:
@@ -9160,6 +9241,10 @@ with st.sidebar.expander("Uložit nebo duplikovat kolo", expanded=False):
                 exchange_rate=st.session_state.get(EXCHANGE_RATE_STATE_KEY),
                 input_hashes=hashes,
             )
+            supplier_list = build_supplier_list(
+                st.session_state.get("supplier_metadata", {}),
+                order=list(metadata.keys()),
+            )
             meta = project_storage.create_round(
                 project_selection,
                 round_name=new_round_name,
@@ -9172,6 +9257,7 @@ with st.sidebar.expander("Uložit nebo duplikovat kolo", expanded=False):
                 basket_mode=fingerprint.get("basket_mode"),
                 quantity_mode=fingerprint.get("quantity_mode"),
                 supplier_metadata=st.session_state.get("supplier_metadata", {}),
+                supplier_list=supplier_list,
             )
             st.session_state["pending_round_id"] = meta["round_id"]
             st.success(f"Kolo '{new_round_name}' bylo uloženo.")
@@ -9294,13 +9380,16 @@ palette = (
 )
 
 if current_suppliers:
-    for idx, raw_name in enumerate(current_suppliers):
-        entry = metadata.get(raw_name, {})
-        if not entry.get("alias"):
-            entry["alias"] = supplier_default_alias(raw_name)
-        if not entry.get("color"):
-            entry["color"] = palette[idx % len(palette)]
-        metadata[raw_name] = entry
+for idx, raw_name in enumerate(current_suppliers):
+    entry = metadata.get(raw_name, {})
+    if not entry.get("alias"):
+        entry["alias"] = supplier_default_alias(raw_name)
+    if not entry.get("color"):
+        entry["color"] = palette[idx % len(palette)]
+    if not entry.get("supplier_id"):
+        entry["supplier_id"] = generate_supplier_id(raw_name)
+    entry.setdefault("order", idx + 1)
+    metadata[raw_name] = entry
 
     with st.sidebar.expander("Alias a barvy dodavatelů", expanded=True):
         st.caption("Zkrácený název a barva se promítnou do tabulek a grafů.")
@@ -9334,7 +9423,7 @@ chart_color_map.setdefault("Master", "#636EFA")
 ensure_exchange_rate_state()
 
 # ------------- Tabs -------------
-tab_data, tab_preview, tab_compare, tab_compare2, tab_curve, tab_summary, tab_rekap = st.tabs([
+tab_data, tab_preview, tab_compare, tab_compare2, tab_curve, tab_summary, tab_rekap, tab_rounds = st.tabs([
     "📑 Mapování",
     "🧾 Kontrola dat",
     "⚖️ Porovnání",
@@ -9342,6 +9431,7 @@ tab_data, tab_preview, tab_compare, tab_compare2, tab_curve, tab_summary, tab_re
     "📈 Spojitá nabídková křivka",
     "📋 Celkový přehled",
     "📊 Rekapitulace",
+    "🔁 Porovnání kol",
 ])
 
 with tab_data:
@@ -13172,6 +13262,154 @@ with tab_rekap:
                 show_df(
                     rename_value_columns_for_display(added_df.copy(), f" — {base_currency}")
                 )
+
+with tab_rounds:
+    st.subheader("Porovnání kol")
+    if not project_selection:
+        st.info("Vyber projekt v horní části pro práci s uloženými koly.")
+    else:
+        available_rounds = project_storage.list_rounds(project_selection)
+        if not available_rounds:
+            st.info("Tento projekt zatím neobsahuje žádná uložená kola.")
+        else:
+            round_options = {
+                r.get("round_id"): f"{r.get('round_name', r.get('round_id'))} ({format_timestamp(r.get('created_at'))})"
+                for r in available_rounds
+                if r.get("round_id")
+            }
+            selected_round_ids = st.multiselect(
+                "Vyber kola k porovnání",
+                options=list(round_options.keys()),
+                format_func=lambda rid: round_options.get(rid, str(rid)),
+                help="Vyber alespoň dvě kola se stejným fingerprintem/schématem.",
+            )
+
+            if len(selected_round_ids) < 2:
+                st.info("Vyber minimálně dvě kola pro porovnání.")
+            else:
+                selected_metas = [
+                    meta for meta in available_rounds if meta.get("round_id") in selected_round_ids
+                ]
+                selected_metas.sort(key=lambda m: selected_round_ids.index(m.get("round_id")))
+                reference = selected_metas[0]
+                reference_fp = reference.get("config_fingerprint")
+                incompatible: List[str] = []
+                for meta in selected_metas[1:]:
+                    if meta.get("mode") != reference.get("mode"):
+                        incompatible.append(
+                            f"{meta.get('round_name', meta.get('round_id'))}: rozdílný režim"
+                        )
+                        continue
+                    fp = meta.get("config_fingerprint")
+                    if fp != reference_fp:
+                        reasons = describe_fingerprint_reason(fp, reference_fp)
+                        reason_text = "; ".join(reasons) if reasons else "Odlišný fingerprint"
+                        incompatible.append(
+                            f"{meta.get('round_name', meta.get('round_id'))}: {reason_text}"
+                        )
+
+                if incompatible:
+                    st.error(
+                        "Kola nejsou kompatibilní pro porovnání:\n- "
+                        + "\n- ".join(incompatible)
+                    )
+                else:
+                    st.success("Fingerprint i režim vybraných kol jsou kompatibilní.")
+                    supplier_pool: Dict[str, Dict[str, Any]] = {}
+                    for meta in selected_metas:
+                        for entry in meta.get("supplier_list", []):
+                            sid = str(entry.get("supplier_id") or entry.get("supplier_name"))
+                            if sid not in supplier_pool:
+                                supplier_pool[sid] = {
+                                    "supplier_id": sid,
+                                    "supplier_name": entry.get("supplier_name") or sid,
+                                    "order": entry.get("order", len(supplier_pool) + 1),
+                                }
+                            if entry.get("supplier_name"):
+                                supplier_pool[sid]["supplier_name"] = entry.get("supplier_name")
+
+                    ordered_suppliers = sorted(
+                        supplier_pool.values(), key=lambda item: item.get("order", 0)
+                    )
+                    supplier_labels = [f"{sup['supplier_name']} ({sup['supplier_id']})" for sup in ordered_suppliers]
+                    default_selection = [sup["supplier_id"] for sup in ordered_suppliers]
+                    chosen_ids = st.multiselect(
+                        "Dodavatelé k porovnání",
+                        options=[sup["supplier_id"] for sup in ordered_suppliers],
+                        default=default_selection,
+                        format_func=lambda sid: next(
+                            (lbl for lbl in supplier_labels if lbl.endswith(f"{sid})")), sid
+                        ),
+                    )
+
+                    if not chosen_ids:
+                        st.info("Vyber alespoň jednoho dodavatele pro zobrazení výsledků.")
+                    else:
+                        view_mode = st.radio(
+                            "Režim zobrazení",
+                            ["Porovnání 2", "Spojitá nabídková křivka", "Rekapitulace"],
+                            horizontal=True,
+                        )
+
+                        legend_rows: List[Dict[str, Any]] = []
+                        for supplier in ordered_suppliers:
+                            if supplier["supplier_id"] not in chosen_ids:
+                                continue
+                            for meta in selected_metas:
+                                legend_rows.append(
+                                    {
+                                        "Dodavatel": supplier.get("supplier_name"),
+                                        "Dodavatel ID": supplier.get("supplier_id"),
+                                        "Kolo": meta.get("round_name") or meta.get("round_id"),
+                                        "Popisek": f"{supplier.get('supplier_name')} — {meta.get('round_name', '')}",
+                                    }
+                                )
+
+                        legend_df = pd.DataFrame(legend_rows)
+                        if not legend_df.empty:
+                            st.caption("Legenda pro porovnání (barva = dodavatel, styl = kolo):")
+                            st.dataframe(legend_df, use_container_width=True, hide_index=True)
+
+                        if view_mode == "Porovnání 2":
+                            column_tuples: List[Tuple[str, str]] = []
+                            for supplier in ordered_suppliers:
+                                if supplier["supplier_id"] not in chosen_ids:
+                                    continue
+                                for meta in selected_metas:
+                                    column_tuples.append(
+                                        (
+                                            supplier.get("supplier_name"),
+                                            f"{meta.get('round_name', meta.get('round_id'))}",
+                                        )
+                                    )
+                            multi_columns = pd.MultiIndex.from_tuples(column_tuples)
+                            preview_df = pd.DataFrame(columns=multi_columns)
+                            st.dataframe(
+                                preview_df,
+                                use_container_width=True,
+                                column_config=None,
+                            )
+                            st.info(
+                                "Tabulka připravena pro zobrazení jednotkových/celkových cen v MultiIndex sloupcích."
+                            )
+                        elif view_mode == "Spojitá nabídková křivka":
+                            st.info(
+                                "Data pro spojitou křivku budou vykreslena po doplnění agregovaných hodnot z jednotlivých kol."
+                            )
+                        else:
+                            recap_columns: List[str] = []
+                            for supplier in ordered_suppliers:
+                                if supplier["supplier_id"] not in chosen_ids:
+                                    continue
+                                for meta in selected_metas:
+                                    recap_columns.append(
+                                        f"{supplier.get('supplier_name')} — Celkem ({meta.get('round_name')})"
+                                    )
+                            recap_df = pd.DataFrame(columns=recap_columns)
+                            st.dataframe(recap_df, use_container_width=True)
+                            st.info(
+                                "Rekapitulace napříč koly je připravena; hodnoty budou doplněny po načtení agregovaných součtů."
+                            )
 
 st.markdown("---")
 st.caption("© 2025 BoQ Bid Studio — MVP. Doporučení: používat jednotné Item ID pro precizní párování.")
