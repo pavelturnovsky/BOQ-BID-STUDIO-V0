@@ -85,6 +85,24 @@ def generate_supplier_id(source: str) -> str:
     return f"sup-{slug}-{digest}"
 
 
+def reset_round_context() -> None:
+    """Clear session-scoped keys tied to the current round uploads and metadata."""
+
+    for key in [
+        "master",
+        "bids",
+        "supplier_only_bids",
+        "supplier_metadata",
+        "supplier_only_metadata",
+        "round_loaded_master",
+        "round_loaded_bids",
+        "bid_selection_state",
+        "prefill_round_inputs",
+    ]:
+        if key in st.session_state:
+            st.session_state.pop(key)
+
+
 def build_supplier_list(
     supplier_metadata: Mapping[str, Mapping[str, Any]],
     order: Optional[Sequence[str]] = None,
@@ -3315,27 +3333,71 @@ class ProjectStorageManager:
             bids.append(payload)
         return master_obj, bids, input_meta
 
+    def initialize_round(
+        self, project_id: str, *, round_name: str, notes: str = ""
+    ) -> Dict[str, Any]:
+        """Create an empty draft round and return its metadata."""
+
+        project_meta = self.load_project(project_id)
+        if not project_meta:
+            raise PermissionError("Projekt nenalezen nebo k němu nemáte přístup.")
+
+        round_id = generate_stable_id("round")
+        meta = {
+            "round_id": round_id,
+            "round_name": round_name,
+            "created_at": time.time(),
+            "created_by": self.user_id,
+            "last_modified_by": self.user_id,
+            "owner_user_id": self.user_id,
+            "mode": None,
+            "config_fingerprint": {},
+            "input_hashes": {},
+            "notes": notes,
+            "locked": False,
+            "status": "draft",
+            "basket_mode": None,
+            "quantity_mode": None,
+            "schema_version": SCHEMA_VERSION,
+            "currency": None,
+            "exchange_rate": None,
+            "dph_mode": None,
+            "inputs": {},
+            "supplier_list": [],
+        }
+        rnd_dir = self._round_dir(project_id, round_id)
+        rnd_dir.mkdir(parents=True, exist_ok=True)
+        self._write_metadata(self._metadata_path(rnd_dir), meta)
+
+        proj_meta = self.load_project(project_id)
+        proj_meta["round_count"] = proj_meta.get("round_count", 0) + 1
+        proj_meta["last_round_id"] = round_id
+        self._write_metadata(self._metadata_path(self._project_dir(project_id)), proj_meta)
+        return meta
+
     def create_round(
         self,
         project_id: str,
         *,
         round_name: str,
-        mode: str,
-        config_fingerprint: Mapping[str, Any],
-        input_hashes: Mapping[str, str],
-        master: Optional[Any],
-        bids: Sequence[Any],
+        mode: Optional[str] = None,
+        config_fingerprint: Optional[Mapping[str, Any]] = None,
+        input_hashes: Optional[Mapping[str, str]] = None,
+        master: Optional[Any] = None,
+        bids: Sequence[Any] = (),
         notes: str = "",
         basket_mode: Optional[str] = None,
         quantity_mode: Optional[str] = None,
         locked: bool = False,
         supplier_metadata: Optional[Mapping[str, Any]] = None,
         supplier_list: Optional[Sequence[Mapping[str, Any]]] = None,
+        status: str = "saved",
+        round_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         project_meta = self.load_project(project_id)
         if not project_meta:
             raise PermissionError("Projekt nenalezen nebo k němu nemáte přístup.")
-        round_id = generate_stable_id("round")
+        round_id = round_id or generate_stable_id("round")
         saved_inputs = self._write_round_inputs(
             project_id,
             round_id,
@@ -3344,6 +3406,8 @@ class ProjectStorageManager:
             supplier_metadata=supplier_metadata,
             supplier_list=supplier_list,
         )
+        config_fingerprint = config_fingerprint or {}
+        input_hashes = input_hashes or {}
         currency = config_fingerprint.get("currency") if isinstance(config_fingerprint, Mapping) else None
         exchange_rate = (
             config_fingerprint.get("exchange_rate")
@@ -3362,7 +3426,8 @@ class ProjectStorageManager:
             "config_fingerprint": dict(config_fingerprint),
             "input_hashes": dict(input_hashes),
             "notes": notes,
-            "locked": locked,
+            "locked": locked or status == "locked",
+            "status": status,
             "basket_mode": basket_mode,
             "quantity_mode": quantity_mode,
             "schema_version": SCHEMA_VERSION,
@@ -3380,6 +3445,73 @@ class ProjectStorageManager:
         proj_meta["round_count"] = proj_meta.get("round_count", 0) + 1
         proj_meta["last_round_id"] = round_id
         self._write_metadata(self._metadata_path(self._project_dir(project_id)), proj_meta)
+        return meta
+
+    def save_round(
+        self,
+        project_id: str,
+        round_id: str,
+        *,
+        round_name: Optional[str] = None,
+        mode: Optional[str] = None,
+        config_fingerprint: Optional[Mapping[str, Any]] = None,
+        input_hashes: Optional[Mapping[str, str]] = None,
+        master: Optional[Any] = None,
+        bids: Optional[Sequence[Any]] = None,
+        notes: Optional[str] = None,
+        basket_mode: Optional[str] = None,
+        quantity_mode: Optional[str] = None,
+        status: str = "saved",
+        supplier_metadata: Optional[Mapping[str, Any]] = None,
+        supplier_list: Optional[Sequence[Mapping[str, Any]]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        if not self.load_project(project_id):
+            raise PermissionError("Projekt nenalezen nebo k němu nemáte přístup.")
+        meta = self._load_metadata(self._metadata_path(self._round_dir(project_id, round_id)))
+        if not meta:
+            return None
+
+        saved_inputs = meta.get("inputs", {})
+        if master is not None or bids is not None or supplier_metadata is not None or supplier_list is not None:
+            saved_inputs = self._write_round_inputs(
+                project_id,
+                round_id,
+                master=master,
+                bids=list(bids or []),
+                supplier_metadata=supplier_metadata,
+                supplier_list=supplier_list,
+            )
+
+        config_fingerprint = config_fingerprint or meta.get("config_fingerprint", {})
+        input_hashes = input_hashes or meta.get("input_hashes", {})
+        meta.update(
+            {
+                "round_name": round_name if round_name is not None else meta.get("round_name"),
+                "mode": mode if mode is not None else meta.get("mode"),
+                "config_fingerprint": dict(config_fingerprint),
+                "input_hashes": dict(input_hashes),
+                "notes": notes if notes is not None else meta.get("notes"),
+                "locked": status == "locked" or bool(meta.get("locked")),
+                "status": status,
+                "basket_mode": basket_mode if basket_mode is not None else meta.get("basket_mode"),
+                "quantity_mode": quantity_mode if quantity_mode is not None else meta.get("quantity_mode"),
+                "schema_version": SCHEMA_VERSION,
+                "currency": config_fingerprint.get("currency")
+                if isinstance(config_fingerprint, Mapping)
+                else meta.get("currency"),
+                "exchange_rate": config_fingerprint.get("exchange_rate")
+                if isinstance(config_fingerprint, Mapping)
+                else meta.get("exchange_rate"),
+                "dph_mode": config_fingerprint.get("dph_mode")
+                if isinstance(config_fingerprint, Mapping)
+                else meta.get("dph_mode"),
+                "inputs": saved_inputs,
+                "supplier_list": list(supplier_list or meta.get("supplier_list", [])),
+                "last_modified_by": self.user_id,
+                "updated_at": time.time(),
+            }
+        )
+        self._write_metadata(self._metadata_path(self._round_dir(project_id, round_id)), meta)
         return meta
 
     def duplicate_round(
@@ -3421,6 +3553,7 @@ class ProjectStorageManager:
         if not meta:
             return None
         meta["locked"] = locked
+        meta["status"] = "locked" if locked else meta.get("status", "saved")
         meta["last_modified_by"] = self.user_id
         self._write_metadata(self._metadata_path(self._round_dir(project_id, round_id)), meta)
         return meta
@@ -6950,6 +7083,7 @@ def run_supplier_only_comparison(
     project_storage: Optional[ProjectStorageManager] = None,
     project_id: Optional[str] = None,
     round_id: Optional[str] = None,
+    prefill_round_inputs: bool = False,
 ) -> None:
     st.sidebar.header("Vstupy")
     st.sidebar.caption(
@@ -6958,7 +7092,7 @@ def run_supplier_only_comparison(
 
     stored_bid_entries = offer_storage.list_bids()
     bid_files: List[Any] = []
-    if project_storage and project_id and round_id:
+    if project_storage and project_id and round_id and prefill_round_inputs:
         try:
             _, loaded_bids, loaded_meta = project_storage.load_round_inputs(project_id, round_id)
             bid_files.extend(loaded_bids)
@@ -7031,11 +7165,33 @@ def run_supplier_only_comparison(
     metadata: Dict[str, Dict[str, str]] = st.session_state["supplier_only_metadata"]
 
     with st.sidebar.expander("Uložit kolo", expanded=False):
-        round_name = st.text_input("Název kola", key="supplier_only_round_name")
-        round_note = st.text_area("Poznámka", key="supplier_only_round_note", height=60)
-        if st.button("💾 Uložit kolo bez Master"):
-            if not project_storage or not project_id:
-                st.warning("Nejprve vytvoř nebo vyber projekt v horní části.")
+        existing_round_meta: Dict[str, Any] = {}
+        if project_storage and project_id and round_id:
+            existing_round_meta = next(
+                (
+                    r
+                    for r in project_storage.list_rounds(project_id)
+                    if r.get("round_id") == round_id
+                ),
+                {},
+            )
+        round_name = st.text_input(
+            "Název kola",
+            value=existing_round_meta.get("round_name", ""),
+            key=f"supplier_only_round_name_{round_id or 'draft'}",
+        )
+        round_note = st.text_area(
+            "Poznámka",
+            value=existing_round_meta.get("notes", ""),
+            key=f"supplier_only_round_note_{round_id or 'draft'}",
+            height=60,
+        )
+        if st.button(
+            "💾 Uložit kolo bez Master",
+            key=f"save_supplier_only_round_{round_id or 'draft'}",
+        ):
+            if not project_storage or not project_id or not round_id:
+                st.warning("Nejprve založ a vyber kolo v horní části.")
             elif not bid_files:
                 st.warning("Není co uložit, nejprve nahraj nabídky.")
             elif not round_name:
@@ -7057,8 +7213,9 @@ def run_supplier_only_comparison(
                     metadata,
                     order=list(metadata.keys()),
                 )
-                meta = project_storage.create_round(
+                meta = project_storage.save_round(
                     project_id,
+                    round_id,
                     round_name=round_name,
                     mode="supplier_only",
                     config_fingerprint=fingerprint,
@@ -7072,10 +7229,12 @@ def run_supplier_only_comparison(
                         "supplier_only_metadata", {}
                     ),
                     supplier_list=supplier_list,
+                    status="saved",
                 )
-                st.session_state["pending_round_id"] = meta.get("round_id")
-                st.success("Kolo bylo uloženo.")
-                trigger_rerun()
+                if meta:
+                    st.session_state["pending_round_id"] = meta.get("round_id")
+                    st.success("Kolo bylo uloženo.")
+                    trigger_rerun()
 
     bids_dict: Dict[str, WorkbookData] = {}
     if not bid_files:
@@ -8944,6 +9103,21 @@ if st.sidebar.button("Vytvořit projekt") and new_project_name:
         new_project_name, notes=new_project_notes, project_note=new_project_notes
     )
     st.session_state["active_project_id"] = meta["project_id"]
+    try:
+        first_round = project_storage.create_round(
+            meta["project_id"],
+            round_name="Kolo 1",
+            mode=None,
+            config_fingerprint={},
+            input_hashes={},
+            master=None,
+            bids=[],
+            notes="",
+            status="draft",
+        )
+        st.session_state["pending_round_id"] = first_round.get("round_id")
+    except Exception:
+        pass
     trigger_rerun()
 
 project_selection = st.sidebar.selectbox(
@@ -8952,6 +9126,11 @@ project_selection = st.sidebar.selectbox(
     format_func=lambda value: project_labels.get(value, "— žádný projekt —"),
     key="active_project_id",
 )
+
+previous_project = st.session_state.get("last_project_selection")
+if project_selection != previous_project:
+    reset_round_context()
+st.session_state["last_project_selection"] = project_selection
 
 active_project_meta: Dict[str, Any] = {}
 if project_selection:
@@ -8985,6 +9164,41 @@ if pending_round_id:
 if "active_round_id" not in st.session_state and round_options:
     st.session_state["active_round_id"] = round_options[-1]["round_id"]
 
+with st.sidebar.expander("Založit nové kolo", expanded=False):
+    next_round_number = (len(round_options) + 1) or 1
+    draft_round_name = st.text_input(
+        "Název nového kola",
+        value=f"Kolo {next_round_number}",
+        key="new_round_name_input",
+    )
+    draft_round_note = st.text_area(
+        "Poznámka k novému kolu",
+        value="",
+        height=60,
+        key="new_round_note_input",
+    )
+    if st.button("➕ Založit kolo", key="create_round_button"):
+        if not project_selection:
+            st.warning("Nejprve vytvoř nebo vyber projekt.")
+        elif not draft_round_name:
+            st.warning("Zadej název kola.")
+        else:
+            meta = project_storage.create_round(
+                project_selection,
+                round_name=draft_round_name,
+                mode=None,
+                config_fingerprint={},
+                input_hashes={},
+                master=None,
+                bids=[],
+                notes=draft_round_note,
+                status="draft",
+            )
+            reset_round_context()
+            st.session_state["pending_round_id"] = meta.get("round_id")
+            st.success(f"Kolo '{draft_round_name}' bylo založeno.")
+            trigger_rerun()
+
 round_selection = st.sidebar.selectbox(
     "Vyber kolo",
     options=[r["round_id"] for r in round_options] if round_options else [""],
@@ -8992,14 +9206,21 @@ round_selection = st.sidebar.selectbox(
     key="active_round_id",
 )
 
+previous_round_selection = st.session_state.get("last_active_round_id")
+if round_selection != previous_round_selection:
+    reset_round_context()
+st.session_state["last_active_round_id"] = round_selection
+
 if round_selection:
     round_meta = next((r for r in round_options if r.get("round_id") == round_selection), {})
     with st.sidebar.expander("Metadata kola", expanded=True):
         fingerprint = round_meta.get("config_fingerprint", {})
         locked = bool(round_meta.get("locked"))
+        round_status = round_meta.get("status", "draft")
         st.write(
             {
                 "Název": round_meta.get("round_name"),
+                "Stav": round_status,
                 "Režim": round_meta.get("mode"),
                 "Koš": round_meta.get("basket_mode"),
                 "Množství": round_meta.get("quantity_mode"),
@@ -9012,7 +9233,7 @@ if round_selection:
                 "schema_version": round_meta.get("schema_version"),
             }
         )
-        lock_label = "🔓 Odemknout kolo" if locked else "🔒 Zamknout kolo"
+        lock_label = "🔓 Odemknout kolo" if locked else "🔒 Uzamknout kolo"
         if st.button(lock_label, key="toggle_round_lock"):
             project_storage.set_round_locked(
                 project_selection, round_selection, not locked
@@ -9024,7 +9245,13 @@ else:
 
 if project_selection and round_options:
     st.subheader("📈 Porovnat všechna kola najednou")
-    rounds_df = pd.DataFrame(round_options)
+    eligible_rounds = [
+        r
+        for r in round_options
+        if r.get("status") in ("saved", "locked")
+        or (r.get("status") is None and r.get("locked"))
+    ]
+    rounds_df = pd.DataFrame(eligible_rounds)
     if not rounds_df.empty:
         rounds_df["start"] = pd.to_datetime(rounds_df.get("created_at"), unit="s", errors="coerce")
         rounds_df["finish"] = rounds_df["start"] + pd.to_timedelta(5, unit="m")
@@ -9082,8 +9309,8 @@ st.markdown(
 
 prefill_round_inputs = st.sidebar.checkbox(
     "Načíst uložené vstupy kola",
-    value=True,
-    help="Vypni pro založení dalšího kola bez předvyplněných souborů.",
+    value=False,
+    help="Zapni, pokud chceš načíst soubory z uloženého kola do aktuálního kontextu.",
     key="prefill_round_inputs",
 )
 
@@ -9117,6 +9344,7 @@ if comparison_mode == "Porovnání nabídek bez Master BoQ":
         project_storage=project_storage,
         project_id=project_selection,
         round_id=round_selection,
+        prefill_round_inputs=prefill_round_inputs,
     )
     st.stop()
 
@@ -9215,17 +9443,40 @@ if "supplier_metadata" not in st.session_state:
     st.session_state["supplier_metadata"] = {}
 metadata: Dict[str, Dict[str, str]] = st.session_state["supplier_metadata"]
 
-with st.sidebar.expander("Uložit nebo duplikovat kolo", expanded=False):
-    new_round_name = st.text_input("Název kola", key="round_name_input")
-    new_round_notes = st.text_area("Poznámka ke kolu", key="round_note_input", height=80)
-    if st.button("💾 Uložit jako nové kolo"):
+with st.sidebar.expander("Správa kola", expanded=False):
+    round_meta = next((r for r in round_options if r.get("round_id") == round_selection), {})
+    round_name_default = round_meta.get("round_name", "")
+    round_note_default = round_meta.get("notes", "")
+    round_name_value = st.text_input(
+        "Název kola",
+        value=round_name_default,
+        key=f"round_name_input_{round_selection}",
+    )
+    round_note_value = st.text_area(
+        "Poznámka ke kolu",
+        value=round_note_default,
+        key=f"round_note_input_{round_selection}",
+        height=80,
+    )
+    st.caption(
+        f"Aktivní: {round_name_value or '—'} ({round_meta.get('status', 'draft')})"
+        if round_selection
+        else "Aktivní kolo není vybráno."
+    )
+    if st.button(
+        "💾 Uložit kolo",
+        key="save_active_round",
+        disabled=not round_selection or round_locked,
+    ):
         if not project_selection:
             st.warning("Nejprve vytvoř nebo vyber projekt.")
+        elif not round_selection:
+            st.warning("Vyber kolo pro uložení.")
         elif not bid_files and comparison_mode != "Porovnání s Master BoQ":
             st.warning("Není k dispozici žádná nabídka k uložení.")
         elif comparison_mode == "Porovnání s Master BoQ" and master_file is None:
             st.warning("Pro kolo s Master BoQ je potřeba mít načtený Master.")
-        elif not new_round_name:
+        elif not round_name_value:
             st.warning("Zadej název kola.")
         else:
             hashes: Dict[str, str] = {}
@@ -9249,23 +9500,26 @@ with st.sidebar.expander("Uložit nebo duplikovat kolo", expanded=False):
                 st.session_state.get("supplier_metadata", {}),
                 order=list(metadata.keys()),
             )
-            meta = project_storage.create_round(
+            meta = project_storage.save_round(
                 project_selection,
-                round_name=new_round_name,
+                round_selection,
+                round_name=round_name_value,
                 mode=fingerprint.get("mode", "unknown"),
                 config_fingerprint=fingerprint,
                 input_hashes=hashes,
                 master=master_file,
                 bids=bid_files,
-                notes=new_round_notes,
+                notes=round_note_value,
                 basket_mode=fingerprint.get("basket_mode"),
                 quantity_mode=fingerprint.get("quantity_mode"),
+                status="saved",
                 supplier_metadata=st.session_state.get("supplier_metadata", {}),
                 supplier_list=supplier_list,
             )
-            st.session_state["pending_round_id"] = meta["round_id"]
-            st.success(f"Kolo '{new_round_name}' bylo uloženo.")
-            trigger_rerun()
+            if meta:
+                st.session_state["pending_round_id"] = meta["round_id"]
+                st.success(f"Kolo '{round_name_value}' bylo uloženo.")
+                trigger_rerun()
 
 stored_master_entries = offer_storage.list_master()
 stored_bid_entries = offer_storage.list_bids()
