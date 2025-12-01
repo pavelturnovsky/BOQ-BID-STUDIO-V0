@@ -7026,6 +7026,10 @@ def run_supplier_only_comparison(
         key="supplier_only_currency",
     )
 
+    if "supplier_only_metadata" not in st.session_state:
+        st.session_state["supplier_only_metadata"] = {}
+    metadata: Dict[str, Dict[str, str]] = st.session_state["supplier_only_metadata"]
+
     with st.sidebar.expander("Uložit kolo", expanded=False):
         round_name = st.text_input("Název kola", key="supplier_only_round_name")
         round_note = st.text_area("Poznámka", key="supplier_only_round_note", height=60)
@@ -7050,7 +7054,7 @@ def run_supplier_only_comparison(
                     input_hashes=hashes,
                 )
                 supplier_list = build_supplier_list(
-                    st.session_state.get("supplier_only_metadata", {}),
+                    metadata,
                     order=list(metadata.keys()),
                 )
                 meta = project_storage.create_round(
@@ -7091,10 +7095,6 @@ def run_supplier_only_comparison(
     if not bids_dict:
         st.info("Nepodařilo se načíst žádnou nabídku.")
         return
-
-    if "supplier_only_metadata" not in st.session_state:
-        st.session_state["supplier_only_metadata"] = {}
-    metadata: Dict[str, Dict[str, str]] = st.session_state["supplier_only_metadata"]
 
     current_suppliers = list(bids_dict.keys())
     for obsolete in list(metadata.keys()):
@@ -9211,6 +9211,10 @@ if len(bid_files) > 7:
 
 currency = st.sidebar.text_input("Popisek měny", value="CZK")
 
+if "supplier_metadata" not in st.session_state:
+    st.session_state["supplier_metadata"] = {}
+metadata: Dict[str, Dict[str, str]] = st.session_state["supplier_metadata"]
+
 with st.sidebar.expander("Uložit nebo duplikovat kolo", expanded=False):
     new_round_name = st.text_input("Název kola", key="round_name_input")
     new_round_notes = st.text_area("Poznámka ke kolu", key="round_note_input", height=80)
@@ -9365,9 +9369,7 @@ if bid_files:
 # Manage supplier aliases and colors
 display_names: Dict[str, str] = {}
 color_map: Dict[str, str] = {}
-if "supplier_metadata" not in st.session_state:
-    st.session_state["supplier_metadata"] = {}
-metadata: Dict[str, Dict[str, str]] = st.session_state["supplier_metadata"]
+metadata = st.session_state.get("supplier_metadata", {})
 current_suppliers = list(bids_dict.keys())
 for obsolete in list(metadata.keys()):
     if obsolete not in current_suppliers:
@@ -9380,16 +9382,16 @@ palette = (
 )
 
 if current_suppliers:
-for idx, raw_name in enumerate(current_suppliers):
-    entry = metadata.get(raw_name, {})
-    if not entry.get("alias"):
-        entry["alias"] = supplier_default_alias(raw_name)
-    if not entry.get("color"):
-        entry["color"] = palette[idx % len(palette)]
-    if not entry.get("supplier_id"):
-        entry["supplier_id"] = generate_supplier_id(raw_name)
-    entry.setdefault("order", idx + 1)
-    metadata[raw_name] = entry
+    for idx, raw_name in enumerate(current_suppliers):
+        entry = metadata.get(raw_name, {})
+        if not entry.get("alias"):
+            entry["alias"] = supplier_default_alias(raw_name)
+        if not entry.get("color"):
+            entry["color"] = palette[idx % len(palette)]
+        if not entry.get("supplier_id"):
+            entry["supplier_id"] = generate_supplier_id(raw_name)
+        entry.setdefault("order", idx + 1)
+        metadata[raw_name] = entry
 
     with st.sidebar.expander("Alias a barvy dodavatelů", expanded=True):
         st.caption("Zkrácený název a barva se promítnou do tabulek a grafů.")
@@ -9414,8 +9416,9 @@ for idx, raw_name in enumerate(current_suppliers):
     display_names = ensure_unique_aliases(display_names, RESERVED_ALIAS_NAMES)
     for raw, display_alias in display_names.items():
         metadata[raw]["alias_display"] = display_alias
-    st.session_state["supplier_metadata"] = metadata
     color_map = {display_names[raw]: metadata[raw]["color"] for raw in current_suppliers}
+
+st.session_state["supplier_metadata"] = metadata
 
 chart_color_map = color_map.copy()
 chart_color_map.setdefault("Master", "#636EFA")
