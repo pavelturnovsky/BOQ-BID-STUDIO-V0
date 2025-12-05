@@ -13,6 +13,7 @@ import unicodedata
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
+from decimal import Decimal
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple, Union
 from string import Template
@@ -5124,7 +5125,18 @@ def show_df(df: pd.DataFrame) -> None:
     comparison_info = attrs.get("comparison_info", {})
     comparison_master = attrs.get("comparison_master")
 
+    def _normalize_cell(value: Any) -> Any:
+        if isinstance(value, Decimal):
+            return float(value)
+        if isinstance(value, (list, dict, set, tuple)):
+            return json.dumps(value, ensure_ascii=False)
+        return value
+
     df_to_show = df.copy()
+    try:
+        df_to_show = df_to_show.applymap(_normalize_cell)
+    except Exception:
+        df_to_show = df_to_show.applymap(lambda x: _normalize_cell(x))
 
     helper_cols = [col for col in df_to_show.columns if str(col).startswith("__present__")]
     presence_map: Dict[str, pd.Series] = {}
