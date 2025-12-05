@@ -11517,6 +11517,22 @@ with tab_compare:
                                 summary_rows: List[Dict[str, Any]] = []
                                 supplier_tabs = st.tabs(list(supplier_views.keys()) + ["Souhrn dodavatelů"])
 
+                                def sanitize_for_streamlit(df: pd.DataFrame) -> pd.DataFrame:
+                                    sanitized = df.reset_index(drop=True).copy()
+                                    sanitized.columns = sanitized.columns.map(str)
+
+                                    def _sanitize_value(value: Any) -> Any:
+                                        if isinstance(value, Decimal):
+                                            try:
+                                                return float(value)
+                                            except (ArithmeticError, ValueError):
+                                                return str(value)
+                                        if not pd.api.types.is_scalar(value):
+                                            return str(value)
+                                        return value
+
+                                    return sanitized.applymap(_sanitize_value)
+
                                 def _format_pct(value: Any) -> str:
                                     if pd.isna(value):
                                         return "—"
@@ -11607,11 +11623,8 @@ with tab_compare:
                                             )
                                             pct_columns.append(pct_col)
 
-                                        display_for_style = display_df.copy().applymap(
-                                            lambda value: str(value)
-                                            if not pd.api.types.is_scalar(value)
-                                            else value
-                                        )
+                                        sanitized_display = sanitize_for_streamlit(display_df)
+                                        display_for_style = sanitized_display.copy()
                                         styled_display = display_for_style.style
                                         if diff_columns:
                                             styled_display = styled_display.applymap(_style_diff, subset=diff_columns)
@@ -11630,11 +11643,8 @@ with tab_compare:
                                         if differences_df.empty:
                                             st.info("Všechny vybrané parametry odpovídají Master.")
                                         else:
-                                            differences_for_style = differences_df.copy().applymap(
-                                                lambda value: str(value)
-                                                if not pd.api.types.is_scalar(value)
-                                                else value
-                                            )
+                                            differences_sanitized = sanitize_for_streamlit(differences_df)
+                                            differences_for_style = differences_sanitized.copy()
                                             differences_styled = differences_for_style.style
                                             if diff_columns:
                                                 differences_styled = differences_styled.applymap(_style_diff, subset=diff_columns)
@@ -11666,7 +11676,7 @@ with tab_compare:
                                                     "Položky, které jsou uvedeny v Master BoQ, ale dodavatel je neocenil (nebo ponechal nulovou hodnotu)."
                                                 )
                                                 st.dataframe(
-                                                    missing_df,
+                                                    sanitize_for_streamlit(missing_df),
                                                     use_container_width=True,
                                                     hide_index=True,
                                                 )
@@ -11711,7 +11721,7 @@ with tab_compare:
                                         }
                                         summary_display = summary_df.rename(columns=rename_map)
                                         st.dataframe(
-                                            summary_display,
+                                            sanitize_for_streamlit(summary_display),
                                             use_container_width=True,
                                             hide_index=True,
                                         )
