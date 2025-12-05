@@ -5300,7 +5300,16 @@ def show_df(df: pd.DataFrame) -> None:
         st.warning(
             "Unable to render styled table due to unsupported data types; displaying fallback table."
         )
-        st.dataframe(df_to_show.astype(str), **display_kwargs)
+
+        safe_df = df_to_show.copy()
+        safe_df.columns = ["" if col is None else str(col) for col in safe_df.columns]
+        safe_df = safe_df.reset_index(drop=True)
+        safe_df = safe_df.astype(str)
+
+        try:
+            st.dataframe(safe_df, **display_kwargs)
+        except Exception:
+            st.dataframe(safe_df.astype(str).reset_index(drop=True))
 
 def _normalize_upload(upload: Any) -> Tuple[str, str, Optional[bytes]]:
     """Convert various upload-like inputs into a consistent payload.
