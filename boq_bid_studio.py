@@ -5302,6 +5302,9 @@ def show_df(df: pd.DataFrame) -> None:
         )
 
         safe_df = df_to_show.copy()
+        # Clear potentially non-serializable metadata that can break Streamlit's dataframe
+        # conversion (pandas stores attrs on copies by default).
+        safe_df.attrs = {}
         safe_df.columns = ["" if col is None else str(col) for col in safe_df.columns]
         safe_df = safe_df.reset_index(drop=True)
         safe_df = safe_df.astype(str)
