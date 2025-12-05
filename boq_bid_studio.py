@@ -5149,6 +5149,7 @@ def show_df(df: pd.DataFrame) -> None:
             return str(value)
 
     df_to_show = df.copy()
+    df_to_show.attrs = {}
     try:
         df_to_show = df_to_show.applymap(_normalize_cell)
     except Exception:
@@ -5291,6 +5292,60 @@ def show_df(df: pd.DataFrame) -> None:
     if not needs_styler:
         st.dataframe(df_to_show, **display_kwargs)
         return
+
+    unsupported_columns: List[str] = []
+
+    def _needs_sanitization(series: pd.Series) -> bool:
+        if pd.api.types.is_numeric_dtype(series) or pd.api.types.is_bool_dtype(series):
+            return False
+        if pd.api.types.is_datetime64_any_dtype(series) or pd.api.types.is_timedelta64_dtype(series):
+            return False
+
+        observed_types: Set[type] = set()
+        for value in series:
+            if pd.isna(value):
+                continue
+            observed_types.add(type(value))
+            if isinstance(value, (Mapping, Sequence)) and not isinstance(
+                value, (str, bytes, bytearray)
+            ):
+                return True
+        safe_types: Set[type] = {
+            str,
+            bytes,
+            bytearray,
+            datetime,
+            date,
+            float,
+            int,
+            np.generic,
+        }
+        if len([t for t in observed_types if t not in safe_types]) > 0:
+            return True
+        return len(observed_types) > 1 and not observed_types.issubset({str})
+
+    def _sanitize_value(value: Any) -> Any:
+        if pd.isna(value):
+            return value
+        if isinstance(value, (Mapping, Sequence)) and not isinstance(
+            value, (str, bytes, bytearray)
+        ):
+            try:
+                return json.dumps(value, ensure_ascii=False)
+            except TypeError:
+                return json.dumps(str(value), ensure_ascii=False)
+        return str(value)
+
+    for column in df_to_show.columns:
+        series = df_to_show[column]
+        if _needs_sanitization(series):
+            unsupported_columns.append(str(column))
+            df_to_show[column] = series.apply(_sanitize_value)
+
+    if unsupported_columns:
+        logging.getLogger(__name__).warning(
+            "Sanitized unsupported columns: %s", ", ".join(unsupported_columns)
+        )
 
     styler = df_to_show.style
     if len(numeric_cols):
