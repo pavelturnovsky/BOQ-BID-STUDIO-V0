@@ -12,7 +12,7 @@ import time
 import unicodedata
 import uuid
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, date
 from decimal import Decimal
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple, Union
@@ -5128,9 +5128,25 @@ def show_df(df: pd.DataFrame) -> None:
     def _normalize_cell(value: Any) -> Any:
         if isinstance(value, Decimal):
             return float(value)
+        if isinstance(value, np.generic):
+            return value.item()
         if isinstance(value, (list, dict, set, tuple)):
-            return json.dumps(value, ensure_ascii=False)
-        return value
+            try:
+                return json.dumps(value, ensure_ascii=False)
+            except TypeError:
+                return json.dumps(str(value), ensure_ascii=False)
+        if isinstance(value, np.ndarray):
+            try:
+                return json.dumps(value.tolist(), ensure_ascii=False)
+            except TypeError:
+                return json.dumps(str(value.tolist()), ensure_ascii=False)
+        if isinstance(value, (datetime, date)):
+            return value
+        try:
+            json.dumps(value)
+            return value
+        except TypeError:
+            return str(value)
 
     df_to_show = df.copy()
     try:
