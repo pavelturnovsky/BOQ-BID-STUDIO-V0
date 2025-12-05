@@ -11521,15 +11521,19 @@ with tab_compare:
                                     sanitized = df.reset_index(drop=True).copy()
                                     sanitized.columns = sanitized.columns.map(str)
 
-                                    def _sanitize_value(value: Any) -> Any:
-                                        if isinstance(value, Decimal):
-                                            try:
-                                                return float(value)
-                                            except (ArithmeticError, ValueError):
-                                                return str(value)
-                                        if not pd.api.types.is_scalar(value):
+                                def _sanitize_value(value: Any) -> Any:
+                                    if isinstance(value, Decimal):
+                                        try:
+                                            return float(value)
+                                        except (ArithmeticError, ValueError):
                                             return str(value)
-                                        return value
+                                    if isinstance(value, (datetime, date)):
+                                        return value.isoformat()
+                                    if isinstance(value, pd.Timestamp):
+                                        return value.isoformat()
+                                    if not pd.api.types.is_scalar(value):
+                                        return str(value)
+                                    return value
 
                                     return sanitized.applymap(_sanitize_value)
 
