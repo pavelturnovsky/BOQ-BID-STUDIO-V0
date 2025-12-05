@@ -11592,22 +11592,27 @@ with tab_compare:
                                                     format=fmt,
                                                     help=config.get("help"),
                                                 )
-                                            if diff_col in display_df.columns:
-                                                column_config[diff_col] = st.column_config.NumberColumn(
-                                                    f"{label} — Rozdíl{unit_note}",
-                                                    format=fmt,
-                                                    help=f"Rozdíl hodnot dodavatele {alias} vůči Master.",
-                                                )
-                                                diff_columns.append(diff_col)
-                                            if pct_col in display_df.columns:
-                                                column_config[pct_col] = st.column_config.NumberColumn(
-                                                    f"{label} — Δ (%)",
-                                                    format="%.2f",
-                                                    help="Procentní rozdíl oproti Master.",
-                                                )
-                                                pct_columns.append(pct_col)
+                                        if diff_col in display_df.columns:
+                                            column_config[diff_col] = st.column_config.NumberColumn(
+                                                f"{label} — Rozdíl{unit_note}",
+                                                format=fmt,
+                                                help=f"Rozdíl hodnot dodavatele {alias} vůči Master.",
+                                            )
+                                            diff_columns.append(diff_col)
+                                        if pct_col in display_df.columns:
+                                            column_config[pct_col] = st.column_config.NumberColumn(
+                                                f"{label} — Δ (%)",
+                                                format="%.2f",
+                                                help="Procentní rozdíl oproti Master.",
+                                            )
+                                            pct_columns.append(pct_col)
 
-                                        styled_display = display_df.style
+                                        display_for_style = display_df.copy().applymap(
+                                            lambda value: str(value)
+                                            if not pd.api.types.is_scalar(value)
+                                            else value
+                                        )
+                                        styled_display = display_for_style.style
                                         if diff_columns:
                                             styled_display = styled_display.applymap(_style_diff, subset=diff_columns)
                                         if pct_columns:
@@ -11625,7 +11630,12 @@ with tab_compare:
                                         if differences_df.empty:
                                             st.info("Všechny vybrané parametry odpovídají Master.")
                                         else:
-                                            differences_styled = differences_df.style
+                                            differences_for_style = differences_df.copy().applymap(
+                                                lambda value: str(value)
+                                                if not pd.api.types.is_scalar(value)
+                                                else value
+                                            )
+                                            differences_styled = differences_for_style.style
                                             if diff_columns:
                                                 differences_styled = differences_styled.applymap(_style_diff, subset=diff_columns)
                                             if pct_columns:
