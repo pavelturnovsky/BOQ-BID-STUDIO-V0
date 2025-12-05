@@ -3696,7 +3696,9 @@ def build_recap_chart_data(
         working_series.index = working_series.index.astype(str)
     except Exception:
         working_series.index = working_series.index.map(str)
-    aligned_values = working_series.reindex(normalized_cols)
+    aligned_values = pd.Series(np.nan, index=normalized_cols)
+    for col in normalized_cols:
+        aligned_values.loc[col] = working_series.get(col, np.nan)
 
     working_df = pd.DataFrame(
         {
@@ -5274,7 +5276,12 @@ def show_df(df: pd.DataFrame) -> None:
                 continue
             pct_series = meta.get("pct_values")
             if isinstance(pct_series, pd.Series):
-                working_pct = pct_series.reindex(data.index)
+                normalized_index = pct_series.index.map(
+                    lambda val: "" if val is None else str(val)
+                )
+                working_pct = pct_series.copy()
+                working_pct.index = normalized_index
+                working_pct = working_pct.reindex(data.index)
             else:
                 working_pct = pd.Series(np.nan, index=data.index)
             styles.loc[data.index, display_col] = working_pct.apply(_color_for_percent).values
