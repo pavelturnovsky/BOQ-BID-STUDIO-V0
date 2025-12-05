@@ -5285,7 +5285,14 @@ def show_df(df: pd.DataFrame) -> None:
         )
     if header_styles:
         styler = styler.set_table_styles(header_styles, overwrite=False)
-    st.dataframe(styler, **display_kwargs)
+
+    try:
+        st.dataframe(styler, **display_kwargs)
+    except TypeError:
+        st.warning(
+            "Unable to render styled table due to unsupported data types; displaying fallback table."
+        )
+        st.dataframe(df_to_show.astype(str), **display_kwargs)
 
 def _normalize_upload(upload: Any) -> Tuple[str, str, Optional[bytes]]:
     """Convert various upload-like inputs into a consistent payload.
