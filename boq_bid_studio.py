@@ -5140,6 +5140,14 @@ def show_df(df: pd.DataFrame) -> None:
     rename_map = {orig: unique for orig, unique in zip(original_cols, unique_cols)}
     df_to_show.rename(columns=rename_map, inplace=True)
 
+    if isinstance(df_to_show.index, pd.MultiIndex):
+        df_to_show.index = df_to_show.index.map(
+            lambda vals: " | ".join("" if val is None else str(val) for val in vals)
+        )
+    else:
+        df_to_show.index = df_to_show.index.map(lambda val: "" if val is None else str(val))
+    df_to_show.index.name = None
+
     presence_display: Dict[str, pd.Series] = {}
     for orig_col, series in presence_map.items():
         display_col = rename_map.get(orig_col, orig_col)
