@@ -173,6 +173,28 @@ def hash_fileobj(file_obj: Any) -> str:
     return sha.hexdigest()
 
 
+def normalize_input_hashes(input_hashes: Optional[Mapping[str, str]]) -> Dict[str, str]:
+    """Normalize input hashes so bid order does not affect comparisons."""
+
+    normalized: Dict[str, str] = {}
+    if not isinstance(input_hashes, Mapping):
+        return normalized
+
+    master_hash = input_hashes.get("master")
+    if master_hash is not None:
+        normalized["master"] = str(master_hash)
+
+    bid_hashes = [
+        str(value)
+        for key, value in input_hashes.items()
+        if key != "master" and value is not None
+    ]
+    for idx, bid_hash in enumerate(sorted(bid_hashes)):
+        normalized[f"bid_{idx}"] = bid_hash
+
+    return normalized
+
+
 def compute_config_fingerprint(
     *,
     mode: str,
@@ -195,11 +217,31 @@ def compute_config_fingerprint(
         "exchange_rate": exchange_rate,
         "engine_version": ENGINE_VERSION,
         "schema_version": SCHEMA_VERSION,
-        "input_hashes": dict(input_hashes or {}),
+        "input_hashes": normalize_input_hashes(input_hashes),
     }
     if extra:
         fingerprint.update(extra)
     return fingerprint
+
+
+def fingerprints_match(
+    current: Optional[Mapping[str, Any]], reference: Optional[Mapping[str, Any]]
+) -> bool:
+    """Return True when fingerprints describe compatible inputs/settings."""
+
+    if not isinstance(current, Mapping) or not isinstance(reference, Mapping):
+        return current == reference
+
+    normalized_current = dict(current)
+    normalized_reference = dict(reference)
+    normalized_current["input_hashes"] = normalize_input_hashes(
+        current.get("input_hashes")
+    )
+    normalized_reference["input_hashes"] = normalize_input_hashes(
+        reference.get("input_hashes")
+    )
+
+    return normalized_current == normalized_reference
 
 
 def describe_fingerprint_reason(
@@ -221,6 +263,10 @@ def describe_fingerprint_reason(
         reasons.append("Výpočtový engine byl aktualizován")
     if current.get("schema_version") != reference.get("schema_version"):
         reasons.append("Schéma dat není shodné")
+    if normalize_input_hashes(current.get("input_hashes")) != normalize_input_hashes(
+        reference.get("input_hashes")
+    ):
+        reasons.append("Vstupní soubory nejsou shodné")
 
     return reasons
 
@@ -13699,7 +13745,7 @@ with tab_rounds:
                         )
                         continue
                     fp = meta.get("config_fingerprint")
-                    if fp != reference_fp:
+                    if not fingerprints_match(fp, reference_fp):
                         reasons = describe_fingerprint_reason(fp, reference_fp)
                         reason_text = "; ".join(reasons) if reasons else "Odlišný fingerprint"
                         incompatible.append(
