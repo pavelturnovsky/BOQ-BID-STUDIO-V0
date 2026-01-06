@@ -225,7 +225,10 @@ def compute_config_fingerprint(
 
 
 def fingerprints_match(
-    current: Optional[Mapping[str, Any]], reference: Optional[Mapping[str, Any]]
+    current: Optional[Mapping[str, Any]],
+    reference: Optional[Mapping[str, Any]],
+    *,
+    ignore_input_hashes: bool = False,
 ) -> bool:
     """Return True when fingerprints describe compatible inputs/settings."""
 
@@ -240,6 +243,9 @@ def fingerprints_match(
     normalized_reference["input_hashes"] = normalize_input_hashes(
         reference.get("input_hashes")
     )
+    if ignore_input_hashes:
+        normalized_current.pop("input_hashes", None)
+        normalized_reference.pop("input_hashes", None)
 
     return normalized_current == normalized_reference
 
@@ -1291,7 +1297,8 @@ def normalize_join_value(value: Any) -> str:
         return ""
     normalized = unicodedata.normalize("NFKD", text)
     without_diacritics = "".join(ch for ch in normalized if not unicodedata.combining(ch))
-    collapsed = re.sub(r"\s+", " ", without_diacritics)
+    normalized_separators = re.sub(r"[^0-9A-Za-z]+", " ", without_diacritics)
+    collapsed = re.sub(r"\s+", " ", normalized_separators)
     return collapsed.strip().lower()
 
 
@@ -13727,6 +13734,10 @@ with tab_rounds:
                 format_func=lambda rid: round_options.get(rid, str(rid)),
                 help="Vyber alespoň dvě kola se stejným fingerprintem/schématem.",
             )
+            ignore_input_hashes = st.checkbox(
+                "Ignorovat rozdíly ve vstupních souborech",
+                help="Povolí porovnání i při odlišných nahraných souborech, pokud se jinak shoduje konfigurace.",
+            )
 
             if len(selected_round_ids) < 2:
                 st.info("Vyber minimálně dvě kola pro porovnání.")
@@ -13745,7 +13756,9 @@ with tab_rounds:
                         )
                         continue
                     fp = meta.get("config_fingerprint")
-                    if not fingerprints_match(fp, reference_fp):
+                    if not fingerprints_match(
+                        fp, reference_fp, ignore_input_hashes=ignore_input_hashes
+                    ):
                         reasons = describe_fingerprint_reason(fp, reference_fp)
                         reason_text = "; ".join(reasons) if reasons else "Odlišný fingerprint"
                         incompatible.append(
@@ -13857,6 +13870,4 @@ with tab_rounds:
 
 st.markdown("---")
 st.caption("© 2025 BoQ Bid Studio — MVP. Doporučení: používat jednotné Item ID pro precizní párování.")
-
-
 

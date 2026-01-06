@@ -234,6 +234,41 @@ def test_compare_normalizes_code_for_join() -> None:
     assert not df["Bid total"].isna().any()
 
 
+def test_compare_matches_code_with_separators() -> None:
+    master_df = pd.DataFrame(
+        {
+            "code": ["1-1"],
+            "description": ["Položka"],
+            "unit": ["ks"],
+            "quantity": [1],
+            "total price": [100],
+        }
+    )
+    supplier_df = pd.DataFrame(
+        {
+            "code": ["1/1"],
+            "description": ["Položka"],
+            "unit": ["ks"],
+            "quantity": [1],
+            "total price": [120],
+        }
+    )
+
+    master_file = make_workbook(master_df)
+    supplier_file = make_workbook(supplier_df)
+
+    master_wb = read_workbook(master_file, limit_sheets=["Sheet1"])
+    supplier_wb = read_workbook(supplier_file, limit_sheets=["Sheet1"])
+
+    apply_master_mapping(master_wb, supplier_wb)
+
+    results = compare(master_wb, {"Bid": supplier_wb})
+    df = results["Sheet1"]
+
+    assert np.isclose(df["Bid total"].iloc[0], 120)
+    assert not df["Bid total"].isna().any()
+
+
 def test_compare_matches_description_variants() -> None:
     master_df = pd.DataFrame(
         {
