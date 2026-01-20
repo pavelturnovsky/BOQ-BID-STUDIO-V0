@@ -149,6 +149,32 @@ def supplier_list_to_metadata(supplier_list: Sequence[Mapping[str, Any]]) -> Dic
     return metadata
 
 
+def reconcile_supplier_metadata(
+    supplier_metadata: Mapping[str, Mapping[str, Any]],
+    current_suppliers: Sequence[str],
+) -> Dict[str, Dict[str, Any]]:
+    """Align supplier metadata keys with current upload names using supplier_id."""
+
+    metadata = dict(supplier_metadata or {})
+    by_id: Dict[str, Dict[str, Any]] = {}
+    for entry in metadata.values():
+        supplier_id = entry.get("supplier_id")
+        if supplier_id:
+            by_id[str(supplier_id)] = dict(entry)
+
+    reconciled: Dict[str, Dict[str, Any]] = {}
+    for raw_name in current_suppliers:
+        entry = metadata.get(raw_name)
+        supplier_id = generate_supplier_id(raw_name)
+        if not entry:
+            entry = by_id.get(supplier_id, {}).copy()
+        entry = dict(entry or {})
+        entry.setdefault("supplier_id", supplier_id)
+        reconciled[raw_name] = entry
+
+    return reconciled
+
+
 def hash_fileobj(file_obj: Any) -> str:
     """Hash a file-like object without mutating its position."""
 
@@ -7426,9 +7452,7 @@ def run_supplier_only_comparison(
         return
 
     current_suppliers = list(bids_dict.keys())
-    for obsolete in list(metadata.keys()):
-        if obsolete not in current_suppliers:
-            metadata.pop(obsolete, None)
+    metadata = reconcile_supplier_metadata(metadata, current_suppliers)
 
     palette = (
         px.colors.qualitative.Plotly
@@ -9795,9 +9819,7 @@ display_names: Dict[str, str] = {}
 color_map: Dict[str, str] = {}
 metadata = st.session_state.get("supplier_metadata", {})
 current_suppliers = list(bids_dict.keys())
-for obsolete in list(metadata.keys()):
-    if obsolete not in current_suppliers:
-        metadata.pop(obsolete, None)
+metadata = reconcile_supplier_metadata(metadata, current_suppliers)
 
 palette = (
     px.colors.qualitative.Plotly
@@ -13870,4 +13892,3 @@ with tab_rounds:
 
 st.markdown("---")
 st.caption("© 2025 BoQ Bid Studio — MVP. Doporučení: používat jednotné Item ID pro precizní párování.")
-
