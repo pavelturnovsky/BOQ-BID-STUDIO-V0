@@ -6974,11 +6974,16 @@ def overview_comparison(
 
     ordered = view.sort_values("__row_order__")
     first_desc_map = ordered.groupby("auto_group_key")["description"].first().to_dict()
-    view["auto_group_label"] = view.apply(
-        lambda r: build_group_label(
-            r["auto_group_key"], first_desc_map.get(r["auto_group_key"], r.get("description"))
-        ),
-        axis=1,
+    view["auto_group_label"] = pd.Series(
+        [
+            build_group_label(
+                key,
+                first_desc_map.get(key, desc),
+            )
+            for key, desc in zip(view["auto_group_key"], view["description"])
+        ],
+        index=view.index,
+        dtype=object,
     )
     order_map = ordered.groupby("auto_group_key")["__row_order__"].min().to_dict()
     view["auto_group_order"] = view["auto_group_key"].map(order_map)
@@ -13989,13 +13994,6 @@ with tab_rounds:
 
                         compare_results_round: Dict[str, pd.DataFrame] = {}
                         comparison_datasets_round: Dict[str, ComparisonDataset] = {}
-                        recap_results_round = (
-                            pd.DataFrame(),
-                            pd.DataFrame(),
-                            pd.DataFrame(),
-                            pd.DataFrame(),
-                            pd.DataFrame(),
-                        )
                         if reference_mode == "with_master" and master_wb_round is not None:
                             raw_compare_round = compare(
                                 master_wb_round, bids_dict_round, join_mode="auto"
@@ -14007,19 +14005,6 @@ with tab_rounds:
                             comparison_datasets_round = build_comparison_datasets(
                                 compare_results_round
                             )
-                            if bids_overview_round:
-                                recap_results_round = overview_comparison(
-                                    master_overview_round,
-                                    bids_overview_round,
-                                    round_overview_sheet,
-                                )
-                                if display_names_round:
-                                    recap_results_round = tuple(
-                                        rename_total_columns(df, display_names_round)
-                                        if i < 3
-                                        else df
-                                        for i, df in enumerate(recap_results_round)
-                                    )
                         else:
                             comparison_datasets_round = {
                                 round_selected_sheet: build_supplier_only_dataset(
@@ -14028,25 +14013,18 @@ with tab_rounds:
                                     display_names_round,
                                 )
                             }
-                            if bids_overview_round:
-                                recap_results_round = (
-                                    pd.DataFrame(),
-                                    pd.DataFrame(),
-                                    pd.DataFrame(),
-                                    pd.DataFrame(),
-                                    pd.DataFrame(),
-                                )
-
                         round_payloads[round_id] = {
                             "round_id": round_id,
                             "round_name": round_name,
                             "mode": reference_mode,
                             "master_wb": master_wb_round,
+                            "master_overview": master_overview_round,
                             "bids_dict": bids_dict_round,
+                            "bids_overview": bids_overview_round,
                             "display_names": display_names_round,
                             "supplier_metadata": metadata_round,
                             "comparison_datasets": comparison_datasets_round,
-                            "recap_results": recap_results_round,
+                            "recap_results": None,
                             "overview_sheet": round_overview_sheet,
                         }
 
@@ -14055,6 +14033,8 @@ with tab_rounds:
                     if not round_payloads:
                         st.info("Nebyla nalezena data pro porovnání vybraných kol.")
                         st.stop()
+                    if "rounds_recap_cache" not in st.session_state:
+                        st.session_state["rounds_recap_cache"] = {}
                     supplier_pool: Dict[str, Dict[str, Any]] = {}
                     for meta in selected_metas:
                         for entry in meta.get("supplier_list", []):
@@ -14067,29 +14047,60 @@ with tab_rounds:
                                 }
                             if entry.get("supplier_name"):
                                 supplier_pool[sid]["supplier_name"] = entry.get("supplier_name")
+                    if not supplier_pool:
+                        for round_data in round_payloads.values():
+                            display_names = round_data.get("display_names") or {}
+                            if display_names:
+                                for raw_name, alias in display_names.items():
+                                    sid = str(raw_name)
+                                    if sid not in supplier_pool:
+                                        supplier_pool[sid] = {
+                                            "supplier_id": sid,
+                                            "supplier_name": alias or raw_name,
+                                            "order": len(supplier_pool) + 1,
+                                        }
+                            else:
+                                for raw_name in (round_data.get("bids_dict") or {}).keys():
+                                    sid = str(raw_name)
+                                    if sid not in supplier_pool:
+                                        supplier_pool[sid] = {
+                                            "supplier_id": sid,
+                                            "supplier_name": raw_name,
+                                            "order": len(supplier_pool) + 1,
+                                        }
 
                     ordered_suppliers = sorted(
                         supplier_pool.values(), key=lambda item: item.get("order", 0)
                     )
                     supplier_labels = [f"{sup['supplier_name']} ({sup['supplier_id']})" for sup in ordered_suppliers]
                     default_selection = [sup["supplier_id"] for sup in ordered_suppliers]
+                    stored_selection = st.session_state.get(
+                        "rounds_chosen_suppliers", default_selection
+                    )
+                    filtered_selection = [
+                        sid for sid in stored_selection if sid in default_selection
+                    ]
+                    if not filtered_selection:
+                        filtered_selection = default_selection
                     chosen_ids = st.multiselect(
                         "Dodavatelé k porovnání",
                         options=[sup["supplier_id"] for sup in ordered_suppliers],
-                        default=default_selection,
+                        default=filtered_selection,
                         format_func=lambda sid: next(
                             (lbl for lbl in supplier_labels if lbl.endswith(f"{sid})")), sid
                         ),
+                    )
+                    st.session_state["rounds_chosen_suppliers"] = chosen_ids
+
+                    view_mode = st.radio(
+                        "Režim zobrazení",
+                        ["Porovnání 2", "Spojitá nabídková křivka", "Rekapitulace"],
+                        horizontal=True,
                     )
 
                     if not chosen_ids:
                         st.info("Vyber alespoň jednoho dodavatele pro zobrazení výsledků.")
                     else:
-                        view_mode = st.radio(
-                            "Režim zobrazení",
-                            ["Porovnání 2", "Spojitá nabídková křivka", "Rekapitulace"],
-                            horizontal=True,
-                        )
 
                         legend_rows: List[Dict[str, Any]] = []
                         for supplier in ordered_suppliers:
@@ -14430,15 +14441,67 @@ with tab_rounds:
                                 )
                                 st.plotly_chart(fig_cumulative, use_container_width=True)
                         else:
+                            recap_cache = st.session_state.get("rounds_recap_cache", {})
                             recap_rows: Dict[str, pd.Series] = {}
                             for meta in selected_metas:
                                 round_id = meta.get("round_id")
                                 round_data = round_payloads.get(round_id)
                                 if not round_data:
                                     continue
-                                recap_results_round = round_data.get(
-                                    "recap_results", ()
+                                recap_key = (
+                                    round_id,
+                                    round_data.get("overview_sheet"),
+                                    reference_mode,
                                 )
+                                display_names_round = round_data.get(
+                                    "display_names", {}
+                                )
+                                signature = tuple(sorted(display_names_round.items()))
+                                cached = recap_cache.get(recap_key)
+                                if cached and cached.get("signature") == signature:
+                                    recap_results_round = cached.get("value")
+                                else:
+                                    recap_results_round = None
+                                    if reference_mode == "with_master":
+                                        master_overview_round = round_data.get(
+                                            "master_overview"
+                                        )
+                                        bids_overview_round = round_data.get(
+                                            "bids_overview", {}
+                                        )
+                                        if (
+                                            master_overview_round is not None
+                                            and bids_overview_round
+                                        ):
+                                            recap_results_round = overview_comparison(
+                                                master_overview_round,
+                                                bids_overview_round,
+                                                round_data.get("overview_sheet"),
+                                            )
+                                            if display_names_round:
+                                                recap_results_round = tuple(
+                                                    rename_total_columns(
+                                                        df, display_names_round
+                                                    )
+                                                    if i < 3
+                                                    else df
+                                                    for i, df in enumerate(
+                                                        recap_results_round
+                                                    )
+                                                )
+                                    if recap_results_round is None:
+                                        recap_results_round = (
+                                            pd.DataFrame(),
+                                            pd.DataFrame(),
+                                            pd.DataFrame(),
+                                            pd.DataFrame(),
+                                            pd.DataFrame(),
+                                        )
+                                    recap_cache[recap_key] = {
+                                        "signature": signature,
+                                        "value": recap_results_round,
+                                    }
+                                round_data["recap_results"] = recap_results_round
                                 if (
                                     not isinstance(recap_results_round, tuple)
                                     or len(recap_results_round) < 3
