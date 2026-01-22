@@ -4173,6 +4173,47 @@ def make_widget_key(*parts: Any) -> str:
     normalized = [_normalize_key_part(p) for p in parts]
     return "_".join(normalized)
 
+
+def _match_header_hints(
+    header_names: Sequence[Any],
+    header_hints: Sequence[str],
+) -> Optional[int]:
+    """Return the first header index matching the hints using normalized matching rules."""
+    normalized_headers = [normalize_col(str(x)) for x in header_names]
+    exact_terms: List[str] = []
+    regex_terms: List[str] = []
+    contains_terms: List[str] = []
+
+    for hint in header_hints:
+        if not hint:
+            continue
+        if hint.startswith("regex:"):
+            regex_terms.append(hint[len("regex:"):])
+        else:
+            normalized_hint = normalize_col(hint)
+            if normalized_hint:
+                exact_terms.append(normalized_hint)
+                escaped = re.escape(normalized_hint)
+                contains_terms.append(rf"(?:^|\\b){escaped}(?:\\b|$)")
+
+    for term in exact_terms:
+        for idx, header in enumerate(normalized_headers):
+            if header == term:
+                return idx
+
+    for pattern in regex_terms:
+        for idx, header in enumerate(normalized_headers):
+            if re.search(pattern, header):
+                return idx
+
+    for pattern in contains_terms:
+        for idx, header in enumerate(normalized_headers):
+            if re.search(pattern, header):
+                return idx
+
+    return None
+
+
 @st.cache_data
 def try_autodetect_mapping(df: pd.DataFrame) -> Tuple[Dict[str, int], int, pd.DataFrame]:
     """Autodetect header mapping using a sampled, vectorized search."""
@@ -4180,59 +4221,10 @@ def try_autodetect_mapping(df: pd.DataFrame) -> Tuple[Dict[str, int], int, pd.Da
     nprobe = min(len(df), 200)
     sample = df.head(nprobe).astype(str).applymap(normalize_col)
 
-    hint_patterns: Dict[str, Dict[str, List[str]]] = {}
-    for key, hints in HEADER_HINTS.items():
-        exact_terms: List[str] = []
-        regex_terms: List[str] = []
-        contains_terms: List[str] = []
-        for h in hints:
-            if not h:
-                continue
-            if h.startswith("regex:"):
-                regex_terms.append(h[len("regex:"):])
-            else:
-                normalized_hint = normalize_col(h)
-                if normalized_hint:
-                    exact_terms.append(normalized_hint)
-                    escaped = re.escape(normalized_hint)
-                    contains_terms.append(rf"(?:^|\\b){escaped}(?:\\b|$)")
-        hint_patterns[key] = {
-            "exact": exact_terms,
-            "regex": regex_terms,
-            "contains": contains_terms,
-        }
-
     def detect_row(row: pd.Series) -> Dict[str, int]:
         mapping: Dict[str, int] = {}
-        for key, patterns in hint_patterns.items():
-            exact_terms = patterns.get("exact", [])
-            regex_terms = patterns.get("regex", [])
-            contains_terms = patterns.get("contains", [])
-
-            matched_idx: Optional[int] = None
-            for term in exact_terms:
-                term_mask = row == term
-                if term_mask.any():
-                    matched_idx = term_mask.idxmax()
-                    break
-            if matched_idx is not None:
-                mapping[key] = matched_idx
-                continue
-
-            for pattern in regex_terms:
-                regex_mask = row.str.contains(pattern, regex=True, na=False)
-                if regex_mask.any():
-                    matched_idx = regex_mask.idxmax()
-                    break
-            if matched_idx is not None:
-                mapping[key] = matched_idx
-                continue
-
-            for pattern in contains_terms:
-                contains_mask = row.str.contains(pattern, regex=True, na=False)
-                if contains_mask.any():
-                    matched_idx = contains_mask.idxmax()
-                    break
+        for key, hints in HEADER_HINTS.items():
+            matched_idx = _match_header_hints(row.tolist(), hints)
             if matched_idx is not None:
                 mapping[key] = matched_idx
         return mapping
@@ -5923,9 +5915,9 @@ def mapping_ui(
                 ):
                     return int(stored_value)
                 hints = HEADER_HINTS.get(key, [])
-                for i, col in enumerate(header_names):
-                    if any(p in col for p in hints):
-                        return i
+                match_idx = _match_header_hints(header_names, hints)
+                if match_idx is not None:
+                    return match_idx
                 return 0
 
             def clamp(idx: Any) -> int:
