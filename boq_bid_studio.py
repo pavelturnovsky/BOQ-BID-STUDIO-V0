@@ -4173,50 +4173,6 @@ def make_widget_key(*parts: Any) -> str:
     normalized = [_normalize_key_part(p) for p in parts]
     return "_".join(normalized)
 
-
-def _match_header_hints(
-    header_names: Sequence[Any],
-    header_hints: Sequence[str],
-) -> Optional[int]:
-    """Return the first header index matching the hints using normalized matching rules."""
-    normalized_headers = [normalize_col(str(x)) for x in header_names]
-    exact_terms: List[str] = []
-    regex_terms: List[str] = []
-    contains_terms: List[str] = []
-
-    for hint in header_hints:
-        if not hint:
-            continue
-        if hint.startswith("regex:"):
-            regex_terms.append(hint[len("regex:"):])
-        else:
-            normalized_hint = normalize_col(hint)
-            if normalized_hint:
-                exact_terms.append(normalized_hint)
-                escaped = re.escape(normalized_hint)
-                if re.search(r"\W", normalized_hint):
-                    contains_terms.append(escaped)
-                else:
-                    contains_terms.append(rf"(?:^|\\b){escaped}(?:\\b|$)")
-
-    for term in exact_terms:
-        for idx, header in enumerate(normalized_headers):
-            if header == term:
-                return idx
-
-    for pattern in regex_terms:
-        for idx, header in enumerate(normalized_headers):
-            if re.search(pattern, header):
-                return idx
-
-    for pattern in contains_terms:
-        for idx, header in enumerate(normalized_headers):
-            if re.search(pattern, header):
-                return idx
-
-    return None
-
-
 @st.cache_data
 def try_autodetect_mapping(df: pd.DataFrame) -> Tuple[Dict[str, int], int, pd.DataFrame]:
     """Autodetect header mapping using a sampled, vectorized search."""
@@ -4224,10 +4180,59 @@ def try_autodetect_mapping(df: pd.DataFrame) -> Tuple[Dict[str, int], int, pd.Da
     nprobe = min(len(df), 200)
     sample = df.head(nprobe).astype(str).applymap(normalize_col)
 
+    hint_patterns: Dict[str, Dict[str, List[str]]] = {}
+    for key, hints in HEADER_HINTS.items():
+        exact_terms: List[str] = []
+        regex_terms: List[str] = []
+        contains_terms: List[str] = []
+        for h in hints:
+            if not h:
+                continue
+            if h.startswith("regex:"):
+                regex_terms.append(h[len("regex:"):])
+            else:
+                normalized_hint = normalize_col(h)
+                if normalized_hint:
+                    exact_terms.append(normalized_hint)
+                    escaped = re.escape(normalized_hint)
+                    contains_terms.append(rf"(?:^|\\b){escaped}(?:\\b|$)")
+        hint_patterns[key] = {
+            "exact": exact_terms,
+            "regex": regex_terms,
+            "contains": contains_terms,
+        }
+
     def detect_row(row: pd.Series) -> Dict[str, int]:
         mapping: Dict[str, int] = {}
-        for key, hints in HEADER_HINTS.items():
-            matched_idx = _match_header_hints(row.tolist(), hints)
+        for key, patterns in hint_patterns.items():
+            exact_terms = patterns.get("exact", [])
+            regex_terms = patterns.get("regex", [])
+            contains_terms = patterns.get("contains", [])
+
+            matched_idx: Optional[int] = None
+            for term in exact_terms:
+                term_mask = row == term
+                if term_mask.any():
+                    matched_idx = term_mask.idxmax()
+                    break
+            if matched_idx is not None:
+                mapping[key] = matched_idx
+                continue
+
+            for pattern in regex_terms:
+                regex_mask = row.str.contains(pattern, regex=True, na=False)
+                if regex_mask.any():
+                    matched_idx = regex_mask.idxmax()
+                    break
+            if matched_idx is not None:
+                mapping[key] = matched_idx
+                continue
+
+            for pattern in contains_terms:
+                contains_mask = row.str.contains(pattern, regex=True, na=False)
+                if contains_mask.any():
+                    matched_idx = contains_mask.idxmax()
+                    break
             if matched_idx is not None:
                 mapping[key] = matched_idx
         return mapping
@@ -5918,9 +5923,9 @@ def mapping_ui(
                 ):
                     return int(stored_value)
                 hints = HEADER_HINTS.get(key, [])
-                match_idx = _match_header_hints(header_names, hints)
-                if match_idx is not None:
-                    return match_idx
+                for i, col in enumerate(header_names):
+                    if any(p in col for p in hints):
+                        return i
                 return 0
 
             def clamp(idx: Any) -> int:
@@ -6130,7 +6135,6 @@ def mapping_ui(
 
             wb.sheets[sheet]["mapping"] = ui_mapping
             wb.sheets[sheet]["header_row"] = header_row
-            wb.sheets[sheet]["header_names"] = header_names
             wb.sheets[sheet]["table"] = table
             wb.sheets[sheet]["preserve_summary_totals"] = use_minimal
             mapping_changed = (ui_mapping != prev_mapping) or (header_row != prev_header)
@@ -6970,16 +6974,11 @@ def overview_comparison(
 
     ordered = view.sort_values("__row_order__")
     first_desc_map = ordered.groupby("auto_group_key")["description"].first().to_dict()
-    view["auto_group_label"] = pd.Series(
-        [
-            build_group_label(
-                key,
-                first_desc_map.get(key, desc),
-            )
-            for key, desc in zip(view["auto_group_key"], view["description"])
-        ],
-        index=view.index,
-        dtype=object,
+    view["auto_group_label"] = view.apply(
+        lambda r: build_group_label(
+            r["auto_group_key"], first_desc_map.get(r["auto_group_key"], r.get("description"))
+        ),
+        axis=1,
     )
     order_map = ordered.groupby("auto_group_key")["__row_order__"].min().to_dict()
     view["auto_group_order"] = view["auto_group_key"].map(order_map)
@@ -13746,33 +13745,11 @@ with tab_rounds:
         if not available_rounds:
             st.info("Tento projekt zatím neobsahuje žádná uložená kola.")
         else:
-            draft_rounds = [r for r in available_rounds if r.get("status") == "draft"]
-            eligible_rounds = [
-                r
-                for r in available_rounds
-                if r.get("status") in ("saved", "locked")
-            ]
-            if draft_rounds:
-                draft_labels = ", ".join(
-                    r.get("round_name", r.get("round_id")) for r in draft_rounds
-                )
-                st.info(
-                    f"Draft kola nejsou standardně zahrnuta do porovnání: {draft_labels}."
-                )
             round_options = {
                 r.get("round_id"): f"{r.get('round_name', r.get('round_id'))} ({format_timestamp(r.get('created_at'))})"
-                for r in eligible_rounds
+                for r in available_rounds
                 if r.get("round_id")
             }
-            include_drafts = st.checkbox(
-                "Zahrnout draft kola do porovnání",
-                help="Draft kola mohou obsahovat nekompletní data.",
-            )
-            if include_drafts:
-                for r in draft_rounds:
-                    round_options[r.get("round_id")] = (
-                        f"{r.get('round_name', r.get('round_id'))} ({format_timestamp(r.get('created_at'))})"
-                    )
             selected_round_ids = st.multiselect(
                 "Vyber kola k porovnání",
                 options=list(round_options.keys()),
@@ -13817,220 +13794,6 @@ with tab_rounds:
                     )
                 else:
                     st.success("Fingerprint i režim vybraných kol jsou kompatibilní.")
-                    reference_mode = reference.get("mode")
-                    reference_round_id = reference.get("round_id")
-                    reference_master, reference_bids, reference_input_meta = (
-                        project_storage.load_round_inputs(
-                            project_selection, reference_round_id
-                        )
-                    )
-                    available_round_sheets: List[str] = []
-                    if reference_mode == "with_master":
-                        if reference_master is None:
-                            st.warning(
-                                "Referenční kolo neobsahuje Master; nelze načíst listy pro porovnání."
-                            )
-                        else:
-                            reference_master.seek(0)
-                            reference_excel = pd.ExcelFile(reference_master)
-                            available_round_sheets = reference_excel.sheet_names
-                    else:
-                        if reference_bids:
-                            reference_bids[0].seek(0)
-                            reference_excel = pd.ExcelFile(reference_bids[0])
-                            available_round_sheets = reference_excel.sheet_names
-                    if not available_round_sheets:
-                        st.info("Pro vybraná kola nejsou dostupné listy k porovnání.")
-                        st.stop()
-                    default_overview_sheet = (
-                        "Přehled_dílčí kapitoly"
-                        if "Přehled_dílčí kapitoly" in available_round_sheets
-                        else available_round_sheets[0]
-                    )
-                    round_compare_sheets = st.multiselect(
-                        "Listy pro porovnání",
-                        available_round_sheets,
-                        default=available_round_sheets,
-                        key="rounds_compare_sheets",
-                    )
-                    if not round_compare_sheets:
-                        st.info("Vyber alespoň jeden list pro porovnání.")
-                        st.stop()
-                    round_overview_sheet = st.selectbox(
-                        "List pro rekapitulaci",
-                        available_round_sheets,
-                        index=available_round_sheets.index(default_overview_sheet)
-                        if default_overview_sheet in available_round_sheets
-                        else 0,
-                        key="rounds_overview_sheet",
-                    )
-                    round_selected_sheet = st.selectbox(
-                        "List pro detailní porovnání",
-                        round_compare_sheets,
-                        index=0,
-                        key="rounds_detail_sheet",
-                    )
-
-                    def _build_round_display_names(
-                        bid_names: Sequence[str],
-                        input_meta: Mapping[str, Any],
-                        round_meta: Mapping[str, Any],
-                    ) -> Tuple[Dict[str, str], Dict[str, Dict[str, Any]]]:
-                        stored_meta = input_meta.get("supplier_metadata", {})
-                        if not stored_meta:
-                            stored_meta = supplier_list_to_metadata(
-                                round_meta.get("supplier_list", [])
-                            )
-                        reconciled = reconcile_supplier_metadata(stored_meta, bid_names)
-                        display: Dict[str, str] = {}
-                        for raw_name in bid_names:
-                            entry = reconciled.get(raw_name, {})
-                            alias = (
-                                entry.get("alias_display")
-                                or entry.get("alias")
-                                or supplier_default_alias(raw_name)
-                            )
-                            display[raw_name] = alias
-                        return display, reconciled
-
-                    def _supplier_alias_by_id(
-                        supplier_id: str,
-                        *,
-                        round_meta: Mapping[str, Any],
-                        metadata: Mapping[str, Mapping[str, Any]],
-                    ) -> Optional[str]:
-                        for entry in round_meta.get("supplier_list", []):
-                            if str(entry.get("supplier_id")) == str(supplier_id):
-                                return (
-                                    entry.get("alias")
-                                    or entry.get("supplier_name")
-                                    or str(entry.get("supplier_id"))
-                                )
-                        for raw_name, entry in metadata.items():
-                            if str(entry.get("supplier_id")) == str(supplier_id):
-                                return entry.get("alias") or entry.get("alias_display") or raw_name
-                        return None
-
-                    round_payloads: Dict[str, Dict[str, Any]] = {}
-                    round_load_errors: List[str] = []
-                    for meta in selected_metas:
-                        round_id = meta.get("round_id")
-                        round_name = meta.get("round_name", round_id)
-                        master_obj, bid_objs, input_meta = project_storage.load_round_inputs(
-                            project_selection, round_id
-                        )
-                        if reference_mode == "with_master" and master_obj is None:
-                            round_load_errors.append(
-                                f"{round_name}: chybí Master soubor."
-                            )
-                            continue
-                        bids_dict_round: Dict[str, WorkbookData] = {}
-                        bids_overview_round: Dict[str, WorkbookData] = {}
-                        display_names_round: Dict[str, str] = {}
-                        metadata_round: Dict[str, Dict[str, Any]] = {}
-
-                        if reference_mode == "with_master" and master_obj is not None:
-                            master_obj.seek(0)
-                            master_wb_round = read_workbook(
-                                master_obj, limit_sheets=round_compare_sheets
-                            )
-                            if round_overview_sheet in round_compare_sheets:
-                                master_overview_round = WorkbookData(
-                                    name=master_wb_round.name,
-                                    sheets={
-                                        round_overview_sheet: master_wb_round.sheets[
-                                            round_overview_sheet
-                                        ]
-                                    },
-                                )
-                            else:
-                                master_obj.seek(0)
-                                master_overview_round = read_workbook(
-                                    master_obj, limit_sheets=[round_overview_sheet]
-                                )
-                        else:
-                            master_wb_round = None
-                            master_overview_round = None
-
-                        bid_names = [getattr(b, "name", f"Bid{idx + 1}") for idx, b in enumerate(bid_objs)]
-                        display_names_round, metadata_round = _build_round_display_names(
-                            bid_names, input_meta, meta
-                        )
-
-                        for bid_obj in bid_objs:
-                            bid_obj.seek(0)
-                            name = getattr(bid_obj, "name", "Bid")
-                            wb_comp = read_workbook(
-                                bid_obj, limit_sheets=round_compare_sheets
-                            )
-                            if reference_mode == "with_master" and master_wb_round is not None:
-                                apply_master_mapping(master_wb_round, wb_comp)
-                            bids_dict_round[name] = wb_comp
-
-                            if round_overview_sheet in round_compare_sheets:
-                                wb_over = WorkbookData(
-                                    name=wb_comp.name,
-                                    sheets={
-                                        round_overview_sheet: wb_comp.sheets.get(
-                                            round_overview_sheet, {}
-                                        )
-                                    },
-                                )
-                            else:
-                                bid_obj.seek(0)
-                                wb_over = read_workbook(
-                                    bid_obj, limit_sheets=[round_overview_sheet]
-                                )
-                                if (
-                                    reference_mode == "with_master"
-                                    and master_overview_round is not None
-                                ):
-                                    apply_master_mapping(master_overview_round, wb_over)
-                            bids_overview_round[name] = wb_over
-
-                        compare_results_round: Dict[str, pd.DataFrame] = {}
-                        comparison_datasets_round: Dict[str, ComparisonDataset] = {}
-                        if reference_mode == "with_master" and master_wb_round is not None:
-                            raw_compare_round = compare(
-                                master_wb_round, bids_dict_round, join_mode="auto"
-                            )
-                            compare_results_round = {
-                                sheet: rename_comparison_columns(df, display_names_round)
-                                for sheet, df in raw_compare_round.items()
-                            }
-                            comparison_datasets_round = build_comparison_datasets(
-                                compare_results_round
-                            )
-                        else:
-                            comparison_datasets_round = {
-                                round_selected_sheet: build_supplier_only_dataset(
-                                    round_selected_sheet,
-                                    bids_dict_round,
-                                    display_names_round,
-                                )
-                            }
-                        round_payloads[round_id] = {
-                            "round_id": round_id,
-                            "round_name": round_name,
-                            "mode": reference_mode,
-                            "master_wb": master_wb_round,
-                            "master_overview": master_overview_round,
-                            "bids_dict": bids_dict_round,
-                            "bids_overview": bids_overview_round,
-                            "display_names": display_names_round,
-                            "supplier_metadata": metadata_round,
-                            "comparison_datasets": comparison_datasets_round,
-                            "recap_results": None,
-                            "overview_sheet": round_overview_sheet,
-                        }
-
-                    if round_load_errors:
-                        st.warning("Některá kola nelze načíst:\n- " + "\n- ".join(round_load_errors))
-                    if not round_payloads:
-                        st.info("Nebyla nalezena data pro porovnání vybraných kol.")
-                        st.stop()
-                    if "rounds_recap_cache" not in st.session_state:
-                        st.session_state["rounds_recap_cache"] = {}
                     supplier_pool: Dict[str, Dict[str, Any]] = {}
                     for meta in selected_metas:
                         for entry in meta.get("supplier_list", []):
@@ -14043,60 +13806,29 @@ with tab_rounds:
                                 }
                             if entry.get("supplier_name"):
                                 supplier_pool[sid]["supplier_name"] = entry.get("supplier_name")
-                    if not supplier_pool:
-                        for round_data in round_payloads.values():
-                            display_names = round_data.get("display_names") or {}
-                            if display_names:
-                                for raw_name, alias in display_names.items():
-                                    sid = str(raw_name)
-                                    if sid not in supplier_pool:
-                                        supplier_pool[sid] = {
-                                            "supplier_id": sid,
-                                            "supplier_name": alias or raw_name,
-                                            "order": len(supplier_pool) + 1,
-                                        }
-                            else:
-                                for raw_name in (round_data.get("bids_dict") or {}).keys():
-                                    sid = str(raw_name)
-                                    if sid not in supplier_pool:
-                                        supplier_pool[sid] = {
-                                            "supplier_id": sid,
-                                            "supplier_name": raw_name,
-                                            "order": len(supplier_pool) + 1,
-                                        }
 
                     ordered_suppliers = sorted(
                         supplier_pool.values(), key=lambda item: item.get("order", 0)
                     )
                     supplier_labels = [f"{sup['supplier_name']} ({sup['supplier_id']})" for sup in ordered_suppliers]
                     default_selection = [sup["supplier_id"] for sup in ordered_suppliers]
-                    stored_selection = st.session_state.get(
-                        "rounds_chosen_suppliers", default_selection
-                    )
-                    filtered_selection = [
-                        sid for sid in stored_selection if sid in default_selection
-                    ]
-                    if not filtered_selection:
-                        filtered_selection = default_selection
                     chosen_ids = st.multiselect(
                         "Dodavatelé k porovnání",
                         options=[sup["supplier_id"] for sup in ordered_suppliers],
-                        default=filtered_selection,
+                        default=default_selection,
                         format_func=lambda sid: next(
                             (lbl for lbl in supplier_labels if lbl.endswith(f"{sid})")), sid
                         ),
-                    )
-                    st.session_state["rounds_chosen_suppliers"] = chosen_ids
-
-                    view_mode = st.radio(
-                        "Režim zobrazení",
-                        ["Porovnání 2", "Spojitá nabídková křivka", "Rekapitulace"],
-                        horizontal=True,
                     )
 
                     if not chosen_ids:
                         st.info("Vyber alespoň jednoho dodavatele pro zobrazení výsledků.")
                     else:
+                        view_mode = st.radio(
+                            "Režim zobrazení",
+                            ["Porovnání 2", "Spojitá nabídková křivka", "Rekapitulace"],
+                            horizontal=True,
+                        )
 
                         legend_rows: List[Dict[str, Any]] = []
                         for supplier in ordered_suppliers:
@@ -14118,459 +13850,45 @@ with tab_rounds:
                             st.dataframe(legend_df, use_container_width=True, hide_index=True)
 
                         if view_mode == "Porovnání 2":
-                            base_rows = pd.DataFrame()
-                            base_order: List[str] = []
-                            for round_data in round_payloads.values():
-                                if reference_mode == "with_master":
-                                    dataset = round_data["comparison_datasets"].get(
-                                        round_selected_sheet
-                                    )
-                                    if not dataset or dataset.analysis_df.empty:
-                                        continue
-                                    analysis_df = dataset.analysis_df.copy()
-                                    join_keys = build_comparison_join_key(analysis_df)
-                                    base_candidate = pd.DataFrame(
-                                        {
-                                            "join_key": join_keys,
-                                            "code": analysis_df.get("code", ""),
-                                            "description": analysis_df.get("description", ""),
-                                            "unit": analysis_df.get("unit", ""),
-                                        }
-                                    )
-                                    base_candidate["order"] = np.arange(len(base_candidate))
-                                    base_candidate = base_candidate.drop_duplicates(
-                                        subset=["join_key"], keep="first"
-                                    )
-                                else:
-                                    dataset = round_data["comparison_datasets"].get(
-                                        round_selected_sheet
-                                    )
-                                    if not dataset or dataset.consensus_df.empty:
-                                        continue
-                                    consensus = dataset.consensus_df.reset_index()
-                                    base_candidate = pd.DataFrame(
-                                        {
-                                            "join_key": consensus.get("join_key"),
-                                            "code": consensus.get("code", ""),
-                                            "description": consensus.get("description", ""),
-                                            "unit": consensus.get("unit", ""),
-                                            "order": consensus.get("order", np.arange(len(consensus))),
-                                        }
-                                    )
-                                if base_rows.empty and not base_candidate.empty:
-                                    base_rows = base_candidate
-                                    base_order = base_candidate["join_key"].tolist()
-                                elif not base_candidate.empty:
-                                    missing_keys = [
-                                        key
-                                        for key in base_candidate["join_key"].tolist()
-                                        if key not in base_order
-                                    ]
-                                    if missing_keys:
-                                        extra_rows = base_candidate[
-                                            base_candidate["join_key"].isin(missing_keys)
-                                        ]
-                                        base_rows = pd.concat(
-                                            [base_rows, extra_rows], ignore_index=True
+                            column_tuples: List[Tuple[str, str]] = []
+                            for supplier in ordered_suppliers:
+                                if supplier["supplier_id"] not in chosen_ids:
+                                    continue
+                                for meta in selected_metas:
+                                    column_tuples.append(
+                                        (
+                                            supplier.get("supplier_name"),
+                                            f"{meta.get('round_name', meta.get('round_id'))}",
                                         )
-                                        base_order.extend(missing_keys)
-
-                            if base_rows.empty:
-                                st.info(
-                                    "Vybraný list neobsahuje položky k porovnání napříč koly."
-                                )
-                            else:
-                                base_rows = base_rows.dropna(subset=["join_key"])
-                                base_rows = base_rows.set_index("join_key")
-                                base_rows = base_rows.loc[
-                                    [key for key in base_order if key in base_rows.index]
-                                ]
-                                base_rows = base_rows[["code", "description", "unit"]]
-                                base_columns = [
-                                    ("Položka", "Kód"),
-                                    ("Položka", "Popis"),
-                                    ("Položka", "Jednotka"),
-                                ]
-                                display_df = pd.DataFrame(
-                                    base_rows.values, index=base_rows.index
-                                )
-                                display_df.columns = pd.MultiIndex.from_tuples(
-                                    base_columns
-                                )
-                                for supplier in ordered_suppliers:
-                                    if supplier["supplier_id"] not in chosen_ids:
-                                        continue
-                                    supplier_label = supplier.get("supplier_name")
-                                    for meta in selected_metas:
-                                        round_id = meta.get("round_id")
-                                        round_data = round_payloads.get(round_id)
-                                        if not round_data:
-                                            continue
-                                        round_label = meta.get(
-                                            "round_name", meta.get("round_id")
-                                        )
-                                        alias = _supplier_alias_by_id(
-                                            supplier["supplier_id"],
-                                            round_meta=meta,
-                                            metadata=round_data.get(
-                                                "supplier_metadata", {}
-                                            ),
-                                        )
-                                        if not alias:
-                                            continue
-                                        if reference_mode == "with_master":
-                                            dataset = round_data[
-                                                "comparison_datasets"
-                                            ].get(round_selected_sheet)
-                                            if not dataset or dataset.analysis_df.empty:
-                                                continue
-                                            analysis_df = dataset.analysis_df.copy()
-                                            join_keys = build_comparison_join_key(
-                                                analysis_df
-                                            )
-                                            analysis_df = analysis_df.assign(
-                                                __join_key__=join_keys
-                                            )
-                                            value_col = f"{alias} total"
-                                            if value_col not in analysis_df.columns:
-                                                continue
-                                            values = (
-                                                analysis_df.groupby("__join_key__")[
-                                                    value_col
-                                                ]
-                                                .first()
-                                                .reindex(display_df.index)
-                                            )
-                                        else:
-                                            dataset = round_data[
-                                                "comparison_datasets"
-                                            ].get(round_selected_sheet)
-                                            if not dataset or dataset.totals_wide.empty:
-                                                continue
-                                            totals = dataset.totals_wide
-                                            if alias not in totals.columns:
-                                                continue
-                                            values = totals[alias].reindex(
-                                                display_df.index
-                                            )
-                                        display_df[(supplier_label, round_label)] = values
-                                st.dataframe(
-                                    display_df,
-                                    use_container_width=True,
-                                )
+                                    )
+                            multi_columns = pd.MultiIndex.from_tuples(column_tuples)
+                            preview_df = pd.DataFrame(columns=multi_columns)
+                            st.dataframe(
+                                preview_df,
+                                use_container_width=True,
+                                column_config=None,
+                            )
+                            st.info(
+                                "Tabulka připravena pro zobrazení jednotkových/celkových cen v MultiIndex sloupcích."
+                            )
                         elif view_mode == "Spojitá nabídková křivka":
-                            curve_frames: List[pd.DataFrame] = []
-                            for meta in selected_metas:
-                                round_id = meta.get("round_id")
-                                round_data = round_payloads.get(round_id)
-                                if not round_data:
-                                    continue
-                                round_label = meta.get(
-                                    "round_name", meta.get("round_id")
-                                )
-                                if reference_mode == "with_master":
-                                    dataset = round_data["comparison_datasets"].get(
-                                        round_selected_sheet
-                                    )
-                                    if not dataset or dataset.analysis_df.empty:
-                                        continue
-                                    master_wb_round = round_data.get("master_wb")
-                                    if not master_wb_round:
-                                        continue
-                                    master_sheet = master_wb_round.sheets.get(
-                                        round_selected_sheet, {}
-                                    )
-                                    master_table = (
-                                        master_sheet.get("table")
-                                        if isinstance(master_sheet, dict)
-                                        else pd.DataFrame()
-                                    )
-                                    if isinstance(master_table, pd.DataFrame):
-                                        master_table = master_table.copy()
-                                    else:
-                                        master_table = pd.DataFrame()
-                                    master_prepared = _prepare_table_for_join(
-                                        master_table
-                                    )
-                                    for supplier in ordered_suppliers:
-                                        if supplier["supplier_id"] not in chosen_ids:
-                                            continue
-                                        alias = _supplier_alias_by_id(
-                                            supplier["supplier_id"],
-                                            round_meta=meta,
-                                            metadata=round_data.get(
-                                                "supplier_metadata", {}
-                                            ),
-                                        )
-                                        if not alias:
-                                            continue
-                                        raw_lookup = {
-                                            alias_value: raw
-                                            for raw, alias_value in round_data[
-                                                "display_names"
-                                            ].items()
-                                        }
-                                        raw_name = raw_lookup.get(alias, alias)
-                                        supplier_wb = round_data["bids_dict"].get(
-                                            raw_name
-                                        )
-                                        if supplier_wb is None:
-                                            continue
-                                        supplier_sheet = supplier_wb.sheets.get(
-                                            round_selected_sheet, {}
-                                        )
-                                        supplier_table = (
-                                            supplier_sheet.get("table")
-                                            if isinstance(supplier_sheet, dict)
-                                            else pd.DataFrame()
-                                        )
-                                        if isinstance(supplier_table, pd.DataFrame):
-                                            supplier_table = supplier_table.copy()
-                                        else:
-                                            supplier_table = pd.DataFrame()
-                                        master_join_keys = (
-                                            dataset.master_join_key_map.get(alias)
-                                            if isinstance(
-                                                dataset.master_join_key_map, dict
-                                            )
-                                            else None
-                                        )
-                                        supplier_join_keys = (
-                                            dataset.supplier_join_key_map.get(alias)
-                                            if isinstance(
-                                                dataset.supplier_join_key_map, dict
-                                            )
-                                            else None
-                                        )
-                                        master_prepared_local = _prepare_table_for_join(
-                                            master_table, join_keys=master_join_keys
-                                        )
-                                        supplier_prepared = _prepare_table_for_join(
-                                            supplier_table, join_keys=supplier_join_keys
-                                        )
-                                        supplier_curve = _build_supplier_curve_points(
-                                            master_prepared_local,
-                                            supplier_prepared,
-                                            f"{supplier.get('supplier_name')} — {round_label}",
-                                        )
-                                        if not supplier_curve.empty:
-                                            curve_frames.append(supplier_curve)
-                                else:
-                                    dataset = round_data["comparison_datasets"].get(
-                                        round_selected_sheet
-                                    )
-                                    if not dataset or dataset.long_df.empty:
-                                        continue
-                                    totals = dataset.totals_wide
-                                    consensus = dataset.consensus_df
-                                    if totals.empty or consensus.empty:
-                                        continue
-                                    order_lookup = consensus.get("order", pd.Series())
-                                    for supplier in ordered_suppliers:
-                                        if supplier["supplier_id"] not in chosen_ids:
-                                            continue
-                                        alias = _supplier_alias_by_id(
-                                            supplier["supplier_id"],
-                                            round_meta=meta,
-                                            metadata=round_data.get(
-                                                "supplier_metadata", {}
-                                            ),
-                                        )
-                                        if not alias or alias not in totals.columns:
-                                            continue
-                                        supplier_values = totals[alias].copy()
-                                        supplier_values = supplier_values.reindex(
-                                            order_lookup.index
-                                        )
-                                        positions = order_lookup.reindex(
-                                            supplier_values.index
-                                        ).fillna(
-                                            np.arange(1, len(supplier_values) + 1)
-                                        )
-                                        curve_df = pd.DataFrame(
-                                            {
-                                                "__curve_position__": positions.astype(int),
-                                                "total": supplier_values.values,
-                                                "supplier": f"{supplier.get('supplier_name')} — {round_label}",
-                                                "code": consensus.get("code", ""),
-                                                "description": consensus.get("description", ""),
-                                            }
-                                        )
-                                        curve_df = curve_df.dropna(subset=["total"])
-                                        curve_frames.append(curve_df)
-                            if not curve_frames:
-                                st.info(
-                                    "Vybraná kola neobsahují data pro vykreslení křivky."
-                                )
-                            else:
-                                curve_df = pd.concat(
-                                    curve_frames, ignore_index=True, sort=False
-                                )
-                                curve_df["__curve_position__"] = pd.to_numeric(
-                                    curve_df.get("__curve_position__"), errors="coerce"
-                                )
-                                curve_df = curve_df.dropna(
-                                    subset=["__curve_position__"]
-                                )
-                                curve_df.sort_values(
-                                    by=["supplier", "__curve_position__"],
-                                    inplace=True,
-                                    kind="stable",
-                                )
-                                cumulative_df = curve_df.copy()
-                                cumulative_df["__cumulative_total__"] = (
-                                    cumulative_df.groupby("supplier")["total"].cumsum()
-                                )
-                                fig_cumulative = px.line(
-                                    cumulative_df,
-                                    x="__curve_position__",
-                                    y="__cumulative_total__",
-                                    color="supplier",
-                                    labels={
-                                        "__curve_position__": "Pořadí položek",
-                                        "__cumulative_total__": "Kumulativní cena",
-                                    },
-                                )
-                                fig_cumulative.update_traces(
-                                    mode="lines+markers",
-                                    marker=dict(size=4),
-                                )
-                                st.plotly_chart(fig_cumulative, use_container_width=True)
+                            st.info(
+                                "Data pro spojitou křivku budou vykreslena po doplnění agregovaných hodnot z jednotlivých kol."
+                            )
                         else:
-                            recap_cache = st.session_state.get("rounds_recap_cache", {})
-                            recap_rows: Dict[str, pd.Series] = {}
-                            for meta in selected_metas:
-                                round_id = meta.get("round_id")
-                                round_data = round_payloads.get(round_id)
-                                if not round_data:
+                            recap_columns: List[str] = []
+                            for supplier in ordered_suppliers:
+                                if supplier["supplier_id"] not in chosen_ids:
                                     continue
-                                recap_key = (
-                                    round_id,
-                                    round_data.get("overview_sheet"),
-                                    reference_mode,
-                                )
-                                display_names_round = round_data.get(
-                                    "display_names", {}
-                                )
-                                signature = tuple(sorted(display_names_round.items()))
-                                cached = recap_cache.get(recap_key)
-                                if cached and cached.get("signature") == signature:
-                                    recap_results_round = cached.get("value")
-                                else:
-                                    recap_results_round = None
-                                    if reference_mode == "with_master":
-                                        master_overview_round = round_data.get(
-                                            "master_overview"
-                                        )
-                                        bids_overview_round = round_data.get(
-                                            "bids_overview", {}
-                                        )
-                                        if (
-                                            master_overview_round is not None
-                                            and bids_overview_round
-                                        ):
-                                            recap_results_round = overview_comparison(
-                                                master_overview_round,
-                                                bids_overview_round,
-                                                round_data.get("overview_sheet"),
-                                            )
-                                            if display_names_round:
-                                                recap_results_round = tuple(
-                                                    rename_total_columns(
-                                                        df, display_names_round
-                                                    )
-                                                    if i < 3
-                                                    else df
-                                                    for i, df in enumerate(
-                                                        recap_results_round
-                                                    )
-                                                )
-                                    if recap_results_round is None:
-                                        recap_results_round = (
-                                            pd.DataFrame(),
-                                            pd.DataFrame(),
-                                            pd.DataFrame(),
-                                            pd.DataFrame(),
-                                            pd.DataFrame(),
-                                        )
-                                    recap_cache[recap_key] = {
-                                        "signature": signature,
-                                        "value": recap_results_round,
-                                    }
-                                round_data["recap_results"] = recap_results_round
-                                if (
-                                    not isinstance(recap_results_round, tuple)
-                                    or len(recap_results_round) < 3
-                                ):
-                                    continue
-                                sections_df, indirect_df, added_df, _, _ = (
-                                    recap_results_round
-                                )
-                                frames = [
-                                    df
-                                    for df in (sections_df, indirect_df, added_df)
-                                    if isinstance(df, pd.DataFrame) and not df.empty
-                                ]
-                                if not frames:
-                                    continue
-                                combined = pd.concat(
-                                    frames, axis=0, ignore_index=True, sort=False
-                                )
-                                value_cols = [
-                                    col
-                                    for col in combined.columns
-                                    if str(col).endswith(" total")
-                                    and not str(col).startswith("__present__")
-                                ]
-                                if not value_cols:
-                                    continue
-                                totals = (
-                                    combined[value_cols]
-                                    .apply(pd.to_numeric, errors="coerce")
-                                    .sum(skipna=True, min_count=1)
-                                )
-                                recap_rows[round_id] = totals
-
-                            if not recap_rows:
-                                st.info(
-                                    "Rekapitulace napříč koly není dostupná pro vybrané listy."
-                                )
-                            else:
-                                recap_table = pd.DataFrame(index=["Celkem"])
-                                for supplier in ordered_suppliers:
-                                    if supplier["supplier_id"] not in chosen_ids:
-                                        continue
-                                    supplier_label = supplier.get("supplier_name")
-                                    for meta in selected_metas:
-                                        round_id = meta.get("round_id")
-                                        totals = recap_rows.get(round_id)
-                                        if totals is None or totals.empty:
-                                            continue
-                                        alias = _supplier_alias_by_id(
-                                            supplier["supplier_id"],
-                                            round_meta=meta,
-                                            metadata=round_payloads.get(round_id, {}).get(
-                                                "supplier_metadata", {}
-                                            ),
-                                        )
-                                        if not alias:
-                                            continue
-                                        value = totals.get(f"{alias} total", np.nan)
-                                        recap_table[
-                                            (
-                                                supplier_label,
-                                                meta.get("round_name", meta.get("round_id")),
-                                            )
-                                        ] = [value]
-                                if len(recap_table.columns) > 0:
-                                    recap_table.columns = pd.MultiIndex.from_tuples(
-                                        recap_table.columns
+                                for meta in selected_metas:
+                                    recap_columns.append(
+                                        f"{supplier.get('supplier_name')} — Celkem ({meta.get('round_name')})"
                                     )
-                                    st.dataframe(recap_table, use_container_width=True)
-                                else:
-                                    st.info(
-                                        "Rekapitulace napříč koly neobsahuje hodnoty pro vybrané dodavatele."
-                                    )
+                            recap_df = pd.DataFrame(columns=recap_columns)
+                            st.dataframe(recap_df, use_container_width=True)
+                            st.info(
+                                "Rekapitulace napříč koly je připravena; hodnoty budou doplněny po načtení agregovaných součtů."
+                            )
 
 st.markdown("---")
 st.caption("© 2025 BoQ Bid Studio — MVP. Doporučení: používat jednotné Item ID pro precizní párování.")
