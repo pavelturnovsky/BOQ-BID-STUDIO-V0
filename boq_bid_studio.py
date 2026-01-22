@@ -6135,6 +6135,7 @@ def mapping_ui(
 
             wb.sheets[sheet]["mapping"] = ui_mapping
             wb.sheets[sheet]["header_row"] = header_row
+            wb.sheets[sheet]["header_names"] = header_names
             wb.sheets[sheet]["table"] = table
             wb.sheets[sheet]["preserve_summary_totals"] = use_minimal
             mapping_changed = (ui_mapping != prev_mapping) or (header_row != prev_header)
