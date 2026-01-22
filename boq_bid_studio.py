@@ -4194,7 +4194,10 @@ def _match_header_hints(
             if normalized_hint:
                 exact_terms.append(normalized_hint)
                 escaped = re.escape(normalized_hint)
-                contains_terms.append(rf"(?:^|\\b){escaped}(?:\\b|$)")
+                if re.search(r"\W", normalized_hint):
+                    contains_terms.append(escaped)
+                else:
+                    contains_terms.append(rf"(?:^|\\b){escaped}(?:\\b|$)")
 
     for term in exact_terms:
         for idx, header in enumerate(normalized_headers):
