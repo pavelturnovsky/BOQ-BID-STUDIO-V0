@@ -314,13 +314,35 @@ HEADER_HINTS = {
         "pol.",
         "regex:^pol$",
     ],
-    "description": ["description", "popis", "položka", "polozka", "název", "nazev", "specifikace"],
+    "description": [
+        "description",
+        "popis",
+        "položka",
+        "polozka",
+        "název",
+        "nazev",
+        "specifikace",
+        "popis položky",
+        "popis polozky",
+    ],
     "unit": ["unit", "jm", "mj", "jednotka", "uom", "měrná jednotka", "merna jednotka"],
-    "quantity": ["quantity", "qty", "množství", "mnozstvi", "q"],
+    "quantity": [
+        "quantity",
+        "qty",
+        "množství",
+        "mnozstvi",
+        "q",
+        "množství dle projekce",
+        "mnozstvi dle projekce",
+        "množství dle projekte",
+        "mnozstvi dle projekte",
+    ],
     # optional extras commonly seen
     "item_id": [
         "celková cena",
         "celkova cena",
+        "celková cena [czk]",
+        "celkova cena [czk]",
         "item id",
         "itemid",
         "id položky",
@@ -340,10 +362,41 @@ HEADER_HINTS = {
         "qty supplier",
         "quantity supplier",
     ],
-    "unit_price_material": ["cena materiál", "cena material", "unit price material", "materiál", "material"],
-    "unit_price_install": ["cena montáž", "cena montaz", "unit price install", "montáž", "montaz"],
-    "total_price": ["cena celkem", "celková cena", "total price", "celkem"],
-    "summary_total": ["celkem za oddíl", "součet oddíl", "součet za oddíl"],
+    "unit_price_material": [
+        "cena materiál",
+        "cena material",
+        "unit price material",
+        "materiál",
+        "material",
+        "jednotková cena - materiál",
+        "jednotkova cena - material",
+    ],
+    "unit_price_install": [
+        "cena montáž",
+        "cena montaz",
+        "unit price install",
+        "montáž",
+        "montaz",
+        "jednotková cena - montáž",
+        "jednotkova cena - montaz",
+        "jednotlova cena - montaz",
+    ],
+    "total_price": [
+        "cena celkem",
+        "celková cena",
+        "total price",
+        "celkem",
+        "celkem czk",
+        "regex:^celková cena\\s*(\\[?czk\\]?)?$",
+        "regex:^celkova cena\\s*(\\[?czk\\]?)?$",
+    ],
+    "summary_total": [
+        "celkem za oddíl",
+        "součet oddíl",
+        "součet za oddíl",
+        "regex:^celkem za oddíl\\s*(\\[?czk\\]?)?$",
+        "regex:^celkem za oddil\\s*(\\[?czk\\]?)?$",
+    ],
 }
 
 # For některé souhrnné listy nemusí být množství dostupné
@@ -5851,11 +5904,7 @@ def mapping_ui(
             raw = obj.get("raw")
             header_row = obj.get("header_row", -1)
             stored_mapping = obj.get("mapping", {}).copy()
-            if (
-                isinstance(raw, pd.DataFrame)
-                and not stored_mapping
-                and (not isinstance(header_row, (int, np.integer)) or header_row < 0)
-            ):
+            if isinstance(raw, pd.DataFrame) and not stored_mapping:
                 detected_mapping, detected_header_row, _ = try_autodetect_mapping(raw)
                 if not detected_mapping:
                     fallback = raw.copy()
@@ -6173,6 +6222,8 @@ def mapping_ui(
             mapping_changed = (ui_mapping != prev_mapping) or (header_row != prev_header)
             wb.sheets[sheet]["_changed"] = mapping_changed
             changed_any = changed_any or mapping_changed
+            if mapping_changed:
+                trigger_rerun()
 
             st.markdown("**Normalizovaná tabulka (náhled):**")
             show_df(table.head(50))
