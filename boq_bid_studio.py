@@ -5995,6 +5995,17 @@ def mapping_ui(
                 header_names = obj.get("header_names", [])
             header_names = [normalize_col(x) for x in header_names]
 
+            if (
+                not isinstance(raw, pd.DataFrame)
+                or raw.empty
+                or not header_names
+            ):
+                st.warning("List nelze automaticky namapovat, přeskočeno.")
+                wb.sheets[sheet]["mapping"] = {}
+                wb.sheets[sheet]["table"] = pd.DataFrame()
+                wb.sheets[sheet]["_changed"] = False
+                continue
+
             header_lookup: Dict[str, int] = {}
             for idx, name in enumerate(header_names):
                 raw_key = str(name).strip()
