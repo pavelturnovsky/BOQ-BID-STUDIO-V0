@@ -99,6 +99,8 @@ def reset_round_context() -> None:
         "round_loaded_bids",
         "bid_selection_state",
         "prefill_round_inputs",
+        "master_upload_fingerprint",
+        "bid_upload_hashes",
     ]:
         if key in st.session_state:
             st.session_state.pop(key)
@@ -9695,6 +9697,8 @@ if comparison_mode == "Porovnání nabídek bez Master BoQ":
 
 stored_master_entries = offer_storage.list_master()
 stored_bid_entries = offer_storage.list_bids()
+stored_master_names = {entry["name"] for entry in stored_master_entries}
+stored_bid_names = {entry["name"] for entry in stored_bid_entries}
 
 st.sidebar.header("Vstupy")
 st.sidebar.caption(
@@ -9722,7 +9726,15 @@ uploaded_master = st.sidebar.file_uploader(
     "Master BoQ (.xlsx/.xlsm)", type=["xlsx", "xlsm"], key="master"
 )
 if uploaded_master is not None:
-    offer_storage.save_master(uploaded_master)
+    master_name = getattr(uploaded_master, "name", "Master.xlsx")
+    master_hash = hash_fileobj(uploaded_master)
+    master_fingerprint = (master_name, master_hash)
+    if (
+        st.session_state.get("master_upload_fingerprint") != master_fingerprint
+        or master_name not in stored_master_names
+    ):
+        offer_storage.save_master(uploaded_master)
+        st.session_state["master_upload_fingerprint"] = master_fingerprint
     master_file = uploaded_master
 else:
     master_file = round_loaded_master
@@ -9746,8 +9758,16 @@ if uploaded_bids:
     if len(uploaded_bids) > 7:
         st.sidebar.warning("Zpracuje se pouze prvních 7 souborů.")
         uploaded_bids = uploaded_bids[:7]
+    bid_upload_hashes = st.session_state.setdefault("bid_upload_hashes", {})
     for file_obj in uploaded_bids:
-        offer_storage.save_bid(file_obj)
+        bid_name = getattr(file_obj, "name", "Bid.xlsx")
+        bid_hash = hash_fileobj(file_obj)
+        if (
+            bid_upload_hashes.get(bid_name) != bid_hash
+            or bid_name not in stored_bid_names
+        ):
+            offer_storage.save_bid(file_obj)
+            bid_upload_hashes[bid_name] = bid_hash
         bid_files.append(file_obj)
 
 selected_stored_bids: List[str] = []
