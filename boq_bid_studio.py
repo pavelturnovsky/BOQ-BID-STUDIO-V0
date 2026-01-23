@@ -199,6 +199,50 @@ def hash_fileobj(file_obj: Any) -> str:
     return sha.hexdigest()
 
 
+def read_file_bytes(file_obj: Any) -> bytes:
+    """Read bytes from a file-like object without mutating its position."""
+
+    if isinstance(file_obj, (bytes, bytearray)):
+        return bytes(file_obj)
+
+    if hasattr(file_obj, "getvalue"):
+        try:
+            return bytes(file_obj.getvalue())
+        except Exception:
+            pass
+
+    if hasattr(file_obj, "getbuffer"):
+        try:
+            return bytes(file_obj.getbuffer())
+        except Exception:
+            pass
+
+    if hasattr(file_obj, "read"):
+        pos = None
+        try:
+            pos = file_obj.tell()
+        except Exception:
+            pos = None
+        try:
+            if hasattr(file_obj, "seek"):
+                try:
+                    file_obj.seek(0)
+                except Exception:
+                    pass
+            raw = file_obj.read()
+        finally:
+            if pos is not None and hasattr(file_obj, "seek"):
+                try:
+                    file_obj.seek(pos)
+                except Exception:
+                    pass
+        if isinstance(raw, str):
+            return raw.encode("utf-8")
+        return bytes(raw)
+
+    return bytes(file_obj)
+
+
 def normalize_input_hashes(input_hashes: Optional[Mapping[str, str]]) -> Dict[str, str]:
     """Normalize input hashes so bid order does not affect comparisons."""
 
@@ -3078,9 +3122,9 @@ class OfferStorage:
             with self.index_file.open("r", encoding="utf-8") as handle:
                 data = json.load(handle)
         except (OSError, json.JSONDecodeError):
-            return {"master": {}, "bids": {}}
+            return {"master": {}, "bids": {}, "templates": {}}
         if not isinstance(data, dict):
-            return {"master": {}, "bids": {}}
+            return {"master": {}, "bids": {}, "templates": {}}
         data.setdefault("master", {})
         data.setdefault("bids", {})
         data.setdefault("templates", {})
@@ -3115,28 +3159,8 @@ class OfferStorage:
                     old_path.unlink()
                 except OSError:
                     pass
-        if hasattr(file_obj, "seek"):
-            try:
-                file_obj.seek(0)
-            except (OSError, AttributeError):
-                pass
-        data: bytes
-        if hasattr(file_obj, "read"):
-            raw = file_obj.read()
-            if isinstance(raw, str):
-                data = raw.encode("utf-8")
-            else:
-                data = bytes(raw)
-        elif hasattr(file_obj, "getbuffer"):
-            data = bytes(file_obj.getbuffer())
-        else:
-            data = bytes(file_obj)
+        data = read_file_bytes(file_obj)
         dest.write_bytes(data)
-        if hasattr(file_obj, "seek"):
-            try:
-                file_obj.seek(0)
-            except (OSError, AttributeError):
-                pass
         entries[display_name] = {"path": dest.name, "updated_at": time.time()}
         self._write_index()
         return dest
@@ -3398,27 +3422,11 @@ class ProjectStorageManager:
         saved: Dict[str, Any] = {}
         if master is not None:
             dest = inputs_dir / "master.xlsx"
-            if hasattr(master, "seek"):
-                try:
-                    master.seek(0)
-                except Exception:
-                    pass
-            data = master.read()
-            if isinstance(data, str):
-                data = data.encode("utf-8")
-            dest.write_bytes(bytes(data))
+            dest.write_bytes(read_file_bytes(master))
             saved["master"] = dest.name
         for idx, bid in enumerate(bids):
             dest = inputs_dir / f"bid_{idx+1}.xlsx"
-            if hasattr(bid, "seek"):
-                try:
-                    bid.seek(0)
-                except Exception:
-                    pass
-            data = bid.read()
-            if isinstance(data, str):
-                data = data.encode("utf-8")
-            dest.write_bytes(bytes(data))
+            dest.write_bytes(read_file_bytes(bid))
             saved.setdefault("bids", [])
             saved.setdefault("bid_names", [])
             saved["bids"].append(dest.name)
