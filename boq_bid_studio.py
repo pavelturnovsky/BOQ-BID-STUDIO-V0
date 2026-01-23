@@ -4173,15 +4173,11 @@ def make_widget_key(*parts: Any) -> str:
     normalized = [_normalize_key_part(p) for p in parts]
     return "_".join(normalized)
 
-@st.cache_data
-def try_autodetect_mapping(df: pd.DataFrame) -> Tuple[Dict[str, int], int, pd.DataFrame]:
-    """Autodetect header mapping using a sampled, vectorized search."""
-    # probe size grows with the dataframe but is capped to keep things fast
-    nprobe = min(len(df), 200)
-    sample = df.head(nprobe).astype(str).applymap(normalize_col)
-
+def build_header_hint_patterns(
+    header_hints: Mapping[str, Sequence[str]],
+) -> Dict[str, Dict[str, List[str]]]:
     hint_patterns: Dict[str, Dict[str, List[str]]] = {}
-    for key, hints in HEADER_HINTS.items():
+    for key, hints in header_hints.items():
         exact_terms: List[str] = []
         regex_terms: List[str] = []
         contains_terms: List[str] = []
@@ -4201,43 +4197,55 @@ def try_autodetect_mapping(df: pd.DataFrame) -> Tuple[Dict[str, int], int, pd.Da
             "regex": regex_terms,
             "contains": contains_terms,
         }
+    return hint_patterns
 
-    def detect_row(row: pd.Series) -> Dict[str, int]:
-        mapping: Dict[str, int] = {}
-        for key, patterns in hint_patterns.items():
-            exact_terms = patterns.get("exact", [])
-            regex_terms = patterns.get("regex", [])
-            contains_terms = patterns.get("contains", [])
+def detect_header_mapping(
+    row: pd.Series,
+    hint_patterns: Mapping[str, Mapping[str, Sequence[str]]],
+) -> Dict[str, int]:
+    mapping: Dict[str, int] = {}
+    for key, patterns in hint_patterns.items():
+        exact_terms = patterns.get("exact", [])
+        regex_terms = patterns.get("regex", [])
+        contains_terms = patterns.get("contains", [])
 
-            matched_idx: Optional[int] = None
-            for term in exact_terms:
-                term_mask = row == term
-                if term_mask.any():
-                    matched_idx = term_mask.idxmax()
-                    break
-            if matched_idx is not None:
-                mapping[key] = matched_idx
-                continue
+        matched_idx: Optional[int] = None
+        for term in exact_terms:
+            term_mask = row == term
+            if term_mask.any():
+                matched_idx = term_mask.idxmax()
+                break
+        if matched_idx is not None:
+            mapping[key] = matched_idx
+            continue
 
-            for pattern in regex_terms:
-                regex_mask = row.str.contains(pattern, regex=True, na=False)
-                if regex_mask.any():
-                    matched_idx = regex_mask.idxmax()
-                    break
-            if matched_idx is not None:
-                mapping[key] = matched_idx
-                continue
+        for pattern in regex_terms:
+            regex_mask = row.str.contains(pattern, regex=True, na=False)
+            if regex_mask.any():
+                matched_idx = regex_mask.idxmax()
+                break
+        if matched_idx is not None:
+            mapping[key] = matched_idx
+            continue
 
-            for pattern in contains_terms:
-                contains_mask = row.str.contains(pattern, regex=True, na=False)
-                if contains_mask.any():
-                    matched_idx = contains_mask.idxmax()
-                    break
-            if matched_idx is not None:
-                mapping[key] = matched_idx
-        return mapping
+        for pattern in contains_terms:
+            contains_mask = row.str.contains(pattern, regex=True, na=False)
+            if contains_mask.any():
+                matched_idx = contains_mask.idxmax()
+                break
+        if matched_idx is not None:
+            mapping[key] = matched_idx
+    return mapping
 
-    mappings = sample.apply(detect_row, axis=1)
+@st.cache_data
+def try_autodetect_mapping(df: pd.DataFrame) -> Tuple[Dict[str, int], int, pd.DataFrame]:
+    """Autodetect header mapping using a sampled, vectorized search."""
+    # probe size grows with the dataframe but is capped to keep things fast
+    nprobe = min(len(df), 200)
+    sample = df.head(nprobe).astype(str).applymap(normalize_col)
+
+    hint_patterns = build_header_hint_patterns(HEADER_HINTS)
+    mappings = sample.apply(lambda row: detect_header_mapping(row, hint_patterns), axis=1)
     for header_row, mapping in mappings.items():
         if set(REQUIRED_KEYS).issubset(mapping.keys()):
             body = df.iloc[header_row + 1:].reset_index(drop=True)
@@ -5843,6 +5851,26 @@ def mapping_ui(
             raw = obj.get("raw")
             header_row = obj.get("header_row", -1)
             stored_mapping = obj.get("mapping", {}).copy()
+            if (
+                isinstance(raw, pd.DataFrame)
+                and not stored_mapping
+                and (not isinstance(header_row, (int, np.integer)) or header_row < 0)
+            ):
+                detected_mapping, detected_header_row, _ = try_autodetect_mapping(raw)
+                if not detected_mapping:
+                    fallback = raw.copy()
+                    fallback.columns = fallback.columns.astype(str)
+                    composed = pd.concat(
+                        [fallback.columns.to_frame().T, fallback], ignore_index=True
+                    )
+                    detected_mapping, detected_header_row, _ = try_autodetect_mapping(composed)
+                if (
+                    detected_mapping
+                    and isinstance(detected_header_row, (int, np.integer))
+                    and detected_header_row >= 0
+                ):
+                    stored_mapping = detected_mapping.copy()
+                    header_row = int(detected_header_row)
             prev_header = header_row
             hdr_preview = raw.head(10) if isinstance(raw, pd.DataFrame) else None
             if hdr_preview is not None:
@@ -5923,9 +5951,14 @@ def mapping_ui(
                 ):
                     return int(stored_value)
                 hints = HEADER_HINTS.get(key, [])
-                for i, col in enumerate(header_names):
-                    if any(p in col for p in hints):
-                        return i
+                if not hints:
+                    return 0
+                hint_patterns = build_header_hint_patterns({key: hints})
+                row = pd.Series(header_names)
+                detected = detect_header_mapping(row, hint_patterns)
+                matched_idx = detected.get(key)
+                if matched_idx is not None and 0 <= matched_idx < len(header_names):
+                    return int(matched_idx)
                 return 0
 
             def clamp(idx: Any) -> int:
