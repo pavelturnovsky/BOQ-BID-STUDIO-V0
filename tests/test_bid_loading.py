@@ -91,30 +91,6 @@ def test_autodetect_item_id_from_celkovacena() -> None:
     assert mapping["item_id"] == 1
 
 
-def test_autodetect_header_row_offset() -> None:
-    df = pd.DataFrame([
-        ["", "", ""],
-        ["", "", ""],
-        ["kod", "popis", "mnozstvi"],
-        ["1", "a", "2"],
-    ])
-    mapping, hdr, _ = module.try_autodetect_mapping(df)
-    assert hdr == 2
-    assert mapping["code"] == 0
-    assert mapping["description"] == 1
-    assert mapping["quantity"] == 2
-
-
-def test_autodetect_requires_core_keys() -> None:
-    df = pd.DataFrame([
-        ["foo", "bar"],
-        ["1", "2"],
-    ])
-    mapping, hdr, _ = module.try_autodetect_mapping(df)
-    assert mapping == {}
-    assert hdr == -1
-
-
 def test_rename_value_columns_adds_percent_diff() -> None:
     df = pd.DataFrame(
         {

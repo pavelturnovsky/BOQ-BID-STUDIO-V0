@@ -99,8 +99,6 @@ def reset_round_context() -> None:
         "round_loaded_bids",
         "bid_selection_state",
         "prefill_round_inputs",
-        "master_upload_fingerprint",
-        "bid_upload_hashes",
     ]:
         if key in st.session_state:
             st.session_state.pop(key)
@@ -199,50 +197,6 @@ def hash_fileobj(file_obj: Any) -> str:
             except Exception:
                 pass
     return sha.hexdigest()
-
-
-def read_file_bytes(file_obj: Any) -> bytes:
-    """Read bytes from a file-like object without mutating its position."""
-
-    if isinstance(file_obj, (bytes, bytearray)):
-        return bytes(file_obj)
-
-    if hasattr(file_obj, "getvalue"):
-        try:
-            return bytes(file_obj.getvalue())
-        except Exception:
-            pass
-
-    if hasattr(file_obj, "getbuffer"):
-        try:
-            return bytes(file_obj.getbuffer())
-        except Exception:
-            pass
-
-    if hasattr(file_obj, "read"):
-        pos = None
-        try:
-            pos = file_obj.tell()
-        except Exception:
-            pos = None
-        try:
-            if hasattr(file_obj, "seek"):
-                try:
-                    file_obj.seek(0)
-                except Exception:
-                    pass
-            raw = file_obj.read()
-        finally:
-            if pos is not None and hasattr(file_obj, "seek"):
-                try:
-                    file_obj.seek(pos)
-                except Exception:
-                    pass
-        if isinstance(raw, str):
-            return raw.encode("utf-8")
-        return bytes(raw)
-
-    return bytes(file_obj)
 
 
 def normalize_input_hashes(input_hashes: Optional[Mapping[str, str]]) -> Dict[str, str]:
@@ -360,35 +314,13 @@ HEADER_HINTS = {
         "pol.",
         "regex:^pol$",
     ],
-    "description": [
-        "description",
-        "popis",
-        "položka",
-        "polozka",
-        "název",
-        "nazev",
-        "specifikace",
-        "popis položky",
-        "popis polozky",
-    ],
+    "description": ["description", "popis", "položka", "polozka", "název", "nazev", "specifikace"],
     "unit": ["unit", "jm", "mj", "jednotka", "uom", "měrná jednotka", "merna jednotka"],
-    "quantity": [
-        "quantity",
-        "qty",
-        "množství",
-        "mnozstvi",
-        "q",
-        "množství dle projekce",
-        "mnozstvi dle projekce",
-        "množství dle projekte",
-        "mnozstvi dle projekte",
-    ],
+    "quantity": ["quantity", "qty", "množství", "mnozstvi", "q"],
     # optional extras commonly seen
     "item_id": [
         "celková cena",
         "celkova cena",
-        "celková cena [czk]",
-        "celkova cena [czk]",
         "item id",
         "itemid",
         "id položky",
@@ -408,41 +340,10 @@ HEADER_HINTS = {
         "qty supplier",
         "quantity supplier",
     ],
-    "unit_price_material": [
-        "cena materiál",
-        "cena material",
-        "unit price material",
-        "materiál",
-        "material",
-        "jednotková cena - materiál",
-        "jednotkova cena - material",
-    ],
-    "unit_price_install": [
-        "cena montáž",
-        "cena montaz",
-        "unit price install",
-        "montáž",
-        "montaz",
-        "jednotková cena - montáž",
-        "jednotkova cena - montaz",
-        "jednotlova cena - montaz",
-    ],
-    "total_price": [
-        "cena celkem",
-        "celková cena",
-        "total price",
-        "celkem",
-        "celkem czk",
-        "regex:^celková cena\\s*(\\[?czk\\]?)?$",
-        "regex:^celkova cena\\s*(\\[?czk\\]?)?$",
-    ],
-    "summary_total": [
-        "celkem za oddíl",
-        "součet oddíl",
-        "součet za oddíl",
-        "regex:^celkem za oddíl\\s*(\\[?czk\\]?)?$",
-        "regex:^celkem za oddil\\s*(\\[?czk\\]?)?$",
-    ],
+    "unit_price_material": ["cena materiál", "cena material", "unit price material", "materiál", "material"],
+    "unit_price_install": ["cena montáž", "cena montaz", "unit price install", "montáž", "montaz"],
+    "total_price": ["cena celkem", "celková cena", "total price", "celkem"],
+    "summary_total": ["celkem za oddíl", "součet oddíl", "součet za oddíl"],
 }
 
 # For některé souhrnné listy nemusí být množství dostupné
@@ -3124,9 +3025,9 @@ class OfferStorage:
             with self.index_file.open("r", encoding="utf-8") as handle:
                 data = json.load(handle)
         except (OSError, json.JSONDecodeError):
-            return {"master": {}, "bids": {}, "templates": {}}
+            return {"master": {}, "bids": {}}
         if not isinstance(data, dict):
-            return {"master": {}, "bids": {}, "templates": {}}
+            return {"master": {}, "bids": {}}
         data.setdefault("master", {})
         data.setdefault("bids", {})
         data.setdefault("templates", {})
@@ -3150,50 +3051,8 @@ class OfferStorage:
         suffix = Path(display_name).suffix or ".bin"
         return self._category_dir(category) / f"{digest}{suffix}"
 
-    def _get_entry_hash(self, category: str, meta: Mapping[str, Any]) -> Optional[str]:
-        stored_hash = meta.get("hash")
-        if isinstance(stored_hash, str) and stored_hash:
-            return stored_hash
-        path = self._category_dir(category) / str(meta.get("path", ""))
-        if not path.exists():
-            return None
-        try:
-            return hashlib.sha1(path.read_bytes()).hexdigest()
-        except OSError:
-            return None
-
-    def _ensure_unique_name(self, category: str, display_name: str, file_hash: str) -> str:
+    def _write_file(self, category: str, display_name: str, file_obj: Any) -> Path:
         entries = self._index.setdefault(category, {})
-        existing = entries.get(display_name)
-        if not existing:
-            return display_name
-        existing_hash = self._get_entry_hash(category, existing)
-        if existing_hash:
-            existing["hash"] = existing_hash
-        if existing_hash == file_hash:
-            return display_name
-
-        base = Path(display_name)
-        stem = base.stem or display_name
-        suffix = base.suffix
-        short_hash = file_hash[:8]
-        candidate = f"{stem} ({short_hash}){suffix}"
-        counter = 2
-        while True:
-            meta = entries.get(candidate)
-            if not meta:
-                return candidate
-            meta_hash = self._get_entry_hash(category, meta)
-            if meta_hash == file_hash:
-                return candidate
-            candidate = f"{stem} ({short_hash}) {counter}{suffix}"
-            counter += 1
-
-    def _write_file(self, category: str, display_name: str, file_obj: Any) -> str:
-        entries = self._index.setdefault(category, {})
-        data = read_file_bytes(file_obj)
-        file_hash = hashlib.sha1(data).hexdigest()
-        display_name = self._ensure_unique_name(category, display_name, file_hash)
         existing = entries.get(display_name)
         dest = self._path_for(category, display_name)
         if existing:
@@ -3203,14 +3062,31 @@ class OfferStorage:
                     old_path.unlink()
                 except OSError:
                     pass
+        if hasattr(file_obj, "seek"):
+            try:
+                file_obj.seek(0)
+            except (OSError, AttributeError):
+                pass
+        data: bytes
+        if hasattr(file_obj, "read"):
+            raw = file_obj.read()
+            if isinstance(raw, str):
+                data = raw.encode("utf-8")
+            else:
+                data = bytes(raw)
+        elif hasattr(file_obj, "getbuffer"):
+            data = bytes(file_obj.getbuffer())
+        else:
+            data = bytes(file_obj)
         dest.write_bytes(data)
-        entries[display_name] = {
-            "path": dest.name,
-            "updated_at": time.time(),
-            "hash": file_hash,
-        }
+        if hasattr(file_obj, "seek"):
+            try:
+                file_obj.seek(0)
+            except (OSError, AttributeError):
+                pass
+        entries[display_name] = {"path": dest.name, "updated_at": time.time()}
         self._write_index()
-        return display_name
+        return dest
 
     def _load_file(self, category: str, display_name: str) -> io.BytesIO:
         entries = self._index.get(category, {})
@@ -3257,15 +3133,18 @@ class OfferStorage:
 
     def save_master(self, file_obj: Any, *, display_name: Optional[str] = None) -> str:
         name = display_name or getattr(file_obj, "name", "Master.xlsx")
-        return self._write_file("master", name, file_obj)
+        self._write_file("master", name, file_obj)
+        return name
 
     def save_bid(self, file_obj: Any, *, display_name: Optional[str] = None) -> str:
         name = display_name or getattr(file_obj, "name", "Bid.xlsx")
-        return self._write_file("bids", name, file_obj)
+        self._write_file("bids", name, file_obj)
+        return name
 
     def save_template(self, file_obj: Any, *, display_name: Optional[str] = None) -> str:
         name = display_name or getattr(file_obj, "name", "Template.xlsx")
-        return self._write_file("templates", name, file_obj)
+        self._write_file("templates", name, file_obj)
+        return name
 
     def load_master(self, display_name: str) -> io.BytesIO:
         return self._load_file("master", display_name)
@@ -3428,15 +3307,11 @@ class ProjectStorageManager:
             self._load_metadata(self._metadata_path(self._project_dir(project_id)))
         )
 
-    def touch_project_last_opened(self, project_id: str, *, min_interval: int = 60) -> Dict[str, Any]:
+    def touch_project_last_opened(self, project_id: str) -> Dict[str, Any]:
         meta = self.load_project(project_id)
         if not meta:
             return {}
-        now = time.time()
-        last_opened = meta.get("last_opened_at")
-        if isinstance(last_opened, (int, float)) and now - float(last_opened) < min_interval:
-            return meta
-        meta["last_opened_at"] = now
+        meta["last_opened_at"] = time.time()
         self._write_metadata(self._metadata_path(self._project_dir(project_id)), meta)
         return meta
 
@@ -3470,11 +3345,27 @@ class ProjectStorageManager:
         saved: Dict[str, Any] = {}
         if master is not None:
             dest = inputs_dir / "master.xlsx"
-            dest.write_bytes(read_file_bytes(master))
+            if hasattr(master, "seek"):
+                try:
+                    master.seek(0)
+                except Exception:
+                    pass
+            data = master.read()
+            if isinstance(data, str):
+                data = data.encode("utf-8")
+            dest.write_bytes(bytes(data))
             saved["master"] = dest.name
         for idx, bid in enumerate(bids):
             dest = inputs_dir / f"bid_{idx+1}.xlsx"
-            dest.write_bytes(read_file_bytes(bid))
+            if hasattr(bid, "seek"):
+                try:
+                    bid.seek(0)
+                except Exception:
+                    pass
+            data = bid.read()
+            if isinstance(data, str):
+                data = data.encode("utf-8")
+            dest.write_bytes(bytes(data))
             saved.setdefault("bids", [])
             saved.setdefault("bid_names", [])
             saved["bids"].append(dest.name)
@@ -4282,11 +4173,15 @@ def make_widget_key(*parts: Any) -> str:
     normalized = [_normalize_key_part(p) for p in parts]
     return "_".join(normalized)
 
-def build_header_hint_patterns(
-    header_hints: Mapping[str, Sequence[str]],
-) -> Dict[str, Dict[str, List[str]]]:
+@st.cache_data
+def try_autodetect_mapping(df: pd.DataFrame) -> Tuple[Dict[str, int], int, pd.DataFrame]:
+    """Autodetect header mapping using a sampled, vectorized search."""
+    # probe size grows with the dataframe but is capped to keep things fast
+    nprobe = min(len(df), 200)
+    sample = df.head(nprobe).astype(str).applymap(normalize_col)
+
     hint_patterns: Dict[str, Dict[str, List[str]]] = {}
-    for key, hints in header_hints.items():
+    for key, hints in HEADER_HINTS.items():
         exact_terms: List[str] = []
         regex_terms: List[str] = []
         contains_terms: List[str] = []
@@ -4306,55 +4201,43 @@ def build_header_hint_patterns(
             "regex": regex_terms,
             "contains": contains_terms,
         }
-    return hint_patterns
 
-def detect_header_mapping(
-    row: pd.Series,
-    hint_patterns: Mapping[str, Mapping[str, Sequence[str]]],
-) -> Dict[str, int]:
-    mapping: Dict[str, int] = {}
-    for key, patterns in hint_patterns.items():
-        exact_terms = patterns.get("exact", [])
-        regex_terms = patterns.get("regex", [])
-        contains_terms = patterns.get("contains", [])
+    def detect_row(row: pd.Series) -> Dict[str, int]:
+        mapping: Dict[str, int] = {}
+        for key, patterns in hint_patterns.items():
+            exact_terms = patterns.get("exact", [])
+            regex_terms = patterns.get("regex", [])
+            contains_terms = patterns.get("contains", [])
 
-        matched_idx: Optional[int] = None
-        for term in exact_terms:
-            term_mask = row == term
-            if term_mask.any():
-                matched_idx = term_mask.idxmax()
-                break
-        if matched_idx is not None:
-            mapping[key] = matched_idx
-            continue
+            matched_idx: Optional[int] = None
+            for term in exact_terms:
+                term_mask = row == term
+                if term_mask.any():
+                    matched_idx = term_mask.idxmax()
+                    break
+            if matched_idx is not None:
+                mapping[key] = matched_idx
+                continue
 
-        for pattern in regex_terms:
-            regex_mask = row.str.contains(pattern, regex=True, na=False)
-            if regex_mask.any():
-                matched_idx = regex_mask.idxmax()
-                break
-        if matched_idx is not None:
-            mapping[key] = matched_idx
-            continue
+            for pattern in regex_terms:
+                regex_mask = row.str.contains(pattern, regex=True, na=False)
+                if regex_mask.any():
+                    matched_idx = regex_mask.idxmax()
+                    break
+            if matched_idx is not None:
+                mapping[key] = matched_idx
+                continue
 
-        for pattern in contains_terms:
-            contains_mask = row.str.contains(pattern, regex=True, na=False)
-            if contains_mask.any():
-                matched_idx = contains_mask.idxmax()
-                break
-        if matched_idx is not None:
-            mapping[key] = matched_idx
-    return mapping
+            for pattern in contains_terms:
+                contains_mask = row.str.contains(pattern, regex=True, na=False)
+                if contains_mask.any():
+                    matched_idx = contains_mask.idxmax()
+                    break
+            if matched_idx is not None:
+                mapping[key] = matched_idx
+        return mapping
 
-@st.cache_data
-def try_autodetect_mapping(df: pd.DataFrame) -> Tuple[Dict[str, int], int, pd.DataFrame]:
-    """Autodetect header mapping using a sampled, vectorized search."""
-    # probe size grows with the dataframe but is capped to keep things fast
-    nprobe = min(len(df), 200)
-    sample = df.head(nprobe).astype(str).applymap(normalize_col)
-
-    hint_patterns = build_header_hint_patterns(HEADER_HINTS)
-    mappings = sample.apply(lambda row: detect_header_mapping(row, hint_patterns), axis=1)
+    mappings = sample.apply(detect_row, axis=1)
     for header_row, mapping in mappings.items():
         if set(REQUIRED_KEYS).issubset(mapping.keys()):
             body = df.iloc[header_row + 1:].reset_index(drop=True)
@@ -5789,28 +5672,6 @@ def _read_workbook_loader(upload, limit_sheets: Optional[List[str]] = None) -> W
 def read_workbook(upload, limit_sheets: Optional[List[str]] = None) -> WorkbookData:
     return _read_workbook_loader(upload, limit_sheets)
 
-
-@st.cache_data
-def _read_sheet_names_cached(file_name: str, suffix: str, data_bytes: bytes) -> List[str]:
-    source = io.BytesIO(data_bytes)
-    source.seek(0)
-    return pd.ExcelFile(source).sheet_names
-
-
-def read_sheet_names(upload: Any) -> List[str]:
-    """Return sheet names for the provided workbook upload."""
-
-    file_name, suffix, data_bytes = _normalize_upload(upload)
-    if data_bytes is not None:
-        return _read_sheet_names_cached(file_name, suffix, data_bytes)
-
-    try:
-        if hasattr(upload, "seek"):
-            upload.seek(0)
-    except Exception:
-        pass
-    return pd.ExcelFile(upload).sheet_names
-
 def apply_master_mapping(master: WorkbookData, target: WorkbookData) -> None:
     """Copy mapping and align it with target workbook headers by column name."""
 
@@ -5975,13 +5836,6 @@ def mapping_ui(
     section_key_input = section_id if section_id is not None else f"{wb.name}__{section_title}"
     section_key = _normalize_key_part(section_key_input)
 
-    def _autodetect_signature(raw_df: pd.DataFrame) -> Optional[Tuple[int, int, int]]:
-        if not isinstance(raw_df, pd.DataFrame) or raw_df.empty:
-            return None
-        sample = raw_df.head(15).astype(str).applymap(normalize_col)
-        sample_hash = int(pd.util.hash_pandas_object(sample, index=True).sum())
-        return (int(raw_df.shape[0]), int(raw_df.shape[1]), sample_hash)
-
     for tab, (sheet, obj) in zip(tabs, wb.sheets.items()):
         use_minimal = minimal or (minimal_sheets is not None and sheet in minimal_sheets)
         with tab:
@@ -5989,52 +5843,16 @@ def mapping_ui(
             raw = obj.get("raw")
             header_row = obj.get("header_row", -1)
             stored_mapping = obj.get("mapping", {}).copy()
-            if isinstance(raw, pd.DataFrame) and not stored_mapping:
-                signature = _autodetect_signature(raw)
-                autodetect_failed = bool(obj.get("autodetect_failed"))
-                prev_signature = obj.get("autodetect_signature")
-                should_autodetect = (not autodetect_failed) or (signature != prev_signature)
-                detected_mapping: Dict[str, int] = {}
-                detected_header_row = -1
-                if should_autodetect:
-                    detected_mapping, detected_header_row, _ = try_autodetect_mapping(raw)
-                    if not detected_mapping:
-                        fallback = raw.copy()
-                        fallback.columns = fallback.columns.astype(str)
-                        composed = pd.concat(
-                            [fallback.columns.to_frame().T, fallback], ignore_index=True
-                        )
-                        detected_mapping, detected_header_row, _ = try_autodetect_mapping(
-                            composed
-                        )
-                if (
-                    detected_mapping
-                    and isinstance(detected_header_row, (int, np.integer))
-                    and detected_header_row >= 0
-                ):
-                    stored_mapping = detected_mapping.copy()
-                    header_row = int(detected_header_row)
-                    obj["autodetect_failed"] = False
-                    obj["autodetect_signature"] = signature
-                elif should_autodetect:
-                    obj["autodetect_failed"] = True
-                    obj["autodetect_signature"] = signature
             prev_header = header_row
-            preview_rows = 10
-            if isinstance(raw, pd.DataFrame) and len(raw) > 0:
-                preview_rows = max(10, min(25, len(raw)))
-            hdr_preview = raw.head(preview_rows) if isinstance(raw, pd.DataFrame) else None
+            hdr_preview = raw.head(10) if isinstance(raw, pd.DataFrame) else None
             if hdr_preview is not None:
                 show_df(hdr_preview)
-            max_header_row = 9
-            if isinstance(raw, pd.DataFrame) and len(raw) > 0:
-                max_header_row = max(0, min(len(raw) - 1, 200))
             # Header row selector
             sheet_key = _normalize_key_part(sheet)
             header_row = st.number_input(
                 f"Řádek s hlavičkou (0 = první řádek) — {sheet}",
                 min_value=0,
-                max_value=max_header_row,
+                max_value=9,
                 value=header_row if header_row >= 0 else 0,
                 step=1,
                 key=make_widget_key("hdr", section_key, sheet_key),
@@ -6048,17 +5866,6 @@ def mapping_ui(
             else:
                 header_names = obj.get("header_names", [])
             header_names = [normalize_col(x) for x in header_names]
-
-            if (
-                not isinstance(raw, pd.DataFrame)
-                or raw.empty
-                or not header_names
-            ):
-                st.warning("List nelze automaticky namapovat, přeskočeno.")
-                wb.sheets[sheet]["mapping"] = {}
-                wb.sheets[sheet]["table"] = pd.DataFrame()
-                wb.sheets[sheet]["_changed"] = False
-                continue
 
             header_lookup: Dict[str, int] = {}
             for idx, name in enumerate(header_names):
@@ -6116,14 +5923,9 @@ def mapping_ui(
                 ):
                     return int(stored_value)
                 hints = HEADER_HINTS.get(key, [])
-                if not hints:
-                    return 0
-                hint_patterns = build_header_hint_patterns({key: hints})
-                row = pd.Series(header_names)
-                detected = detect_header_mapping(row, hint_patterns)
-                matched_idx = detected.get(key)
-                if matched_idx is not None and 0 <= matched_idx < len(header_names):
-                    return int(matched_idx)
+                for i, col in enumerate(header_names):
+                    if any(p in col for p in hints):
+                        return i
                 return 0
 
             def clamp(idx: Any) -> int:
@@ -6338,8 +6140,6 @@ def mapping_ui(
             mapping_changed = (ui_mapping != prev_mapping) or (header_row != prev_header)
             wb.sheets[sheet]["_changed"] = mapping_changed
             changed_any = changed_any or mapping_changed
-            if mapping_changed:
-                trigger_rerun()
 
             st.markdown("**Normalizovaná tabulka (náhled):**")
             show_df(table.head(50))
@@ -7492,7 +7292,6 @@ def run_supplier_only_comparison(
     )
 
     stored_bid_entries = offer_storage.list_bids()
-    stored_bid_names = {entry["name"] for entry in stored_bid_entries}
     bid_files: List[Any] = []
     if project_storage and project_id and round_id and prefill_round_inputs:
         try:
@@ -7520,16 +7319,8 @@ def run_supplier_only_comparison(
         if len(uploaded_bids) > 7:
             st.sidebar.warning("Zpracuje se pouze prvních 7 souborů.")
             uploaded_bids = uploaded_bids[:7]
-        bid_upload_hashes = st.session_state.setdefault("supplier_only_bid_upload_hashes", {})
         for file_obj in uploaded_bids:
-            bid_name = getattr(file_obj, "name", "Bid.xlsx")
-            bid_hash = hash_fileobj(file_obj)
-            if (
-                bid_upload_hashes.get(bid_name) != bid_hash
-                or bid_name not in stored_bid_names
-            ):
-                offer_storage.save_bid(file_obj)
-                bid_upload_hashes[bid_name] = bid_hash
+            offer_storage.save_bid(file_obj)
             bid_files.append(file_obj)
 
     if stored_bid_entries:
@@ -9758,8 +9549,6 @@ if comparison_mode == "Porovnání nabídek bez Master BoQ":
 
 stored_master_entries = offer_storage.list_master()
 stored_bid_entries = offer_storage.list_bids()
-stored_master_names = {entry["name"] for entry in stored_master_entries}
-stored_bid_names = {entry["name"] for entry in stored_bid_entries}
 
 st.sidebar.header("Vstupy")
 st.sidebar.caption(
@@ -9787,16 +9576,7 @@ uploaded_master = st.sidebar.file_uploader(
     "Master BoQ (.xlsx/.xlsm)", type=["xlsx", "xlsm"], key="master"
 )
 if uploaded_master is not None:
-    master_name = getattr(uploaded_master, "name", "Master.xlsx")
-    master_hash = hash_fileobj(uploaded_master)
-    master_fingerprint = (master_name, master_hash)
-    if (
-        st.session_state.get("master_upload_fingerprint") != master_fingerprint
-        or master_name not in stored_master_names
-    ):
-        saved_name = offer_storage.save_master(uploaded_master)
-        stored_master_names.add(saved_name)
-        st.session_state["master_upload_fingerprint"] = master_fingerprint
+    offer_storage.save_master(uploaded_master)
     master_file = uploaded_master
 else:
     master_file = round_loaded_master
@@ -9820,17 +9600,8 @@ if uploaded_bids:
     if len(uploaded_bids) > 7:
         st.sidebar.warning("Zpracuje se pouze prvních 7 souborů.")
         uploaded_bids = uploaded_bids[:7]
-    bid_upload_hashes = st.session_state.setdefault("bid_upload_hashes", {})
     for file_obj in uploaded_bids:
-        bid_name = getattr(file_obj, "name", "Bid.xlsx")
-        bid_hash = hash_fileobj(file_obj)
-        if (
-            bid_upload_hashes.get(bid_name) != bid_hash
-            or bid_name not in stored_bid_names
-        ):
-            saved_name = offer_storage.save_bid(file_obj)
-            stored_bid_names.add(saved_name)
-            bid_upload_hashes[bid_name] = bid_hash
+        offer_storage.save_bid(file_obj)
         bid_files.append(file_obj)
 
 selected_stored_bids: List[str] = []
@@ -9995,9 +9766,11 @@ if not master_file:
     st.stop()
 
 # Determine sheet names without loading all sheets
-all_sheets = read_sheet_names(master_file)
+master_xl = pd.ExcelFile(master_file)
+all_sheets = master_xl.sheet_names
 
 # User selections for comparison and overview
+compare_sheets = st.sidebar.multiselect("Listy pro porovnání", all_sheets, default=all_sheets)
 default_overview = (
     "Přehled_dílčí kapitoly"
     if "Přehled_dílčí kapitoly" in all_sheets
@@ -10008,18 +9781,6 @@ overview_sheet = st.sidebar.selectbox(
     all_sheets,
     index=all_sheets.index(default_overview) if default_overview in all_sheets else 0,
 )
-default_compare = [sheet for sheet in all_sheets if sheet != overview_sheet]
-compare_sheets_raw = st.sidebar.multiselect(
-    "Listy pro porovnání",
-    all_sheets,
-    default=default_compare,
-)
-compare_sheets = [sheet for sheet in compare_sheets_raw if sheet != overview_sheet]
-if overview_sheet in compare_sheets_raw:
-    st.sidebar.warning(
-        "List zvolený pro rekapitulaci se neporovnává s položkami. "
-        "Pro porovnání detailů vyber jiné listy."
-    )
 
 # Read master only for selected comparison sheets
 master_file.seek(0)
