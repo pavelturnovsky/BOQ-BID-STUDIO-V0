@@ -5733,6 +5733,28 @@ def _read_workbook_loader(upload, limit_sheets: Optional[List[str]] = None) -> W
 def read_workbook(upload, limit_sheets: Optional[List[str]] = None) -> WorkbookData:
     return _read_workbook_loader(upload, limit_sheets)
 
+
+@st.cache_data
+def _read_sheet_names_cached(file_name: str, suffix: str, data_bytes: bytes) -> List[str]:
+    source = io.BytesIO(data_bytes)
+    source.seek(0)
+    return pd.ExcelFile(source).sheet_names
+
+
+def read_sheet_names(upload: Any) -> List[str]:
+    """Return sheet names for the provided workbook upload."""
+
+    file_name, suffix, data_bytes = _normalize_upload(upload)
+    if data_bytes is not None:
+        return _read_sheet_names_cached(file_name, suffix, data_bytes)
+
+    try:
+        if hasattr(upload, "seek"):
+            upload.seek(0)
+    except Exception:
+        pass
+    return pd.ExcelFile(upload).sheet_names
+
 def apply_master_mapping(master: WorkbookData, target: WorkbookData) -> None:
     """Copy mapping and align it with target workbook headers by column name."""
 
@@ -9850,8 +9872,7 @@ if not master_file:
     st.stop()
 
 # Determine sheet names without loading all sheets
-master_xl = pd.ExcelFile(master_file)
-all_sheets = master_xl.sheet_names
+all_sheets = read_sheet_names(master_file)
 
 # User selections for comparison and overview
 compare_sheets = st.sidebar.multiselect("Listy pro porovnání", all_sheets, default=all_sheets)
