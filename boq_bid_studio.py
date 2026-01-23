@@ -3150,8 +3150,50 @@ class OfferStorage:
         suffix = Path(display_name).suffix or ".bin"
         return self._category_dir(category) / f"{digest}{suffix}"
 
-    def _write_file(self, category: str, display_name: str, file_obj: Any) -> Path:
+    def _get_entry_hash(self, category: str, meta: Mapping[str, Any]) -> Optional[str]:
+        stored_hash = meta.get("hash")
+        if isinstance(stored_hash, str) and stored_hash:
+            return stored_hash
+        path = self._category_dir(category) / str(meta.get("path", ""))
+        if not path.exists():
+            return None
+        try:
+            return hashlib.sha1(path.read_bytes()).hexdigest()
+        except OSError:
+            return None
+
+    def _ensure_unique_name(self, category: str, display_name: str, file_hash: str) -> str:
         entries = self._index.setdefault(category, {})
+        existing = entries.get(display_name)
+        if not existing:
+            return display_name
+        existing_hash = self._get_entry_hash(category, existing)
+        if existing_hash:
+            existing["hash"] = existing_hash
+        if existing_hash == file_hash:
+            return display_name
+
+        base = Path(display_name)
+        stem = base.stem or display_name
+        suffix = base.suffix
+        short_hash = file_hash[:8]
+        candidate = f"{stem} ({short_hash}){suffix}"
+        counter = 2
+        while True:
+            meta = entries.get(candidate)
+            if not meta:
+                return candidate
+            meta_hash = self._get_entry_hash(category, meta)
+            if meta_hash == file_hash:
+                return candidate
+            candidate = f"{stem} ({short_hash}) {counter}{suffix}"
+            counter += 1
+
+    def _write_file(self, category: str, display_name: str, file_obj: Any) -> str:
+        entries = self._index.setdefault(category, {})
+        data = read_file_bytes(file_obj)
+        file_hash = hashlib.sha1(data).hexdigest()
+        display_name = self._ensure_unique_name(category, display_name, file_hash)
         existing = entries.get(display_name)
         dest = self._path_for(category, display_name)
         if existing:
@@ -3161,11 +3203,14 @@ class OfferStorage:
                     old_path.unlink()
                 except OSError:
                     pass
-        data = read_file_bytes(file_obj)
         dest.write_bytes(data)
-        entries[display_name] = {"path": dest.name, "updated_at": time.time()}
+        entries[display_name] = {
+            "path": dest.name,
+            "updated_at": time.time(),
+            "hash": file_hash,
+        }
         self._write_index()
-        return dest
+        return display_name
 
     def _load_file(self, category: str, display_name: str) -> io.BytesIO:
         entries = self._index.get(category, {})
@@ -3212,18 +3257,15 @@ class OfferStorage:
 
     def save_master(self, file_obj: Any, *, display_name: Optional[str] = None) -> str:
         name = display_name or getattr(file_obj, "name", "Master.xlsx")
-        self._write_file("master", name, file_obj)
-        return name
+        return self._write_file("master", name, file_obj)
 
     def save_bid(self, file_obj: Any, *, display_name: Optional[str] = None) -> str:
         name = display_name or getattr(file_obj, "name", "Bid.xlsx")
-        self._write_file("bids", name, file_obj)
-        return name
+        return self._write_file("bids", name, file_obj)
 
     def save_template(self, file_obj: Any, *, display_name: Optional[str] = None) -> str:
         name = display_name or getattr(file_obj, "name", "Template.xlsx")
-        self._write_file("templates", name, file_obj)
-        return name
+        return self._write_file("templates", name, file_obj)
 
     def load_master(self, display_name: str) -> io.BytesIO:
         return self._load_file("master", display_name)
@@ -5978,15 +6020,21 @@ def mapping_ui(
                     obj["autodetect_failed"] = True
                     obj["autodetect_signature"] = signature
             prev_header = header_row
-            hdr_preview = raw.head(10) if isinstance(raw, pd.DataFrame) else None
+            preview_rows = 10
+            if isinstance(raw, pd.DataFrame) and len(raw) > 0:
+                preview_rows = max(10, min(25, len(raw)))
+            hdr_preview = raw.head(preview_rows) if isinstance(raw, pd.DataFrame) else None
             if hdr_preview is not None:
                 show_df(hdr_preview)
+            max_header_row = 9
+            if isinstance(raw, pd.DataFrame) and len(raw) > 0:
+                max_header_row = max(0, min(len(raw) - 1, 200))
             # Header row selector
             sheet_key = _normalize_key_part(sheet)
             header_row = st.number_input(
                 f"Řádek s hlavičkou (0 = první řádek) — {sheet}",
                 min_value=0,
-                max_value=9,
+                max_value=max_header_row,
                 value=header_row if header_row >= 0 else 0,
                 step=1,
                 key=make_widget_key("hdr", section_key, sheet_key),
@@ -9746,7 +9794,8 @@ if uploaded_master is not None:
         st.session_state.get("master_upload_fingerprint") != master_fingerprint
         or master_name not in stored_master_names
     ):
-        offer_storage.save_master(uploaded_master)
+        saved_name = offer_storage.save_master(uploaded_master)
+        stored_master_names.add(saved_name)
         st.session_state["master_upload_fingerprint"] = master_fingerprint
     master_file = uploaded_master
 else:
@@ -9779,7 +9828,8 @@ if uploaded_bids:
             bid_upload_hashes.get(bid_name) != bid_hash
             or bid_name not in stored_bid_names
         ):
-            offer_storage.save_bid(file_obj)
+            saved_name = offer_storage.save_bid(file_obj)
+            stored_bid_names.add(saved_name)
             bid_upload_hashes[bid_name] = bid_hash
         bid_files.append(file_obj)
 
