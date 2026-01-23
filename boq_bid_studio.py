@@ -5919,6 +5919,13 @@ def mapping_ui(
     section_key_input = section_id if section_id is not None else f"{wb.name}__{section_title}"
     section_key = _normalize_key_part(section_key_input)
 
+    def _autodetect_signature(raw_df: pd.DataFrame) -> Optional[Tuple[int, int, int]]:
+        if not isinstance(raw_df, pd.DataFrame) or raw_df.empty:
+            return None
+        sample = raw_df.head(15).astype(str).applymap(normalize_col)
+        sample_hash = int(pd.util.hash_pandas_object(sample, index=True).sum())
+        return (int(raw_df.shape[0]), int(raw_df.shape[1]), sample_hash)
+
     for tab, (sheet, obj) in zip(tabs, wb.sheets.items()):
         use_minimal = minimal or (minimal_sheets is not None and sheet in minimal_sheets)
         with tab:
@@ -5927,14 +5934,23 @@ def mapping_ui(
             header_row = obj.get("header_row", -1)
             stored_mapping = obj.get("mapping", {}).copy()
             if isinstance(raw, pd.DataFrame) and not stored_mapping:
-                detected_mapping, detected_header_row, _ = try_autodetect_mapping(raw)
-                if not detected_mapping:
-                    fallback = raw.copy()
-                    fallback.columns = fallback.columns.astype(str)
-                    composed = pd.concat(
-                        [fallback.columns.to_frame().T, fallback], ignore_index=True
-                    )
-                    detected_mapping, detected_header_row, _ = try_autodetect_mapping(composed)
+                signature = _autodetect_signature(raw)
+                autodetect_failed = bool(obj.get("autodetect_failed"))
+                prev_signature = obj.get("autodetect_signature")
+                should_autodetect = (not autodetect_failed) or (signature != prev_signature)
+                detected_mapping: Dict[str, int] = {}
+                detected_header_row = -1
+                if should_autodetect:
+                    detected_mapping, detected_header_row, _ = try_autodetect_mapping(raw)
+                    if not detected_mapping:
+                        fallback = raw.copy()
+                        fallback.columns = fallback.columns.astype(str)
+                        composed = pd.concat(
+                            [fallback.columns.to_frame().T, fallback], ignore_index=True
+                        )
+                        detected_mapping, detected_header_row, _ = try_autodetect_mapping(
+                            composed
+                        )
                 if (
                     detected_mapping
                     and isinstance(detected_header_row, (int, np.integer))
@@ -5942,6 +5958,11 @@ def mapping_ui(
                 ):
                     stored_mapping = detected_mapping.copy()
                     header_row = int(detected_header_row)
+                    obj["autodetect_failed"] = False
+                    obj["autodetect_signature"] = signature
+                elif should_autodetect:
+                    obj["autodetect_failed"] = True
+                    obj["autodetect_signature"] = signature
             prev_header = header_row
             hdr_preview = raw.head(10) if isinstance(raw, pd.DataFrame) else None
             if hdr_preview is not None:
@@ -9875,7 +9896,6 @@ if not master_file:
 all_sheets = read_sheet_names(master_file)
 
 # User selections for comparison and overview
-compare_sheets = st.sidebar.multiselect("Listy pro porovnání", all_sheets, default=all_sheets)
 default_overview = (
     "Přehled_dílčí kapitoly"
     if "Přehled_dílčí kapitoly" in all_sheets
@@ -9886,6 +9906,18 @@ overview_sheet = st.sidebar.selectbox(
     all_sheets,
     index=all_sheets.index(default_overview) if default_overview in all_sheets else 0,
 )
+default_compare = [sheet for sheet in all_sheets if sheet != overview_sheet]
+compare_sheets_raw = st.sidebar.multiselect(
+    "Listy pro porovnání",
+    all_sheets,
+    default=default_compare,
+)
+compare_sheets = [sheet for sheet in compare_sheets_raw if sheet != overview_sheet]
+if overview_sheet in compare_sheets_raw:
+    st.sidebar.warning(
+        "List zvolený pro rekapitulaci se neporovnává s položkami. "
+        "Pro porovnání detailů vyber jiné listy."
+    )
 
 # Read master only for selected comparison sheets
 master_file.seek(0)
