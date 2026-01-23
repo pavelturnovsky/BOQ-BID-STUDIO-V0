@@ -3386,11 +3386,15 @@ class ProjectStorageManager:
             self._load_metadata(self._metadata_path(self._project_dir(project_id)))
         )
 
-    def touch_project_last_opened(self, project_id: str) -> Dict[str, Any]:
+    def touch_project_last_opened(self, project_id: str, *, min_interval: int = 60) -> Dict[str, Any]:
         meta = self.load_project(project_id)
         if not meta:
             return {}
-        meta["last_opened_at"] = time.time()
+        now = time.time()
+        last_opened = meta.get("last_opened_at")
+        if isinstance(last_opened, (int, float)) and now - float(last_opened) < min_interval:
+            return meta
+        meta["last_opened_at"] = now
         self._write_metadata(self._metadata_path(self._project_dir(project_id)), meta)
         return meta
 
@@ -7440,6 +7444,7 @@ def run_supplier_only_comparison(
     )
 
     stored_bid_entries = offer_storage.list_bids()
+    stored_bid_names = {entry["name"] for entry in stored_bid_entries}
     bid_files: List[Any] = []
     if project_storage and project_id and round_id and prefill_round_inputs:
         try:
@@ -7467,8 +7472,16 @@ def run_supplier_only_comparison(
         if len(uploaded_bids) > 7:
             st.sidebar.warning("Zpracuje se pouze prvních 7 souborů.")
             uploaded_bids = uploaded_bids[:7]
+        bid_upload_hashes = st.session_state.setdefault("supplier_only_bid_upload_hashes", {})
         for file_obj in uploaded_bids:
-            offer_storage.save_bid(file_obj)
+            bid_name = getattr(file_obj, "name", "Bid.xlsx")
+            bid_hash = hash_fileobj(file_obj)
+            if (
+                bid_upload_hashes.get(bid_name) != bid_hash
+                or bid_name not in stored_bid_names
+            ):
+                offer_storage.save_bid(file_obj)
+                bid_upload_hashes[bid_name] = bid_hash
             bid_files.append(file_obj)
 
     if stored_bid_entries:
