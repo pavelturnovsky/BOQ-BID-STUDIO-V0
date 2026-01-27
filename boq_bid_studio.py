@@ -70,6 +70,29 @@ def trigger_rerun() -> None:
     raise AttributeError("Streamlit rerun function is not available")
 
 
+def build_comparison_fingerprint(
+    master_file: Optional[Any],
+    bid_files: Sequence[Any],
+    compare_sheets: Sequence[str],
+    overview_sheet: str,
+) -> Tuple[Any, ...]:
+    """Return a tuple fingerprint for workbook inputs and sheet selection."""
+
+    master_hash = hash_fileobj(master_file) if master_file is not None else None
+    bid_hashes: List[Optional[str]] = []
+    for bid in bid_files:
+        try:
+            bid_hashes.append(hash_fileobj(bid))
+        except Exception:
+            bid_hashes.append(getattr(bid, "name", None))
+    return (
+        master_hash,
+        tuple(bid_hashes),
+        tuple(compare_sheets),
+        overview_sheet,
+    )
+
+
 def generate_stable_id(prefix: str = "id") -> str:
     """Return a stable-ish identifier for projects, rounds or snapshots."""
 
@@ -5317,6 +5340,52 @@ def show_df(df: pd.DataFrame) -> None:
         display_col = rename_map.get(orig_col, orig_col)
         presence_display[display_col] = series.reindex(df_to_show.index).fillna(False)
 
+    def _needs_sanitization(series: pd.Series) -> bool:
+        if pd.api.types.is_numeric_dtype(series) or pd.api.types.is_bool_dtype(series):
+            return False
+        if pd.api.types.is_datetime64_any_dtype(series) or pd.api.types.is_timedelta64_dtype(series):
+            return False
+
+        observed_types: Set[type] = set()
+        for value in series:
+            if pd.isna(value):
+                continue
+            observed_types.add(type(value))
+            if isinstance(value, (Mapping, Sequence)) and not isinstance(
+                value, (str, bytes, bytearray)
+            ):
+                return True
+        safe_types: Set[type] = {
+            str,
+            bytes,
+            bytearray,
+            datetime,
+            date,
+            float,
+            int,
+            np.generic,
+        }
+        if len([t for t in observed_types if t not in safe_types]) > 0:
+            return True
+        return len(observed_types) > 1 and not observed_types.issubset({str})
+
+    def _sanitize_value(value: Any) -> Any:
+        if pd.isna(value):
+            return value
+        if isinstance(value, (Mapping, Sequence)) and not isinstance(
+            value, (str, bytes, bytearray)
+        ):
+            try:
+                return json.dumps(value, ensure_ascii=False)
+            except TypeError:
+                return json.dumps(str(value), ensure_ascii=False)
+        return str(value)
+
+    for column in df_to_show.columns:
+        series = df_to_show[column]
+        if _needs_sanitization(series):
+            df_to_show[column] = series.apply(_sanitize_value)
+
     numeric_cols = df_to_show.select_dtypes(include=[np.number]).columns
     column_widths = compute_display_column_widths(df_to_show)
     column_config = {
@@ -5433,54 +5502,11 @@ def show_df(df: pd.DataFrame) -> None:
         st.dataframe(df_to_show, **display_kwargs)
         return
 
-    unsupported_columns: List[str] = []
-
-    def _needs_sanitization(series: pd.Series) -> bool:
-        if pd.api.types.is_numeric_dtype(series) or pd.api.types.is_bool_dtype(series):
-            return False
-        if pd.api.types.is_datetime64_any_dtype(series) or pd.api.types.is_timedelta64_dtype(series):
-            return False
-
-        observed_types: Set[type] = set()
-        for value in series:
-            if pd.isna(value):
-                continue
-            observed_types.add(type(value))
-            if isinstance(value, (Mapping, Sequence)) and not isinstance(
-                value, (str, bytes, bytearray)
-            ):
-                return True
-        safe_types: Set[type] = {
-            str,
-            bytes,
-            bytearray,
-            datetime,
-            date,
-            float,
-            int,
-            np.generic,
-        }
-        if len([t for t in observed_types if t not in safe_types]) > 0:
-            return True
-        return len(observed_types) > 1 and not observed_types.issubset({str})
-
-    def _sanitize_value(value: Any) -> Any:
-        if pd.isna(value):
-            return value
-        if isinstance(value, (Mapping, Sequence)) and not isinstance(
-            value, (str, bytes, bytearray)
-        ):
-            try:
-                return json.dumps(value, ensure_ascii=False)
-            except TypeError:
-                return json.dumps(str(value), ensure_ascii=False)
-        return str(value)
-
-    for column in df_to_show.columns:
-        series = df_to_show[column]
-        if _needs_sanitization(series):
-            unsupported_columns.append(str(column))
-            df_to_show[column] = series.apply(_sanitize_value)
+    unsupported_columns = [
+        str(column)
+        for column in df_to_show.columns
+        if _needs_sanitization(df_to_show[column])
+    ]
 
     if unsupported_columns:
         logging.getLogger(__name__).warning(
@@ -9836,42 +9862,68 @@ overview_sheet = st.sidebar.selectbox(
     index=all_sheets.index(default_overview) if default_overview in all_sheets else 0,
 )
 
-# Read master only for selected comparison sheets
-master_file.seek(0)
-master_wb = read_workbook(master_file, limit_sheets=compare_sheets)
+if len(bid_files) > 7:
+    st.sidebar.warning("Zpracuje se pouze prvních 7 souborů.")
+    bid_files = bid_files[:7]
 
-# If overview sheet not among comparison sheets, load separately
-if overview_sheet in compare_sheets:
-    master_overview_wb = WorkbookData(
-        name=master_wb.name, sheets={overview_sheet: master_wb.sheets[overview_sheet]}
-    )
-else:
-    master_file.seek(0)
-    master_overview_wb = read_workbook(master_file, limit_sheets=[overview_sheet])
+comparison_fingerprint = build_comparison_fingerprint(
+    master_file, bid_files, compare_sheets, overview_sheet
+)
+comparison_cache = st.session_state.get("comparison_cache")
+cache_valid = (
+    isinstance(comparison_cache, dict)
+    and comparison_cache.get("fingerprint") == comparison_fingerprint
+)
 
-# Read bids for comparison sheets and overview sheet separately
-bids_dict: Dict[str, WorkbookData] = {}
-bids_overview_dict: Dict[str, WorkbookData] = {}
-if bid_files:
-    if len(bid_files) > 7:
-        st.sidebar.warning("Zpracuje se pouze prvních 7 souborů.")
-        bid_files = bid_files[:7]
-    for i, f in enumerate(bid_files, start=1):
-        name = getattr(f, "name", f"Bid{i}")
-        f.seek(0)
-        wb_comp = read_workbook(f, limit_sheets=compare_sheets)
-        apply_master_mapping(master_wb, wb_comp)
-        bids_dict[name] = wb_comp
+if not cache_valid:
+    with st.spinner("Načítám data pro porovnání..."):
+        # Read master only for selected comparison sheets
+        master_file.seek(0)
+        master_wb = read_workbook(master_file, limit_sheets=compare_sheets)
 
+        # If overview sheet not among comparison sheets, load separately
         if overview_sheet in compare_sheets:
-            wb_over = WorkbookData(
-                name=wb_comp.name, sheets={overview_sheet: wb_comp.sheets.get(overview_sheet, {})}
+            master_overview_wb = WorkbookData(
+                name=master_wb.name, sheets={overview_sheet: master_wb.sheets[overview_sheet]}
             )
         else:
-            f.seek(0)
-            wb_over = read_workbook(f, limit_sheets=[overview_sheet])
-            apply_master_mapping(master_overview_wb, wb_over)
-        bids_overview_dict[name] = wb_over
+            master_file.seek(0)
+            master_overview_wb = read_workbook(master_file, limit_sheets=[overview_sheet])
+
+        # Read bids for comparison sheets and overview sheet separately
+        bids_dict: Dict[str, WorkbookData] = {}
+        bids_overview_dict: Dict[str, WorkbookData] = {}
+        if bid_files:
+            for i, f in enumerate(bid_files, start=1):
+                name = getattr(f, "name", f"Bid{i}")
+                f.seek(0)
+                wb_comp = read_workbook(f, limit_sheets=compare_sheets)
+                apply_master_mapping(master_wb, wb_comp)
+                bids_dict[name] = wb_comp
+
+                if overview_sheet in compare_sheets:
+                    wb_over = WorkbookData(
+                        name=wb_comp.name,
+                        sheets={overview_sheet: wb_comp.sheets.get(overview_sheet, {})},
+                    )
+                else:
+                    f.seek(0)
+                    wb_over = read_workbook(f, limit_sheets=[overview_sheet])
+                    apply_master_mapping(master_overview_wb, wb_over)
+                bids_overview_dict[name] = wb_over
+
+        st.session_state["comparison_cache"] = {
+            "fingerprint": comparison_fingerprint,
+            "master_wb": master_wb,
+            "master_overview_wb": master_overview_wb,
+            "bids_dict": bids_dict,
+            "bids_overview_dict": bids_overview_dict,
+        }
+else:
+    master_wb = comparison_cache["master_wb"]
+    master_overview_wb = comparison_cache["master_overview_wb"]
+    bids_dict = comparison_cache.get("bids_dict", {})
+    bids_overview_dict = comparison_cache.get("bids_overview_dict", {})
 
 # Manage supplier aliases and colors
 display_names: Dict[str, str] = {}
@@ -10567,11 +10619,14 @@ with tab_preview:
             )
 
             try:
-                components.html(
-                    script,
-                    height=1,
-                    key=f"preview_sync_script_{widget_suffix}",
-                )
+                try:
+                    components.html(
+                        script,
+                        height=1,
+                        key=f"preview_sync_script_{widget_suffix}",
+                    )
+                except TypeError:
+                    components.html(script, height=1)
             except Exception as exc:  # pragma: no cover - guard against Streamlit quirks
                 logging.getLogger(__name__).warning(
                     "Failed to initialize preview scroll sync for %s: %s",
