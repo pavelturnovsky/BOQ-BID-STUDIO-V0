@@ -4437,7 +4437,7 @@ def is_summary_like_row(df: pd.DataFrame) -> pd.Series:
 
     desc = df.get("description", pd.Series("", index=index, dtype="object")).fillna("").astype(str)
     pattern_mask = desc.str.contains(
-        r"(sou[cč]et|celkem|sum[aá]r|subtotal|total)", case=False, na=False
+        r"(?:sou[cč]et|celkem|sum[aá]r|subtotal|total)", case=False, na=False
     )
     code_blank = df.get("code", pd.Series("", index=index, dtype="object")).astype(str).str.strip() == ""
     totals = coerce_numeric(df.get("total_price", np.nan))
@@ -4454,8 +4454,12 @@ def classify_summary_type(df: pd.DataFrame, summary_mask: pd.Series) -> pd.Serie
     """Categorize summary rows into section, grand, or other totals."""
     desc = df.get("description", "").fillna("").astype(str).str.lower()
     summary_type = pd.Series("", index=df.index, dtype="object")
-    section = desc.str.contains(r"(celkem\s*(za)?\s*odd[ií]l|sou[cč]et\s*(za)?\s*odd[ií]l)", na=False)
-    grand = desc.str.contains(r"(celkov[aá] cena|sou[cč]et za list|celkem)", na=False) & ~section
+    section = desc.str.contains(
+        r"(?:celkem\s*(?:za)?\s*odd[ií]l|sou[cč]et\s*(?:za)?\s*odd[ií]l)", na=False
+    )
+    grand = desc.str.contains(
+        r"(?:celkov[aá] cena|sou[cč]et za list|celkem)", na=False
+    ) & ~section
     summary_type.loc[summary_mask & section] = "section"
     summary_type.loc[summary_mask & grand] = "grand"
     summary_type.loc[summary_mask & (summary_type == "")] = "other"
@@ -6379,6 +6383,7 @@ def compare(master: WorkbookData, bids: Dict[str, WorkbookData], join_mode: str 
     """
     results = {}
     sheets = list(master.sheets.keys())
+    overview_cache: Dict[str, pd.DataFrame] = {}
     for sheet in sheets:
         mobj = master.sheets.get(sheet, {})
         mtab = mobj.get("table", pd.DataFrame())
@@ -6657,10 +6662,14 @@ def compare(master: WorkbookData, bids: Dict[str, WorkbookData], join_mode: str 
             comp.attrs.setdefault("supplier_totals", {}).update(supplier_totals)
 
         comp.attrs["master_total_sum"] = master_total_sum
-        try:
-            sections_view, _, _, _, _ = overview_comparison(master, bids, sheet)
-        except Exception:
-            sections_view = pd.DataFrame()
+        if sheet in overview_cache:
+            sections_view = overview_cache[sheet]
+        else:
+            try:
+                sections_view, _, _, _, _ = overview_comparison(master, bids, sheet)
+            except Exception:
+                sections_view = pd.DataFrame()
+            overview_cache[sheet] = sections_view
         if isinstance(sections_view, pd.DataFrame) and not sections_view.empty:
             comp = align_total_columns(comp, sections_view)
         results[sheet] = comp
@@ -6845,9 +6854,11 @@ def overview_comparison(
     master_key_df = pd.DataFrame(
         {
             "__code_key__": mtab.get("code", pd.Series(index=mtab.index, dtype=object))
+            .astype("string")
             .fillna("")
             .astype(str),
             "__desc_key__": mtab.get("description", pd.Series(index=mtab.index, dtype=object))
+            .astype("string")
             .fillna("")
             .astype(str),
         },
@@ -6922,9 +6933,11 @@ def overview_comparison(
             supplier_key_df = pd.DataFrame(
                 {
                     "__code_key__": ttab.get("code", pd.Series(index=ttab.index, dtype=object))
+                    .astype("string")
                     .fillna("")
                     .astype(str),
                     "__desc_key__": ttab.get("description", pd.Series(index=ttab.index, dtype=object))
+                    .astype("string")
                     .fillna("")
                     .astype(str),
                 },
