@@ -313,15 +313,37 @@ HEADER_HINTS = {
         "kod",
         "pol.",
         "regex:^pol$",
+        "pol",
     ],
-    "description": ["description", "popis", "položka", "polozka", "název", "nazev", "specifikace"],
+    "description": [
+        "description",
+        "popis",
+        "popis položky",
+        "popis polozky",
+        "položka",
+        "polozka",
+        "název",
+        "nazev",
+        "specifikace",
+    ],
     "unit": ["unit", "jm", "mj", "jednotka", "uom", "měrná jednotka", "merna jednotka"],
-    "quantity": ["quantity", "qty", "množství", "mnozstvi", "q"],
+    "quantity": [
+        "quantity",
+        "qty",
+        "množství",
+        "mnozstvi",
+        "množství dle projekce",
+        "mnozstvi dle projekce",
+        "q",
+    ],
     # optional extras commonly seen
     "item_id": [
         "celková cena",
         "celkova cena",
+        "celková cena [czk]",
+        "celkova cena [czk]",
         "item id",
+        "item_id",
         "itemid",
         "id položky",
         "id polozky",
@@ -340,10 +362,42 @@ HEADER_HINTS = {
         "qty supplier",
         "quantity supplier",
     ],
-    "unit_price_material": ["cena materiál", "cena material", "unit price material", "materiál", "material"],
-    "unit_price_install": ["cena montáž", "cena montaz", "unit price install", "montáž", "montaz"],
-    "total_price": ["cena celkem", "celková cena", "total price", "celkem"],
-    "summary_total": ["celkem za oddíl", "součet oddíl", "součet za oddíl"],
+    "unit_price_material": [
+        "cena materiál",
+        "cena material",
+        "unit price material",
+        "materiál",
+        "material",
+        "jednotková cena - materiál",
+        "jednotkova cena - material",
+    ],
+    "unit_price_install": [
+        "cena montáž",
+        "cena montaz",
+        "unit price install",
+        "montáž",
+        "montaz",
+        "jednotková cena - montáž",
+        "jednotkova cena - montaz",
+    ],
+    "total_price": [
+        "cena celkem",
+        "celková cena",
+        "celková cena [czk]",
+        "celkkova cena [czk]",
+        "total price",
+        "celkem",
+    ],
+    "summary_total": [
+        "celkem za oddíl",
+        "celkem za oddil",
+        "celkem za oddíl [czk]",
+        "celkem za oddil [czk]",
+        "součet oddíl",
+        "součet oddil",
+        "součet za oddíl",
+        "součet za oddil",
+    ],
 }
 
 # For některé souhrnné listy nemusí být množství dostupné
@@ -5922,7 +5976,7 @@ def mapping_ui(
                     and 0 <= int(stored_value) < len(header_names)
                 ):
                     return int(stored_value)
-                hints = HEADER_HINTS.get(key, [])
+                hints = [normalize_col(h) for h in HEADER_HINTS.get(key, []) if h]
                 for i, col in enumerate(header_names):
                     if any(p in col for p in hints):
                         return i
