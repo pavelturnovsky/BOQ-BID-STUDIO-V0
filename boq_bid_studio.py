@@ -319,11 +319,17 @@ HEADER_HINTS = {
     "quantity": ["quantity", "qty", "množství", "mnozstvi", "q"],
     # optional extras commonly seen
     "item_id": [
+        "celková cena",
+        "celkova cena",
         "item id",
         "itemid",
         "id položky",
         "id polozky",
+        "číslo položky",
+        "cislo polozky",
         "regex:^id$",
+        "kod",
+        "kód",
     ],
     # extended optional columns for richer comparisons
     "quantity_supplier": [
@@ -4233,11 +4239,6 @@ def try_autodetect_mapping(df: pd.DataFrame) -> Tuple[Dict[str, int], int, pd.Da
 
     mappings = sample.apply(detect_row, axis=1)
     for header_row, mapping in mappings.items():
-        if "item_id" in mapping:
-            item_idx = mapping.get("item_id")
-            conflict_keys = {"code", "total_price", "quantity"}
-            if any(mapping.get(key) == item_idx for key in conflict_keys):
-                mapping.pop("item_id", None)
         if set(REQUIRED_KEYS).issubset(mapping.keys()):
             body = df.iloc[header_row + 1:].reset_index(drop=True)
             body.columns = [normalize_col(x) for x in df.iloc[header_row].tolist()]
@@ -5773,10 +5774,6 @@ def apply_master_mapping(master: WorkbookData, target: WorkbookData) -> None:
                 continue
             header_lookup.setdefault(name, idx)
 
-        previous_header_names = [
-            normalize_col(x) for x in target_sheet.get("header_names", []) or []
-        ]
-
         previous_mapping = target_sheet.get("mapping", {}).copy()
         all_keys = set(previous_mapping.keys()) | set(master_mapping.keys())
         new_mapping: Dict[str, int] = {}
@@ -5788,14 +5785,8 @@ def apply_master_mapping(master: WorkbookData, target: WorkbookData) -> None:
                 resolved_idx = header_lookup.get(master_col_name, -1)
             if resolved_idx < 0:
                 prev_idx = previous_mapping.get(key, -1)
-                if isinstance(prev_idx, (int, np.integer)):
-                    prev_idx_int = int(prev_idx)
-                    if 0 <= prev_idx_int < len(previous_header_names):
-                        prev_name = previous_header_names[prev_idx_int]
-                        if prev_name:
-                            resolved_idx = header_lookup.get(prev_name, -1)
-                    if resolved_idx < 0 and 0 <= prev_idx_int < len(header):
-                        resolved_idx = prev_idx_int
+                if isinstance(prev_idx, (int, np.integer)) and 0 <= int(prev_idx) < len(header):
+                    resolved_idx = int(prev_idx)
             if resolved_idx < 0:
                 resolved_idx = -1
             new_mapping[key] = resolved_idx
@@ -5875,7 +5866,6 @@ def mapping_ui(
             else:
                 header_names = obj.get("header_names", [])
             header_names = [normalize_col(x) for x in header_names]
-            wb.sheets[sheet]["header_names"] = header_names
 
             header_lookup: Dict[str, int] = {}
             for idx, name in enumerate(header_names):
