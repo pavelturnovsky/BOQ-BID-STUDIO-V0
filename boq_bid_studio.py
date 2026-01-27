@@ -5866,6 +5866,7 @@ def mapping_ui(
             else:
                 header_names = obj.get("header_names", [])
             header_names = [normalize_col(x) for x in header_names]
+            wb.sheets[sheet]["header_names"] = header_names
 
             header_lookup: Dict[str, int] = {}
             for idx, name in enumerate(header_names):
