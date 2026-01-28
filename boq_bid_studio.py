@@ -1,5 +1,6 @@
 
 import hashlib
+from collections import Counter
 import logging
 import functools
 import io
@@ -91,6 +92,15 @@ def build_comparison_fingerprint(
         tuple(compare_sheets),
         overview_sheet,
     )
+
+
+def subset_workbook_sheets(
+    wb: Optional[WorkbookData], sheets: Sequence[str]
+) -> Optional[WorkbookData]:
+    if wb is None:
+        return None
+    selected = {sheet: wb.sheets[sheet] for sheet in sheets if sheet in wb.sheets}
+    return WorkbookData(name=wb.name, sheets=selected)
 
 
 def generate_stable_id(prefix: str = "id") -> str:
@@ -9911,7 +9921,19 @@ master_xl = pd.ExcelFile(master_file)
 all_sheets = master_xl.sheet_names
 
 # User selections for comparison and overview
-compare_sheets = st.sidebar.multiselect("Listy pro porovnání", all_sheets, default=all_sheets)
+default_compare_sheets = (
+    [default_overview]
+    if default_overview and default_overview in all_sheets
+    else ([all_sheets[0]] if all_sheets else [])
+)
+compare_sheets = st.sidebar.multiselect(
+    "Listy pro porovnání",
+    all_sheets,
+    default=default_compare_sheets,
+)
+if not compare_sheets:
+    st.sidebar.warning("Vyber alespoň jeden list pro porovnání.")
+    st.stop()
 default_overview = (
     "Přehled_dílčí kapitoly"
     if "Přehled_dílčí kapitoly" in all_sheets
@@ -9926,6 +9948,38 @@ overview_sheet = st.sidebar.selectbox(
 if len(bid_files) > 7:
     st.sidebar.warning("Zpracuje se pouze prvních 7 souborů.")
     bid_files = bid_files[:7]
+
+bid_file_entries: List[Dict[str, Any]] = []
+if bid_files:
+    raw_bid_names = [
+        getattr(f, "name", f"Bid{i}") for i, f in enumerate(bid_files, start=1)
+    ]
+    duplicate_counts = Counter(raw_bid_names)
+    for i, (f, raw_name) in enumerate(zip(bid_files, raw_bid_names), start=1):
+        label = raw_name
+        if duplicate_counts.get(raw_name, 0) > 1:
+            label = f"{raw_name} ({i})"
+        bid_file_entries.append(
+            {
+                "file": f,
+                "raw_name": raw_name,
+                "label": label,
+            }
+        )
+    selected_bid_labels = st.sidebar.multiselect(
+        "Dodavatelé pro porovnání",
+        [entry["label"] for entry in bid_file_entries],
+        default=[entry["label"] for entry in bid_file_entries],
+        key="compare_bid_selection",
+    )
+    if not selected_bid_labels:
+        st.sidebar.warning("Vyber alespoň jednoho dodavatele pro porovnání.")
+        st.stop()
+    bid_files = [
+        entry["file"]
+        for entry in bid_file_entries
+        if entry["label"] in selected_bid_labels
+    ]
 
 comparison_fingerprint = build_comparison_fingerprint(
     master_file, bid_files, compare_sheets, overview_sheet
@@ -14170,10 +14224,15 @@ with tab_rounds:
                         if "Přehled_dílčí kapitoly" in available_round_sheets
                         else available_round_sheets[0]
                     )
+                    round_default_compare_sheets = (
+                        [default_overview_sheet]
+                        if default_overview_sheet in available_round_sheets
+                        else [available_round_sheets[0]]
+                    )
                     round_compare_sheets = st.multiselect(
                         "Listy pro porovnání",
                         available_round_sheets,
-                        default=available_round_sheets,
+                        default=round_default_compare_sheets,
                         key="rounds_compare_sheets",
                     )
                     if not round_compare_sheets:
@@ -14313,10 +14372,24 @@ with tab_rounds:
 
                         compare_results_round: Dict[str, pd.DataFrame] = {}
                         comparison_datasets_round: Dict[str, ComparisonDataset] = {}
+                        round_calc_sheets = [round_selected_sheet]
                         if reference_mode == "with_master" and master_wb_round is not None:
-                            raw_compare_round = compare(
-                                master_wb_round, bids_dict_round, join_mode="auto"
+                            master_compare_wb = subset_workbook_sheets(
+                                master_wb_round, round_calc_sheets
                             )
+                            bids_compare = {
+                                name: subset_workbook_sheets(wb, round_calc_sheets)
+                                for name, wb in bids_dict_round.items()
+                            }
+                            bids_compare = {
+                                name: wb for name, wb in bids_compare.items() if wb is not None
+                            }
+                            if master_compare_wb is None or not master_compare_wb.sheets:
+                                raw_compare_round = {}
+                            else:
+                                raw_compare_round = compare(
+                                    master_compare_wb, bids_compare, join_mode="auto"
+                                )
                             compare_results_round = {
                                 sheet: rename_comparison_columns(df, display_names_round)
                                 for sheet, df in raw_compare_round.items()
@@ -14328,7 +14401,11 @@ with tab_rounds:
                             comparison_datasets_round = {
                                 round_selected_sheet: build_supplier_only_dataset(
                                     round_selected_sheet,
-                                    bids_dict_round,
+                                    {
+                                        name: wb
+                                        for name, wb in bids_dict_round.items()
+                                        if name in bids_dict_round
+                                    },
                                     display_names_round,
                                 )
                             }
