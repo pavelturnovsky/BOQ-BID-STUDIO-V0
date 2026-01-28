@@ -244,6 +244,45 @@ def normalize_input_hashes(input_hashes: Optional[Mapping[str, str]]) -> Dict[st
     return normalized
 
 
+def _normalize_mapping_state(
+    mapping: Optional[Mapping[str, Any]], header_row: Optional[Any]
+) -> Dict[str, Any]:
+    if not isinstance(mapping, Mapping):
+        mapping = {}
+    normalized_mapping = {
+        str(key): int(value)
+        for key, value in mapping.items()
+        if value is not None and value != ""
+    }
+    return {"mapping": normalized_mapping, "header_row": header_row}
+
+
+def build_mapping_signature(
+    master_wb: Optional["WorkbookData"],
+    bids_dict: Mapping[str, "WorkbookData"],
+    compare_sheets: Sequence[str],
+) -> str:
+    payload: Dict[str, Any] = {"master": {}, "bids": {}}
+    if isinstance(master_wb, WorkbookData):
+        for sheet in compare_sheets:
+            sheet_obj = master_wb.sheets.get(sheet, {})
+            payload["master"][sheet] = _normalize_mapping_state(
+                sheet_obj.get("mapping"), sheet_obj.get("header_row")
+            )
+    for bid_name, wb in bids_dict.items():
+        if not isinstance(wb, WorkbookData):
+            continue
+        sheet_payload: Dict[str, Any] = {}
+        for sheet in compare_sheets:
+            sheet_obj = wb.sheets.get(sheet, {})
+            sheet_payload[sheet] = _normalize_mapping_state(
+                sheet_obj.get("mapping"), sheet_obj.get("header_row")
+            )
+        payload["bids"][bid_name] = sheet_payload
+    payload_bytes = json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
+    return hashlib.sha256(payload_bytes).hexdigest()
+
+
 def compute_config_fingerprint(
     *,
     mode: str,
@@ -324,6 +363,15 @@ def describe_fingerprint_reason(
         reasons.append("Vstupní soubory nejsou shodné")
 
     return reasons
+
+
+def build_compare_cache_key(
+    comparison_fingerprint: Tuple[Any, ...],
+    mapping_signature: str,
+    display_names: Mapping[str, str],
+) -> Tuple[Any, ...]:
+    display_signature = tuple(sorted(display_names.items()))
+    return (comparison_fingerprint, mapping_signature, display_signature)
 
 HEADER_HINTS = {
     "code": [
@@ -11413,17 +11461,45 @@ with tab_preview:
                     key=f"{selected_preview_sheet}_diff_pdf",
                 )
 
-# Pre-compute comparison results for reuse in tabs (after mapping)
+# Comparison modules run on demand to avoid heavy work after mapping
 compare_results: Dict[str, pd.DataFrame] = {}
-if bids_dict:
-    raw_compare_results = compare(master_wb, bids_dict, join_mode="auto")
-    compare_results = {
-        sheet: rename_comparison_columns(df, display_names) for sheet, df in raw_compare_results.items()
-    }
-
 comparison_datasets: Dict[str, ComparisonDataset] = {}
-if compare_results:
-    comparison_datasets = build_comparison_datasets(compare_results)
+mapping_signature = build_mapping_signature(master_wb, bids_dict, compare_sheets)
+compare_cache_key = build_compare_cache_key(
+    comparison_fingerprint, mapping_signature, display_names
+)
+compare_cache = st.session_state.get("compare_results_cache", {})
+if isinstance(compare_cache, dict) and compare_cache.get("fingerprint") != compare_cache_key:
+    st.session_state.pop("compare_results_cache", None)
+    st.session_state["run_compare_modules"] = False
+
+
+def load_compare_payload() -> Tuple[Dict[str, pd.DataFrame], Dict[str, ComparisonDataset]]:
+    cache = st.session_state.get("compare_results_cache", {})
+    if isinstance(cache, dict) and cache.get("fingerprint") == compare_cache_key:
+        return (
+            cache.get("compare_results", {}),
+            cache.get("comparison_datasets", {}),
+        )
+    if not bids_dict:
+        return {}, {}
+    with st.spinner("Počítám porovnání..."):
+        raw_compare_results = compare(master_wb, bids_dict, join_mode="auto")
+        loaded_compare_results = {
+            sheet: rename_comparison_columns(df, display_names)
+            for sheet, df in raw_compare_results.items()
+        }
+        loaded_datasets = (
+            build_comparison_datasets(loaded_compare_results)
+            if loaded_compare_results
+            else {}
+        )
+    st.session_state["compare_results_cache"] = {
+        "fingerprint": compare_cache_key,
+        "compare_results": loaded_compare_results,
+        "comparison_datasets": loaded_datasets,
+    }
+    return loaded_compare_results, loaded_datasets
 
 # Pre-compute rekapitulace results to avoid repeated work in tabs (after mapping)
 recap_results: Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame] = (
@@ -11456,39 +11532,68 @@ if bids_overview_dict:
 with tab_compare:
     if not bids_dict:
         st.info("Nahraj alespoň jednu nabídku dodavatele v levém panelu.")
-    elif not comparison_datasets:
-        st.info("Nebyla nalezena data pro porovnání. Zkontroluj mapování nebo vyber jiné listy.")
     else:
-        available_sheets = [
-            sheet for sheet, dataset in comparison_datasets.items() if not dataset.analysis_df.empty
-        ]
-        if not available_sheets:
-            st.info("Listy určené k porovnání jsou prázdné. Zkontroluj zdrojová data.")
-        else:
-            default_sheet = available_sheets[0]
-            selected_sheet = st.selectbox(
-                "Vyber list pro analýzu",
-                available_sheets,
-                index=available_sheets.index(default_sheet) if default_sheet in available_sheets else 0,
-                key="compare_sheet_select",
+        run_compare = st.session_state.get("run_compare_modules", False)
+        if st.button("▶️ Spustit porovnání", key="run_compare_main"):
+            st.session_state["run_compare_modules"] = True
+            run_compare = True
+        if not run_compare:
+            st.info(
+                "Porovnání zatím není spuštěno. Spusť modul pro načtení výpočtů."
             )
-            dataset = comparison_datasets.get(selected_sheet)
-            if dataset is None or dataset.analysis_df.empty:
-                st.warning("Vybraný list neobsahuje žádné položky k porovnání.")
-            else:
-                st.subheader(f"List: {selected_sheet}")
-                default_range = st.session_state.get("compare_threshold_range", (-10.0, 10.0))
-                threshold_min, threshold_max = st.slider(
-                    "Rozmezí odchylky vs Master (%)",
-                    min_value=-200.0,
-                    max_value=200.0,
-                    value=default_range,
-                    step=0.5,
-                    help="Rozsah procentní odchylky, který se považuje za přijatelný. Hodnoty mimo rozsah budou zvýrazněny.",
-                    key=make_widget_key("compare_threshold", selected_sheet),
+        else:
+            compare_results, comparison_datasets = load_compare_payload()
+            if not comparison_datasets:
+                st.info(
+                    "Nebyla nalezena data pro porovnání. Zkontroluj mapování nebo vyber jiné listy."
                 )
-                st.session_state["compare_threshold_range"] = (threshold_min, threshold_max)
-                analysis_df = dataset.analysis_df.copy()
+            else:
+                available_sheets = [
+                    sheet
+                    for sheet, dataset in comparison_datasets.items()
+                    if not dataset.analysis_df.empty
+                ]
+                if not available_sheets:
+                    st.info(
+                        "Listy určené k porovnání jsou prázdné. Zkontroluj zdrojová data."
+                    )
+                else:
+                    default_sheet = available_sheets[0]
+                    selected_sheet = st.selectbox(
+                        "Vyber list pro analýzu",
+                        available_sheets,
+                        index=available_sheets.index(default_sheet)
+                        if default_sheet in available_sheets
+                        else 0,
+                        key="compare_sheet_select",
+                    )
+                    dataset = comparison_datasets.get(selected_sheet)
+                    if dataset is None or dataset.analysis_df.empty:
+                        st.warning(
+                            "Vybraný list neobsahuje žádné položky k porovnání."
+                        )
+                    else:
+                        st.subheader(f"List: {selected_sheet}")
+                        default_range = st.session_state.get(
+                            "compare_threshold_range", (-10.0, 10.0)
+                        )
+                        threshold_min, threshold_max = st.slider(
+                            "Rozmezí odchylky vs Master (%)",
+                            min_value=-200.0,
+                            max_value=200.0,
+                            value=default_range,
+                            step=0.5,
+                            help=(
+                                "Rozsah procentní odchylky, který se považuje za přijatelný. "
+                                "Hodnoty mimo rozsah budou zvýrazněny."
+                            ),
+                            key=make_widget_key("compare_threshold", selected_sheet),
+                        )
+                        st.session_state["compare_threshold_range"] = (
+                            threshold_min,
+                            threshold_max,
+                        )
+                        analysis_df = dataset.analysis_df.copy()
 
                 available_metric_keys = []
                 for key in COMPARISON_METRIC_ORDER:
@@ -11969,46 +12074,71 @@ with tab_compare:
 with tab_compare2:
     if not bids_dict:
         st.info("Nahraj alespoň jednu nabídku dodavatele v levém panelu.")
-    elif not comparison_datasets:
-        st.info("Nebyla nalezena data pro porovnání. Zkontroluj mapování nebo vyber jiné listy.")
     else:
-        available_sheets = [
-            sheet
-            for sheet, dataset in comparison_datasets.items()
-            if dataset is not None and not dataset.analysis_df.empty
-        ]
-        if not available_sheets:
-            st.info("Listy určené k porovnání jsou prázdné. Zkontroluj zdrojová data.")
+        run_compare = st.session_state.get("run_compare_modules", False)
+        if st.button("▶️ Spustit porovnání", key="run_compare_secondary"):
+            st.session_state["run_compare_modules"] = True
+            run_compare = True
+        if not run_compare:
+            st.info(
+                "Porovnání zatím není spuštěno. Spusť modul pro načtení výpočtů."
+            )
         else:
-            default_sheet = available_sheets[0]
-            sheet_index = (
-                available_sheets.index(default_sheet)
-                if default_sheet in available_sheets
-                else 0
-            )
-            selected_sheet = st.selectbox(
-                "Vyber list pro zobrazení",
-                available_sheets,
-                index=sheet_index,
-                key="compare2_sheet_select",
-            )
-            dataset = comparison_datasets.get(selected_sheet)
-            if dataset is None or dataset.analysis_df.empty:
-                st.warning("Vybraný list neobsahuje žádné položky k zobrazení.")
+            compare_results, comparison_datasets = load_compare_payload()
+            if not comparison_datasets:
+                st.info(
+                    "Nebyla nalezena data pro porovnání. Zkontroluj mapování nebo vyber jiné listy."
+                )
             else:
-                supplier_aliases = [alias for alias in dataset.suppliers if alias]
-                if not supplier_aliases:
-                    st.info("Žádný z dodavatelů neobsahuje data pro vybraný list.")
-                else:
-                    supplier_index = 0 if len(supplier_aliases) else None
-                    selected_supplier = st.selectbox(
-                        "Vyber dodavatele",
-                        supplier_aliases,
-                        index=supplier_index,
-                        key=make_widget_key("compare2_supplier_select", selected_sheet),
+                available_sheets = [
+                    sheet
+                    for sheet, dataset in comparison_datasets.items()
+                    if dataset is not None and not dataset.analysis_df.empty
+                ]
+                if not available_sheets:
+                    st.info(
+                        "Listy určené k porovnání jsou prázdné. Zkontroluj zdrojová data."
                     )
-                    alias_lookup = {alias: raw for raw, alias in display_names.items()}
-                    raw_supplier_name = alias_lookup.get(selected_supplier, selected_supplier)
+                else:
+                    default_sheet = available_sheets[0]
+                    sheet_index = (
+                        available_sheets.index(default_sheet)
+                        if default_sheet in available_sheets
+                        else 0
+                    )
+                    selected_sheet = st.selectbox(
+                        "Vyber list pro zobrazení",
+                        available_sheets,
+                        index=sheet_index,
+                        key="compare2_sheet_select",
+                    )
+                    dataset = comparison_datasets.get(selected_sheet)
+                    if dataset is None or dataset.analysis_df.empty:
+                        st.warning(
+                            "Vybraný list neobsahuje žádné položky k zobrazení."
+                        )
+                    else:
+                        supplier_aliases = [alias for alias in dataset.suppliers if alias]
+                        if not supplier_aliases:
+                            st.info(
+                                "Žádný z dodavatelů neobsahuje data pro vybraný list."
+                            )
+                        else:
+                            supplier_index = 0 if len(supplier_aliases) else None
+                            selected_supplier = st.selectbox(
+                                "Vyber dodavatele",
+                                supplier_aliases,
+                                index=supplier_index,
+                                key=make_widget_key(
+                                    "compare2_supplier_select", selected_sheet
+                                ),
+                            )
+                            alias_lookup = {
+                                alias: raw for raw, alias in display_names.items()
+                            }
+                            raw_supplier_name = alias_lookup.get(
+                                selected_supplier, selected_supplier
+                            )
 
                     master_source = master_wb.sheets.get(selected_sheet, {}).get(
                         "table", pd.DataFrame()
@@ -12492,122 +12622,164 @@ with tab_compare2:
 with tab_curve:
     if not bids_dict:
         st.info("Nahraj alespoň jednu nabídku dodavatele v levém panelu.")
-    elif not comparison_datasets:
-        st.info(
-            "Nebyla nalezena data pro porovnání. Zkontroluj mapování nebo vyber jiné listy."
-        )
     else:
-        available_sheets = [
-            sheet
-            for sheet, dataset in comparison_datasets.items()
-            if dataset is not None and not dataset.analysis_df.empty
-        ]
-        if not available_sheets:
-            st.info("Listy určené k porovnání jsou prázdné. Zkontroluj zdrojová data.")
+        run_compare = st.session_state.get("run_compare_modules", False)
+        if st.button("▶️ Spustit porovnání", key="run_compare_curve"):
+            st.session_state["run_compare_modules"] = True
+            run_compare = True
+        if not run_compare:
+            st.info(
+                "Porovnání zatím není spuštěno. Spusť modul pro načtení výpočtů."
+            )
         else:
-            default_sheet = available_sheets[0]
-            sheet_index = (
-                available_sheets.index(default_sheet)
-                if default_sheet in available_sheets
-                else 0
-            )
-            selected_sheet = st.selectbox(
-                "Vyber list pro graf",
-                available_sheets,
-                index=sheet_index,
-                key=make_widget_key("curve_sheet_select", "curve"),
-            )
-            dataset = comparison_datasets.get(selected_sheet)
-            if dataset is None or dataset.analysis_df.empty:
-                st.warning("Vybraný list neobsahuje žádné položky k zobrazení.")
+            compare_results, comparison_datasets = load_compare_payload()
+            if not comparison_datasets:
+                st.info(
+                    "Nebyla nalezena data pro porovnání. Zkontroluj mapování nebo vyber jiné listy."
+                )
             else:
-                supplier_options = [alias for alias in dataset.supplier_order if alias]
-                if not supplier_options:
-                    st.info("Žádný z dodavatelů neobsahuje data pro vybraný list.")
-                else:
-                    selected_suppliers = st.multiselect(
-                        "Dodavatelé v grafu",
-                        options=supplier_options,
-                        default=supplier_options,
-                        key=make_widget_key("curve_supplier_select", selected_sheet),
+                available_sheets = [
+                    sheet
+                    for sheet, dataset in comparison_datasets.items()
+                    if dataset is not None and not dataset.analysis_df.empty
+                ]
+                if not available_sheets:
+                    st.info(
+                        "Listy určené k porovnání jsou prázdné. Zkontroluj zdrojová data."
                     )
-                    if not selected_suppliers:
-                        st.info("Vyber alespoň jednoho dodavatele pro vykreslení grafu.")
+                else:
+                    default_sheet = available_sheets[0]
+                    sheet_index = (
+                        available_sheets.index(default_sheet)
+                        if default_sheet in available_sheets
+                        else 0
+                    )
+                    selected_sheet = st.selectbox(
+                        "Vyber list pro graf",
+                        available_sheets,
+                        index=sheet_index,
+                        key=make_widget_key("curve_sheet_select", "curve"),
+                    )
+                    dataset = comparison_datasets.get(selected_sheet)
+                    if dataset is None or dataset.analysis_df.empty:
+                        st.warning(
+                            "Vybraný list neobsahuje žádné položky k zobrazení."
+                        )
                     else:
-                        analysis_df = dataset.analysis_df.copy()
-                        if analysis_df.empty:
-                            st.warning("Vybraný list neobsahuje žádné položky k zobrazení.")
+                        supplier_options = [
+                            alias for alias in dataset.supplier_order if alias
+                        ]
+                        if not supplier_options:
+                            st.info(
+                                "Žádný z dodavatelů neobsahuje data pro vybraný list."
+                            )
                         else:
-                            if "__row_order__" in analysis_df.columns:
-                                analysis_df = analysis_df.sort_values("__row_order__")
-                            analysis_df = analysis_df.reset_index(drop=True)
-                            if "__key__" not in analysis_df.columns:
-                                analysis_df["__key__"] = np.arange(len(analysis_df))
-                            analysis_df["__curve_position__"] = np.arange(
-                                1, len(analysis_df) + 1
+                            selected_suppliers = st.multiselect(
+                                "Dodavatelé v grafu",
+                                options=supplier_options,
+                                default=supplier_options,
+                                key=make_widget_key(
+                                    "curve_supplier_select", selected_sheet
+                                ),
                             )
-                            alias_lookup = {
-                                alias: raw for raw, alias in display_names.items()
-                            }
-                            master_sheet = master_wb.sheets.get(selected_sheet)
-                            master_table = (
-                                master_sheet.get("table")
-                                if isinstance(master_sheet, dict)
-                                else pd.DataFrame()
-                            )
-                            if isinstance(master_table, pd.DataFrame):
-                                master_table = master_table.copy()
+                            if not selected_suppliers:
+                                st.info(
+                                    "Vyber alespoň jednoho dodavatele pro vykreslení grafu."
+                                )
                             else:
-                                master_table = pd.DataFrame()
-
-                            master_prepared_base = _prepare_table_for_join(master_table)
-
-                            curve_frames: List[pd.DataFrame] = []
-                            if "Master" in selected_suppliers:
-                                master_curve = _build_master_curve_points(
-                                    master_prepared_base
-                                )
-                                if not master_curve.empty:
-                                    curve_frames.append(master_curve)
-
-                            for supplier_alias in selected_suppliers:
-                                if supplier_alias == "Master":
-                                    continue
-                                raw_supplier = alias_lookup.get(
-                                    supplier_alias, supplier_alias
-                                )
-                                supplier_wb = bids_dict.get(raw_supplier)
-                                if supplier_wb is None:
-                                    continue
-                                supplier_sheet = supplier_wb.sheets.get(
-                                    selected_sheet, {}
-                                )
-                                supplier_table = (
-                                    supplier_sheet.get("table")
-                                    if isinstance(supplier_sheet, dict)
-                                    else pd.DataFrame()
-                                )
-                                if isinstance(supplier_table, pd.DataFrame):
-                                    supplier_table = supplier_table.copy()
+                                analysis_df = dataset.analysis_df.copy()
+                                if analysis_df.empty:
+                                    st.warning(
+                                        "Vybraný list neobsahuje žádné položky k zobrazení."
+                                    )
                                 else:
-                                    supplier_table = pd.DataFrame()
-                                master_join_keys = (
-                                    dataset.master_join_key_map.get(supplier_alias)
-                                    if isinstance(dataset.master_join_key_map, dict)
-                                    else None
-                                )
-                                supplier_join_keys = (
-                                    dataset.supplier_join_key_map.get(supplier_alias)
-                                    if isinstance(dataset.supplier_join_key_map, dict)
-                                    else None
-                                )
-                                master_prepared = _prepare_table_for_join(
-                                    master_table, join_keys=master_join_keys
-                                )
-                                supplier_prepared = _prepare_table_for_join(
-                                    supplier_table, join_keys=supplier_join_keys
-                                )
-                                supplier_curve = _build_supplier_curve_points(
+                                    if "__row_order__" in analysis_df.columns:
+                                        analysis_df = analysis_df.sort_values(
+                                            "__row_order__"
+                                        )
+                                    analysis_df = analysis_df.reset_index(drop=True)
+                                    if "__key__" not in analysis_df.columns:
+                                        analysis_df["__key__"] = np.arange(
+                                            len(analysis_df)
+                                        )
+                                    analysis_df["__curve_position__"] = np.arange(
+                                        1, len(analysis_df) + 1
+                                    )
+                                    alias_lookup = {
+                                        alias: raw
+                                        for raw, alias in display_names.items()
+                                    }
+                                    master_sheet = master_wb.sheets.get(selected_sheet)
+                                    master_table = (
+                                        master_sheet.get("table")
+                                        if isinstance(master_sheet, dict)
+                                        else pd.DataFrame()
+                                    )
+                                    if isinstance(master_table, pd.DataFrame):
+                                        master_table = master_table.copy()
+                                    else:
+                                        master_table = pd.DataFrame()
+
+                                    master_prepared_base = _prepare_table_for_join(
+                                        master_table
+                                    )
+
+                                    curve_frames: List[pd.DataFrame] = []
+                                    if "Master" in selected_suppliers:
+                                        master_curve = _build_master_curve_points(
+                                            master_prepared_base
+                                        )
+                                        if not master_curve.empty:
+                                            curve_frames.append(master_curve)
+
+                                    for supplier_alias in selected_suppliers:
+                                        if supplier_alias == "Master":
+                                            continue
+                                        raw_supplier = alias_lookup.get(
+                                            supplier_alias, supplier_alias
+                                        )
+                                        supplier_wb = bids_dict.get(raw_supplier)
+                                        if supplier_wb is None:
+                                            continue
+                                        supplier_sheet = supplier_wb.sheets.get(
+                                            selected_sheet, {}
+                                        )
+                                        supplier_table = (
+                                            supplier_sheet.get("table")
+                                            if isinstance(supplier_sheet, dict)
+                                            else pd.DataFrame()
+                                        )
+                                        if isinstance(supplier_table, pd.DataFrame):
+                                            supplier_table = supplier_table.copy()
+                                        else:
+                                            supplier_table = pd.DataFrame()
+                                        master_join_keys = (
+                                            dataset.master_join_key_map.get(
+                                                supplier_alias
+                                            )
+                                            if isinstance(
+                                                dataset.master_join_key_map, dict
+                                            )
+                                            else None
+                                        )
+                                        supplier_join_keys = (
+                                            dataset.supplier_join_key_map.get(
+                                                supplier_alias
+                                            )
+                                            if isinstance(
+                                                dataset.supplier_join_key_map, dict
+                                            )
+                                            else None
+                                        )
+                                        master_prepared = _prepare_table_for_join(
+                                            master_table,
+                                            join_keys=master_join_keys,
+                                        )
+                                        supplier_prepared = _prepare_table_for_join(
+                                            supplier_table,
+                                            join_keys=supplier_join_keys,
+                                        )
+                                        supplier_curve = _build_supplier_curve_points(
                                     master_prepared, supplier_prepared, supplier_alias
                                 )
                                 if not supplier_curve.empty:
@@ -12904,90 +13076,115 @@ with tab_summary:
     if not bids_dict:
         st.info("Nahraj alespoň jednu nabídku dodavatele v levém panelu.")
     else:
-        results = compare_results
-
-        summary_df = summarize(results)
-        if not summary_df.empty:
-            st.markdown("### 📌 Souhrn po listech")
-            ctrl_dir, ctrl_rate = st.columns([2, 1])
-            with ctrl_dir:
-                conversion_direction = st.radio(
-                    "Směr konverze",
-                    ["CZK → EUR", "EUR → CZK"],
-                    index=0,
-                    horizontal=True,
-                )
-            with ctrl_rate:
-                rate_label = (
-                    "Kurz (CZK za 1 EUR)"
-                    if conversion_direction == "CZK → EUR"
-                    else "Kurz (CZK za 1 EUR)"
-                )
-                exchange_rate = st.number_input(
-                    rate_label,
-                    min_value=0.0001,
-                    value=float(st.session_state[EXCHANGE_RATE_STATE_KEY]),
-                    step=0.1,
-                    format="%.4f",
-                    key=EXCHANGE_RATE_WIDGET_KEYS["summary"],
-                )
-                exchange_rate = update_exchange_rate_shared(exchange_rate)
-
-            st.caption(
-                "Tabulka zobrazuje původní hodnoty v CZK. Přepočet níže pracuje pouze se souhrnnými hodnotami pro rychlost."
+        run_compare = st.session_state.get("run_compare_modules", False)
+        if st.button("▶️ Spustit porovnání", key="run_compare_summary"):
+            st.session_state["run_compare_modules"] = True
+            run_compare = True
+        if not run_compare:
+            st.info(
+                "Porovnání zatím není spuštěno. Spusť modul pro načtení výpočtů."
             )
-            show_df(summary_df)
+        else:
+            compare_results, comparison_datasets = load_compare_payload()
+            results = compare_results
 
-            target_currency = "EUR" if conversion_direction == "CZK → EUR" else "CZK"
-            conversion_factor = (1.0 / exchange_rate) if conversion_direction == "CZK → EUR" else exchange_rate
-            value_cols = [c for c in summary_df.columns if c != "sheet"]
-            summary_converted_df = summary_df.copy()
-            for col in value_cols:
-                summary_converted_df[col] = (
-                    pd.to_numeric(summary_converted_df[col], errors="coerce") * conversion_factor
-                )
-
-            st.markdown(f"**Souhrn v {target_currency}:**")
-            show_df(summary_converted_df)
-
-            supplier_totals = {}
-            for col in summary_df.columns:
-                if str(col).endswith(" total") and not str(col).startswith("__present__"):
-                    supplier = col.replace(" total", "")
-                    supplier_totals[supplier] = pd.to_numeric(
-                        summary_df[col], errors="coerce"
-                    ).sum()
-            grand_df = pd.DataFrame(
-                {"supplier": list(supplier_totals.keys()), "grand_total": list(supplier_totals.values())}
-            )
-            grand_converted_df = grand_df.copy()
-            if not grand_converted_df.empty:
-                grand_converted_df["grand_total"] = (
-                    pd.to_numeric(grand_converted_df["grand_total"], errors="coerce") * conversion_factor
-                )
-
-            base_totals_col, converted_totals_col = st.columns(2)
-            with base_totals_col:
-                st.markdown("**Celkové součty (CZK):**")
-                show_df(grand_df)
-            with converted_totals_col:
-                st.markdown(f"**Celkové součty ({target_currency}):**")
-                show_df(grand_converted_df)
-
-            if not grand_df.empty:
-                try:
-                    fig = px.bar(
-                        grand_df,
-                        x="supplier",
-                        y="grand_total",
-                        color="supplier",
-                        color_discrete_map=chart_color_map,
-                        title=f"Celkové součty ({currency})",
+            summary_df = summarize(results)
+            if summary_df.empty:
+                st.info("Souhrn není k dispozici. Zkontroluj mapování nebo listy.")
+            else:
+                st.markdown("### 📌 Souhrn po listech")
+                ctrl_dir, ctrl_rate = st.columns([2, 1])
+                with ctrl_dir:
+                    conversion_direction = st.radio(
+                        "Směr konverze",
+                        ["CZK → EUR", "EUR → CZK"],
+                        index=0,
+                        horizontal=True,
                     )
-                    fig.update_layout(showlegend=False)
-                    st.plotly_chart(fig, use_container_width=True)
-                except Exception:
+                with ctrl_rate:
+                    rate_label = (
+                        "Kurz (CZK za 1 EUR)"
+                        if conversion_direction == "CZK → EUR"
+                        else "Kurz (CZK za 1 EUR)"
+                    )
+                    exchange_rate = st.number_input(
+                        rate_label,
+                        min_value=0.0001,
+                        value=float(st.session_state[EXCHANGE_RATE_STATE_KEY]),
+                        step=0.1,
+                        format="%.4f",
+                        key=EXCHANGE_RATE_WIDGET_KEYS["summary"],
+                    )
+                    exchange_rate = update_exchange_rate_shared(exchange_rate)
+
+                st.caption(
+                    "Tabulka zobrazuje původní hodnoty v CZK. Přepočet níže pracuje pouze se souhrnnými hodnotami pro rychlost."
+                )
+                show_df(summary_df)
+
+                target_currency = (
+                    "EUR" if conversion_direction == "CZK → EUR" else "CZK"
+                )
+                conversion_factor = (
+                    (1.0 / exchange_rate)
+                    if conversion_direction == "CZK → EUR"
+                    else exchange_rate
+                )
+                value_cols = [c for c in summary_df.columns if c != "sheet"]
+                summary_converted_df = summary_df.copy()
+                for col in value_cols:
+                    summary_converted_df[col] = (
+                        pd.to_numeric(summary_converted_df[col], errors="coerce")
+                        * conversion_factor
+                    )
+
+                st.markdown(f"**Souhrn v {target_currency}:**")
+                show_df(summary_converted_df)
+
+                supplier_totals = {}
+                for col in summary_df.columns:
+                    if str(col).endswith(" total") and not str(col).startswith(
+                        "__present__"
+                    ):
+                        supplier = col.replace(" total", "")
+                        supplier_totals[supplier] = pd.to_numeric(
+                            summary_df[col], errors="coerce"
+                        ).sum()
+                grand_df = pd.DataFrame(
+                    {
+                        "supplier": list(supplier_totals.keys()),
+                        "grand_total": list(supplier_totals.values()),
+                    }
+                )
+                grand_converted_df = grand_df.copy()
+                if not grand_converted_df.empty:
+                    grand_converted_df["grand_total"] = (
+                        pd.to_numeric(grand_converted_df["grand_total"], errors="coerce")
+                        * conversion_factor
+                    )
+
+                base_totals_col, converted_totals_col = st.columns(2)
+                with base_totals_col:
+                    st.markdown("**Celkové součty (CZK):**")
                     show_df(grand_df)
+                with converted_totals_col:
+                    st.markdown(f"**Celkové součty ({target_currency}):**")
+                    show_df(grand_converted_df)
+
+                if not grand_df.empty:
+                    try:
+                        fig = px.bar(
+                            grand_df,
+                            x="supplier",
+                            y="grand_total",
+                            color="supplier",
+                            color_discrete_map=chart_color_map,
+                            title=f"Celkové součty ({currency})",
+                        )
+                        fig.update_layout(showlegend=False)
+                        st.plotly_chart(fig, use_container_width=True)
+                    except Exception:
+                        show_df(grand_df)
 
 with tab_rekap:
     if not bids_overview_dict:
