@@ -9921,6 +9921,11 @@ master_xl = pd.ExcelFile(master_file)
 all_sheets = master_xl.sheet_names
 
 # User selections for comparison and overview
+default_overview = (
+    "Přehled_dílčí kapitoly"
+    if "Přehled_dílčí kapitoly" in all_sheets
+    else (all_sheets[0] if all_sheets else "")
+)
 default_compare_sheets = (
     [default_overview]
     if default_overview and default_overview in all_sheets
@@ -9934,11 +9939,6 @@ compare_sheets = st.sidebar.multiselect(
 if not compare_sheets:
     st.sidebar.warning("Vyber alespoň jeden list pro porovnání.")
     st.stop()
-default_overview = (
-    "Přehled_dílčí kapitoly"
-    if "Přehled_dílčí kapitoly" in all_sheets
-    else (all_sheets[0] if all_sheets else "")
-)
 overview_sheet = st.sidebar.selectbox(
     "List pro rekapitulaci",
     all_sheets,
