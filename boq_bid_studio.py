@@ -10098,7 +10098,7 @@ chart_color_map.setdefault("Master", "#636EFA")
 ensure_exchange_rate_state()
 
 # ------------- Tabs -------------
-tab_data, tab_preview, tab_compare, tab_compare2, tab_curve, tab_summary, tab_rekap, tab_rounds = st.tabs([
+tab_data, tab_preview, tab_compare, tab_compare2, tab_curve, tab_summary, tab_rekap, tab_rounds, tab_rounds_v2 = st.tabs([
     "📑 Mapování",
     "🧾 Kontrola dat",
     "⚖️ Porovnání",
@@ -10107,6 +10107,7 @@ tab_data, tab_preview, tab_compare, tab_compare2, tab_curve, tab_summary, tab_re
     "📋 Celkový přehled",
     "📊 Rekapitulace",
     "🔁 Porovnání kol",
+    "🆕 Porovnání kol 2",
 ])
 
 with tab_data:
@@ -14971,6 +14972,303 @@ with tab_rounds:
                                     st.info(
                                         "Rekapitulace napříč koly neobsahuje hodnoty pro vybrané dodavatele."
                                     )
+
+
+with tab_rounds_v2:
+    st.subheader("Porovnání kol 2")
+    if not project_selection:
+        st.info("Vyber projekt v horní části pro práci s uzavřenými koly.")
+    else:
+        all_rounds = project_storage.list_rounds(project_selection)
+        closed_rounds = [
+            r
+            for r in all_rounds
+            if r.get("status") == "locked" or bool(r.get("locked"))
+        ]
+        if not closed_rounds:
+            st.info("Projekt zatím neobsahuje uzavřená kola.")
+        else:
+            round_labels_v2 = {
+                r.get("round_id"): (
+                    f"{r.get('round_name', r.get('round_id'))}"
+                    f" | režim: {r.get('mode', 'unknown')}"
+                    f" | {format_timestamp(r.get('created_at'))}"
+                )
+                for r in closed_rounds
+                if r.get("round_id")
+            }
+            selected_round_ids_v2 = st.multiselect(
+                "1) Vyber kola k porovnání",
+                options=list(round_labels_v2.keys()),
+                format_func=lambda rid: round_labels_v2.get(rid, str(rid)),
+                key="rounds_v2_selected_ids",
+            )
+
+            if len(selected_round_ids_v2) < 2:
+                st.info("Vyber minimálně dvě uzavřená kola.")
+            else:
+                selected_round_meta_v2 = [
+                    r for r in closed_rounds if r.get("round_id") in selected_round_ids_v2
+                ]
+                selected_round_meta_v2.sort(
+                    key=lambda m: selected_round_ids_v2.index(m.get("round_id"))
+                )
+
+                mode_set = {str(m.get("mode") or "") for m in selected_round_meta_v2}
+                if len(mode_set) > 1:
+                    st.error("Vybraná kola mají rozdílný režim (s Master / bez Master).")
+                    st.stop()
+
+                compare_mode_v2 = "with_master" if "with_master" in mode_set else "supplier_only"
+                st.caption(
+                    "Režim porovnání: "
+                    + ("Porovnání s Master BoQ" if compare_mode_v2 == "with_master" else "Porovnání nabídek bez Master BoQ")
+                )
+
+                loaded_rounds_v2: Dict[str, Dict[str, Any]] = {}
+                load_errors_v2: List[str] = []
+                common_sheets_v2: Optional[Set[str]] = None
+
+                for round_meta in selected_round_meta_v2:
+                    round_id = round_meta.get("round_id")
+                    round_name = round_meta.get("round_name", round_id)
+                    master_obj, bid_objs, input_meta = project_storage.load_round_inputs(
+                        project_selection, round_id
+                    )
+                    if compare_mode_v2 == "with_master" and master_obj is None:
+                        load_errors_v2.append(f"{round_name}: chybí Master soubor.")
+                        continue
+
+                    bid_names = [
+                        str(getattr(b, "name", f"Bid{idx + 1}"))
+                        for idx, b in enumerate(bid_objs)
+                    ]
+                    stored_meta = input_meta.get("supplier_metadata", {}) if isinstance(input_meta, Mapping) else {}
+                    if not stored_meta:
+                        stored_meta = supplier_list_to_metadata(round_meta.get("supplier_list", []))
+                    reconciled_meta = reconcile_supplier_metadata(stored_meta, bid_names)
+                    alias_map: Dict[str, str] = {}
+                    for raw_name in bid_names:
+                        entry = reconciled_meta.get(raw_name, {})
+                        alias_map[raw_name] = (
+                            entry.get("alias_display")
+                            or entry.get("alias")
+                            or supplier_default_alias(raw_name)
+                        )
+
+                    bids_dict_v2: Dict[str, WorkbookData] = {}
+                    sheet_set: Set[str] = set()
+
+                    if compare_mode_v2 == "with_master" and master_obj is not None:
+                        master_obj.seek(0)
+                        master_wb_v2 = read_workbook(master_obj)
+                        sheet_set |= set(master_wb_v2.sheets.keys())
+                    else:
+                        master_wb_v2 = None
+
+                    for bid_obj in bid_objs:
+                        bid_obj.seek(0)
+                        raw_name = str(getattr(bid_obj, "name", "Bid"))
+                        wb = read_workbook(bid_obj)
+                        if compare_mode_v2 == "with_master" and master_wb_v2 is not None:
+                            apply_master_mapping(master_wb_v2, wb)
+                        bids_dict_v2[raw_name] = wb
+                        sheet_set |= set(wb.sheets.keys())
+
+                    if common_sheets_v2 is None:
+                        common_sheets_v2 = set(sheet_set)
+                    else:
+                        common_sheets_v2 &= set(sheet_set)
+
+                    loaded_rounds_v2[round_id] = {
+                        "meta": round_meta,
+                        "master_wb": master_wb_v2,
+                        "bids_dict": bids_dict_v2,
+                        "alias_map": alias_map,
+                    }
+
+                if load_errors_v2:
+                    st.warning("Některá kola nelze načíst:\n- " + "\n- ".join(load_errors_v2))
+
+                if not loaded_rounds_v2:
+                    st.info("Nepodařilo se načíst žádné použitelné kolo.")
+                    st.stop()
+
+                file_options_v2 = []
+                file_labels_v2: Dict[str, str] = {}
+                for rid, payload in loaded_rounds_v2.items():
+                    round_name = payload["meta"].get("round_name", rid)
+                    for raw_name in payload["bids_dict"].keys():
+                        alias = payload["alias_map"].get(raw_name, raw_name)
+                        option_id = f"{rid}::{raw_name}"
+                        file_options_v2.append(option_id)
+                        file_labels_v2[option_id] = f"{round_name} • {alias} ({raw_name})"
+
+                selected_files_v2 = st.multiselect(
+                    "2) Vyber nabídky (XLS soubory) pro porovnání",
+                    options=file_options_v2,
+                    default=file_options_v2,
+                    format_func=lambda value: file_labels_v2.get(value, value),
+                    key="rounds_v2_selected_files",
+                )
+
+                common_sheet_list = sorted(common_sheets_v2 or [])
+                if not common_sheet_list:
+                    st.info("Vybraná kola nemají společné listy.")
+                    st.stop()
+
+                selected_sheets_v2 = st.multiselect(
+                    "3) Vyber listy k porovnání",
+                    options=common_sheet_list,
+                    default=[common_sheet_list[0]],
+                    key="rounds_v2_sheets",
+                )
+
+                if not selected_files_v2 or not selected_sheets_v2:
+                    st.info("Vyber alespoň jeden soubor a jeden list.")
+                else:
+                    with st.expander("4) Namapování dat", expanded=False):
+                        st.caption("Mapování se provádí nad vybranými koly/soubory bez zásahu do původního porovnání kol.")
+                        for rid, payload in loaded_rounds_v2.items():
+                            round_name = payload["meta"].get("round_name", rid)
+                            if compare_mode_v2 == "with_master" and payload.get("master_wb") is not None:
+                                mapping_ui(
+                                    f"Master — {round_name}",
+                                    payload["master_wb"],
+                                    minimal_sheets=selected_sheets_v2,
+                                    section_id=f"round2_master_{rid}",
+                                )
+                            for raw_name, wb in payload["bids_dict"].items():
+                                option_id = f"{rid}::{raw_name}"
+                                if option_id not in selected_files_v2:
+                                    continue
+                                alias = payload["alias_map"].get(raw_name, raw_name)
+                                mapping_ui(
+                                    f"{round_name} — {alias}",
+                                    wb,
+                                    minimal_sheets=selected_sheets_v2,
+                                    section_id=f"round2_bid_{rid}_{sanitize_key('bid', raw_name)}",
+                                )
+
+                    view_mode_v2 = st.radio(
+                        "5) Režim výstupu",
+                        options=["Kontrola dat", "Porovnání 2", "Spojitá nabídková křivka"],
+                        horizontal=True,
+                        key="rounds_v2_view_mode",
+                    )
+
+                    if view_mode_v2 == "Kontrola dat":
+                        for rid, payload in loaded_rounds_v2.items():
+                            round_name = payload["meta"].get("round_name", rid)
+                            st.markdown(f"### {round_name}")
+                            for raw_name, wb in payload["bids_dict"].items():
+                                option_id = f"{rid}::{raw_name}"
+                                if option_id not in selected_files_v2:
+                                    continue
+                                alias = payload["alias_map"].get(raw_name, raw_name)
+                                st.markdown(f"**{alias}**")
+                                for sheet_name in selected_sheets_v2:
+                                    sheet_obj = wb.sheets.get(sheet_name, {})
+                                    table = sheet_obj.get("table") if isinstance(sheet_obj, dict) else None
+                                    if isinstance(table, pd.DataFrame) and not table.empty:
+                                        st.caption(f"List: {sheet_name}")
+                                        st.dataframe(prepare_preview_table(table), use_container_width=True)
+
+                    elif view_mode_v2 == "Porovnání 2":
+                        selected_sheet_v2 = selected_sheets_v2[0]
+                        combined_rows_v2: List[pd.DataFrame] = []
+                        for rid, payload in loaded_rounds_v2.items():
+                            round_name = payload["meta"].get("round_name", rid)
+                            picked_bids = {
+                                raw: wb
+                                for raw, wb in payload["bids_dict"].items()
+                                if f"{rid}::{raw}" in selected_files_v2
+                            }
+                            if not picked_bids:
+                                continue
+                            if compare_mode_v2 == "with_master" and payload.get("master_wb") is not None:
+                                master_subset = subset_workbook_sheets(payload["master_wb"], [selected_sheet_v2])
+                                bids_subset = {
+                                    raw: subset_workbook_sheets(wb, [selected_sheet_v2])
+                                    for raw, wb in picked_bids.items()
+                                }
+                                bids_subset = {k: v for k, v in bids_subset.items() if v is not None}
+                                if master_subset is None or not master_subset.sheets:
+                                    continue
+                                compare_raw = compare(master_subset, bids_subset, join_mode="auto")
+                                renamed_compare = {
+                                    sheet: rename_comparison_columns(df, payload["alias_map"])
+                                    for sheet, df in compare_raw.items()
+                                }
+                                dataset = build_comparison_datasets(renamed_compare).get(selected_sheet_v2)
+                                if dataset is None or dataset.long_df.empty:
+                                    continue
+                                frame = dataset.long_df.copy()
+                                frame["kolo"] = round_name
+                                combined_rows_v2.append(frame)
+                            else:
+                                supplier_dataset = build_supplier_only_dataset(
+                                    selected_sheet_v2,
+                                    picked_bids,
+                                    payload["alias_map"],
+                                )
+                                if supplier_dataset.long_df.empty:
+                                    continue
+                                frame = supplier_dataset.long_df.copy()
+                                frame["kolo"] = round_name
+                                combined_rows_v2.append(frame)
+
+                        if not combined_rows_v2:
+                            st.info("Pro zvolená data nelze připravit Porovnání 2.")
+                        else:
+                            merged_v2 = pd.concat(combined_rows_v2, ignore_index=True, sort=False)
+                            st.dataframe(merged_v2, use_container_width=True)
+
+                    else:
+                        selected_sheet_v2 = selected_sheets_v2[0]
+                        curve_rows_v2: List[Dict[str, Any]] = []
+                        for rid, payload in loaded_rounds_v2.items():
+                            round_name = payload["meta"].get("round_name", rid)
+                            for raw_name, wb in payload["bids_dict"].items():
+                                if f"{rid}::{raw_name}" not in selected_files_v2:
+                                    continue
+                                alias = payload["alias_map"].get(raw_name, raw_name)
+                                sheet_obj = wb.sheets.get(selected_sheet_v2, {})
+                                table = sheet_obj.get("table") if isinstance(sheet_obj, dict) else None
+                                if not isinstance(table, pd.DataFrame) or table.empty:
+                                    continue
+                                prepared = _prepare_table_for_join(table.copy())
+                                if prepared.empty:
+                                    continue
+                                values = pd.to_numeric(prepared.get("total_price"), errors="coerce")
+                                values = values.dropna()
+                                if values.empty:
+                                    continue
+                                values = values.sort_values().reset_index(drop=True)
+                                running = values.cumsum()
+                                for idx, value in enumerate(running, start=1):
+                                    curve_rows_v2.append(
+                                        {
+                                            "Kolo": round_name,
+                                            "Dodavatel": alias,
+                                            "Pořadí položky": idx,
+                                            "Kumulovaná cena": value,
+                                        }
+                                    )
+                        if not curve_rows_v2:
+                            st.info("Pro vybraná data nelze vykreslit spojitou nabídkovou křivku.")
+                        else:
+                            curve_df_v2 = pd.DataFrame(curve_rows_v2)
+                            fig_curve_v2 = px.line(
+                                curve_df_v2,
+                                x="Pořadí položky",
+                                y="Kumulovaná cena",
+                                color="Dodavatel",
+                                line_dash="Kolo",
+                                title="Spojitá nabídková křivka napříč koly",
+                            )
+                            st.plotly_chart(fig_curve_v2, use_container_width=True)
+                            st.dataframe(curve_df_v2, use_container_width=True)
 
 st.markdown("---")
 st.caption("© 2025 BoQ Bid Studio — MVP. Doporučení: používat jednotné Item ID pro precizní párování.")
