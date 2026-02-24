@@ -15632,10 +15632,32 @@ with tab_rounds_v2:
                                     for key, group in rounds_supplier_long.groupby("supplier_key", sort=False)
                                 }
                                 supplier_options = list(supplier_labels.keys())
+                                supplier_round_counts = (
+                                    rounds_supplier_long.groupby("supplier_key")["round_id"]
+                                    .nunique()
+                                    .reindex(supplier_options)
+                                    .fillna(0)
+                                    .astype(int)
+                                )
+                                multi_round_candidates = supplier_round_counts[
+                                    supplier_round_counts >= 2
+                                ]
+                                if not multi_round_candidates.empty:
+                                    preferred_supplier_key = multi_round_candidates.idxmax()
+                                elif supplier_options:
+                                    preferred_supplier_key = supplier_options[0]
+                                else:
+                                    preferred_supplier_key = None
+                                default_supplier_index = (
+                                    supplier_options.index(preferred_supplier_key)
+                                    if preferred_supplier_key in supplier_options
+                                    else 0
+                                )
                                 selected_supplier_key = st.selectbox(
                                     "Dodavatel",
                                     options=supplier_options,
                                     format_func=lambda key: supplier_labels.get(key, str(key)),
+                                    index=default_supplier_index,
                                     key=f"rounds_v2_supplier_key_{selected_sheet_v2}",
                                 )
                                 source_mode = rounds_supplier_long.loc[
@@ -15655,6 +15677,14 @@ with tab_rounds_v2:
                                 ]
                                 if len(available_round_ids) < 2:
                                     st.info("Vybraný dodavatel nemá data alespoň ve dvou kolech.")
+                                    selected_round_count = int(
+                                        supplier_round_counts.get(selected_supplier_key, 0)
+                                    )
+                                    if selected_round_count == 1:
+                                        st.caption(
+                                            "Dodavatel je aktuálně spárovaný jen v jednom kole "
+                                            "(zkontrolujte auto/ruční mapování aliasů mezi koly)."
+                                        )
                                 else:
                                     all_rounds_toggle = st.toggle(
                                         "Porovnat všechna kola",
