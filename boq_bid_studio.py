@@ -1,6 +1,7 @@
 
 import hashlib
 from collections import Counter
+from difflib import SequenceMatcher
 import logging
 import functools
 import io
@@ -119,6 +120,41 @@ def generate_supplier_id(source: str) -> str:
     return f"sup-{slug}-{digest}"
 
 
+def canonical_supplier_name(value: Any) -> str:
+    """Return canonical supplier name for cross-round matching."""
+
+    text = normalize_text(value)
+    if not text:
+        return ""
+    collapsed = re.sub(r"[^a-z0-9]+", " ", text).strip()
+    collapsed = re.sub(
+        r"\b(?:round|kolo)\s*\d+\b|\b\d+\s*[.]?\s*(?:round|kolo)\b",
+        " ",
+        collapsed,
+    )
+    collapsed = re.sub(r"\s+", " ", collapsed).strip()
+    return collapsed
+
+
+def supplier_identity_source(raw_name: str, entry: Optional[Mapping[str, Any]] = None) -> str:
+    """Return normalized supplier identity source for stable IDs."""
+
+    if isinstance(entry, Mapping):
+        preferred = entry.get("alias_display") or entry.get("alias") or raw_name
+    else:
+        preferred = raw_name
+    canonical = canonical_supplier_name(preferred)
+    return canonical or canonical_supplier_name(raw_name) or str(preferred)
+
+
+def supplier_similarity_score(left: str, right: str) -> float:
+    """Return fuzzy similarity score between two supplier labels."""
+
+    if not left or not right:
+        return 0.0
+    return SequenceMatcher(None, left, right).ratio()
+
+
 def reset_round_context() -> None:
     """Clear session-scoped keys tied to the current round uploads and metadata."""
 
@@ -153,7 +189,7 @@ def build_supplier_list(
     supplier_list: List[Dict[str, Any]] = []
     for idx, raw_name in enumerate(ordered_names, start=1):
         meta = supplier_metadata.get(raw_name, {}) or {}
-        supplier_id = meta.get("supplier_id") or generate_supplier_id(raw_name)
+        supplier_id = meta.get("supplier_id") or generate_supplier_id(supplier_identity_source(raw_name, meta))
         supplier_entry = {
             "supplier_id": supplier_id,
             "supplier_name": meta.get("alias_display")
@@ -186,21 +222,56 @@ def reconcile_supplier_metadata(
     supplier_metadata: Mapping[str, Mapping[str, Any]],
     current_suppliers: Sequence[str],
 ) -> Dict[str, Dict[str, Any]]:
-    """Align supplier metadata keys with current upload names using supplier_id."""
+    """Align supplier metadata keys with current upload names using IDs and name matching."""
 
     metadata = dict(supplier_metadata or {})
     by_id: Dict[str, Dict[str, Any]] = {}
-    for entry in metadata.values():
+    by_canonical: Dict[str, List[Dict[str, Any]]] = {}
+    for raw_key, entry_raw in metadata.items():
+        entry = dict(entry_raw or {})
         supplier_id = entry.get("supplier_id")
         if supplier_id:
-            by_id[str(supplier_id)] = dict(entry)
+            by_id[str(supplier_id)] = entry
+        canonical = canonical_supplier_name(
+            entry.get("alias_display") or entry.get("alias") or raw_key
+        )
+        if canonical:
+            by_canonical.setdefault(canonical, []).append(entry)
 
     reconciled: Dict[str, Dict[str, Any]] = {}
     for raw_name in current_suppliers:
         entry = metadata.get(raw_name)
-        supplier_id = generate_supplier_id(raw_name)
+        fallback_source = supplier_identity_source(raw_name, entry)
+        supplier_id = generate_supplier_id(fallback_source)
         if not entry:
             entry = by_id.get(supplier_id, {}).copy()
+
+        if not entry:
+            canonical = canonical_supplier_name(raw_name)
+            candidates = by_canonical.get(canonical, [])
+            if len(candidates) == 1:
+                entry = dict(candidates[0])
+
+        if not entry:
+            target = canonical_supplier_name(raw_name)
+            best_score = 0.0
+            best_candidate: Optional[Dict[str, Any]] = None
+            tie = False
+            for candidate_list in by_canonical.values():
+                for candidate in candidate_list:
+                    candidate_name = canonical_supplier_name(
+                        candidate.get("alias_display") or candidate.get("alias")
+                    )
+                    score = supplier_similarity_score(target, candidate_name)
+                    if score > best_score:
+                        best_score = score
+                        best_candidate = candidate
+                        tie = False
+                    elif score == best_score and score > 0:
+                        tie = True
+            if best_candidate and best_score >= 0.90 and not tie:
+                entry = dict(best_candidate)
+
         entry = dict(entry or {})
         entry.setdefault("supplier_id", supplier_id)
         reconciled[raw_name] = entry
@@ -1664,6 +1735,7 @@ def build_rounds_supplier_long_dataset(
     loaded_rounds: Mapping[str, Mapping[str, Any]],
     selected_files: Set[str],
     compare_mode: str,
+    supplier_cluster_map: Optional[Mapping[str, str]] = None,
 ) -> pd.DataFrame:
     """Build a long-form supplier dataset across rounds for inter-round comparison."""
     metric_columns = ["total", "quantity", "unit_price_material", "unit_price_install"]
@@ -1711,7 +1783,7 @@ def build_rounds_supplier_long_dataset(
 
             for raw_name in picked_bids.keys():
                 alias = alias_map.get(raw_name, raw_name)
-                supplier_id = supplier_id_map.get(raw_name) or generate_supplier_id(raw_name)
+                supplier_id = supplier_id_map.get(raw_name) or generate_supplier_id(supplier_identity_source(raw_name, {"alias": alias}))
                 supplier_join_keys = (
                     dataset.supplier_join_key_map.get(alias)
                     if isinstance(dataset.supplier_join_key_map, dict)
@@ -1791,8 +1863,107 @@ def build_rounds_supplier_long_dataset(
             source = source.reindex(columns=needed)
             records.extend(source.to_dict("records"))
 
-    return pd.DataFrame(records)
+    result = pd.DataFrame(records)
+    if result.empty:
+        return result
 
+    if supplier_cluster_map:
+        map_series = result.apply(
+            lambda row: supplier_cluster_map.get(
+                f"{row.get('round_id','')}::{row.get('supplier_alias','')}",
+                supplier_cluster_map.get(
+                    f"{row.get('round_id','')}::{row.get('supplier_id','')}",
+                    "",
+                ),
+            ),
+            axis=1,
+        )
+        map_series = map_series.astype(str)
+        has_override = map_series.str.strip().ne("") & ~map_series.eq("nan")
+        result.loc[has_override, "supplier_id"] = map_series[has_override]
+
+    return result
+
+
+
+
+def resolve_supplier_cluster_map(
+    loaded_rounds: Mapping[str, Mapping[str, Any]],
+    selected_files: Set[str],
+    *,
+    similarity_threshold: float = 0.90,
+) -> Tuple[Dict[str, str], List[str]]:
+    """Return automatic supplier cluster map and unresolved conflicts."""
+
+    supplier_rows: List[Dict[str, str]] = []
+    for rid, payload in loaded_rounds.items():
+        alias_map = payload.get("alias_map", {}) if isinstance(payload, Mapping) else {}
+        supplier_id_map = payload.get("supplier_id_map", {}) if isinstance(payload, Mapping) else {}
+        for raw_name in payload.get("bids_dict", {}).keys():
+            option_id = f"{rid}::{raw_name}"
+            if option_id not in selected_files:
+                continue
+            alias = str(alias_map.get(raw_name, raw_name))
+            supplier_rows.append(
+                {
+                    "round_id": str(rid),
+                    "raw_name": str(raw_name),
+                    "alias": alias,
+                    "supplier_id": str(supplier_id_map.get(raw_name, "")),
+                    "canonical": canonical_supplier_name(alias) or canonical_supplier_name(raw_name),
+                }
+            )
+
+    auto_map: Dict[str, str] = {}
+    canonical_groups: Dict[str, List[Dict[str, str]]] = {}
+    unresolved: List[str] = []
+    for row in supplier_rows:
+        canonical_groups.setdefault(row["canonical"], []).append(row)
+
+    for canonical, rows in canonical_groups.items():
+        if not canonical:
+            continue
+        possible_expansions = [
+            key
+            for key in canonical_groups.keys()
+            if key != canonical and key.startswith(canonical + " ")
+        ]
+        is_ambiguous_short_name = len(rows) == 1 and len(possible_expansions) >= 2
+        if is_ambiguous_short_name:
+            unresolved.append(f"{rows[0]['round_id']}::{rows[0]['alias']}")
+            continue
+
+        ids = {r["supplier_id"] for r in rows if r.get("supplier_id")}
+        cluster_id = sorted(ids)[0] if ids else generate_supplier_id(canonical)
+        for row in rows:
+            auto_map[f"{row['round_id']}::{row['alias']}"] = cluster_id
+            auto_map[f"{row['round_id']}::{row['supplier_id']}"] = cluster_id
+
+    for row in supplier_rows:
+        key = f"{row['round_id']}::{row['alias']}"
+        if key in auto_map:
+            continue
+        target = row["canonical"]
+        best_score = 0.0
+        best_cluster = ""
+        tie = False
+        for existing_key, cluster_id in auto_map.items():
+            _, _, candidate_name = existing_key.partition("::")
+            candidate = canonical_supplier_name(candidate_name)
+            score = supplier_similarity_score(target, candidate)
+            if score > best_score:
+                best_score = score
+                best_cluster = cluster_id
+                tie = False
+            elif score == best_score and score > 0:
+                tie = True
+        if best_cluster and best_score >= similarity_threshold and not tie:
+            auto_map[key] = best_cluster
+            auto_map[f"{row['round_id']}::{row['supplier_id']}"] = best_cluster
+        else:
+            unresolved.append(key)
+
+    return auto_map, unresolved
 
 def build_supplier_only_summary(
     dataset: SupplierOnlyDataset,
@@ -3589,6 +3760,30 @@ class ProjectStorageManager:
         if not meta:
             return {}
         meta["last_opened_at"] = time.time()
+        self._write_metadata(self._metadata_path(self._project_dir(project_id)), meta)
+        return meta
+
+    def load_rounds_v2_supplier_manual_map(self, project_id: str) -> Dict[str, str]:
+        """Return persisted manual supplier mapping for rounds v2."""
+
+        meta = self.load_project(project_id)
+        stored = meta.get("rounds_v2_supplier_manual_map", {}) if isinstance(meta, Mapping) else {}
+        if not isinstance(stored, Mapping):
+            return {}
+        return {str(k): str(v) for k, v in stored.items() if str(k).strip() and str(v).strip()}
+
+    def save_rounds_v2_supplier_manual_map(
+        self, project_id: str, manual_map: Mapping[str, str]
+    ) -> Dict[str, Any]:
+        """Persist manual supplier mapping for rounds v2 at project level."""
+
+        meta = self.load_project(project_id)
+        if not meta:
+            return {}
+        clean = {str(k): str(v) for k, v in manual_map.items() if str(k).strip() and str(v).strip()}
+        meta["rounds_v2_supplier_manual_map"] = clean
+        meta["last_modified_by"] = self.user_id
+        meta["updated_at"] = time.time()
         self._write_metadata(self._metadata_path(self._project_dir(project_id)), meta)
         return meta
 
@@ -7765,7 +7960,7 @@ def run_supplier_only_comparison(
         if not entry.get("color"):
             entry["color"] = palette[idx % len(palette)]
         if not entry.get("supplier_id"):
-            entry["supplier_id"] = generate_supplier_id(raw_name)
+            entry["supplier_id"] = generate_supplier_id(supplier_identity_source(raw_name, entry))
         entry.setdefault("order", idx + 1)
         metadata[raw_name] = entry
 
@@ -10200,7 +10395,7 @@ if current_suppliers:
         if not entry.get("color"):
             entry["color"] = palette[idx % len(palette)]
         if not entry.get("supplier_id"):
-            entry["supplier_id"] = generate_supplier_id(raw_name)
+            entry["supplier_id"] = generate_supplier_id(supplier_identity_source(raw_name, entry))
         entry.setdefault("order", idx + 1)
         metadata[raw_name] = entry
 
@@ -15192,7 +15387,7 @@ with tab_rounds_v2:
                             or supplier_default_alias(raw_name)
                         )
                         supplier_id_map[raw_name] = str(
-                            entry.get("supplier_id") or generate_supplier_id(raw_name)
+                            entry.get("supplier_id") or generate_supplier_id(supplier_identity_source(raw_name, entry))
                         )
 
                     bids_dict_v2: Dict[str, WorkbookData] = {}
@@ -15339,11 +15534,77 @@ with tab_rounds_v2:
                         )
 
                         if compare_type_v2 == "supplier_inter_round":
+                            manual_map_state_key = f"rounds_v2_supplier_manual_map::{project_selection}"
+                            if manual_map_state_key not in st.session_state:
+                                st.session_state[manual_map_state_key] = project_storage.load_rounds_v2_supplier_manual_map(
+                                    project_selection
+                                )
+                            manual_map = dict(st.session_state.get(manual_map_state_key, {}))
+                            auto_cluster_map, unresolved_pairs = resolve_supplier_cluster_map(
+                                loaded_rounds_v2,
+                                set(selected_files_v2),
+                            )
+
+                            with st.expander("Ruční párování dodavatelů", expanded=False):
+                                st.caption("Automatické párování používá canonical název. Zde můžete ručně přiřadit společného dodavatele napříč koly.")
+                                supplier_entries: List[Tuple[str, str]] = []
+                                for rid, payload in loaded_rounds_v2.items():
+                                    if rid not in selected_round_ids_v2:
+                                        continue
+                                    round_name = payload.get("meta", {}).get("round_name", rid)
+                                    for raw_name in payload.get("bids_dict", {}).keys():
+                                        option_id = f"{rid}::{raw_name}"
+                                        if option_id not in set(selected_files_v2):
+                                            continue
+                                        alias = payload.get("alias_map", {}).get(raw_name, raw_name)
+                                        supplier_entries.append((f"{rid}::{alias}", f"{round_name} • {alias}"))
+
+                                cluster_options = sorted(set(auto_cluster_map.values()) | set(manual_map.values()))
+                                display_options = ["(auto)", "(nový společný dodavatel)"] + cluster_options
+
+                                for pair_key, label in supplier_entries:
+                                    current_value = manual_map.get(pair_key, "(auto)")
+                                    selected_value = st.selectbox(
+                                        f"Mapování — {label}",
+                                        options=display_options,
+                                        index=display_options.index(current_value) if current_value in display_options else 0,
+                                        key=f"rounds_v2_manual_pair_{sanitize_key('pair', pair_key)}_{selected_sheet_v2}",
+                                    )
+                                    if selected_value == "(auto)":
+                                        manual_map.pop(pair_key, None)
+                                    elif selected_value == "(nový společný dodavatel)":
+                                        custom_name = st.text_input(
+                                            f"Název společného dodavatele — {label}",
+                                            key=f"rounds_v2_manual_custom_{sanitize_key('pair_custom', pair_key)}_{selected_sheet_v2}",
+                                        ).strip()
+                                        if custom_name:
+                                            manual_map[pair_key] = generate_supplier_id(canonical_supplier_name(custom_name) or custom_name)
+                                    else:
+                                        manual_map[pair_key] = selected_value
+
+                                col_save, col_reset = st.columns(2)
+                                if col_save.button("Uložit mapování", key=f"rounds_v2_manual_save_{selected_sheet_v2}"):
+                                    project_storage.save_rounds_v2_supplier_manual_map(project_selection, manual_map)
+                                    st.session_state[manual_map_state_key] = manual_map
+                                    st.success("Ruční mapování bylo uloženo.")
+                                if col_reset.button("Reset mapování", key=f"rounds_v2_manual_reset_{selected_sheet_v2}"):
+                                    manual_map = {}
+                                    st.session_state[manual_map_state_key] = {}
+                                    project_storage.save_rounds_v2_supplier_manual_map(project_selection, {})
+                                    st.info("Ruční mapování bylo vymazáno.")
+
+                                if unresolved_pairs:
+                                    st.warning("Některé nabídky nemají jednoznačné automatické přiřazení: " + ", ".join(unresolved_pairs))
+
+                            combined_cluster_map = dict(auto_cluster_map)
+                            combined_cluster_map.update(manual_map)
+
                             rounds_supplier_long = build_rounds_supplier_long_dataset(
                                 selected_sheet_v2,
                                 loaded_rounds_v2,
                                 set(selected_files_v2),
                                 compare_mode_v2,
+                                supplier_cluster_map=combined_cluster_map,
                             )
                             if rounds_supplier_long.empty:
                                 st.info("Pro mezikolové porovnání nejsou dostupná data.")
@@ -15356,7 +15617,11 @@ with tab_rounds_v2:
                                 ) | rounds_supplier_long["supplier_key"].eq("nan")
                                 rounds_supplier_long.loc[empty_supplier_id, "supplier_key"] = rounds_supplier_long.loc[
                                     empty_supplier_id, "supplier_alias"
-                                ].map(lambda value: generate_supplier_id(str(value)))
+                                ].map(lambda value: generate_supplier_id(canonical_supplier_name(str(value)) or str(value)))
+                                rounds_supplier_long["mapping_source"] = rounds_supplier_long.apply(
+                                    lambda row: "manuální" if f"{row.get('round_id','')}::{row.get('supplier_alias','')}" in manual_map else "automatické",
+                                    axis=1,
+                                )
 
                                 supplier_labels = {
                                     key: (
@@ -15373,6 +15638,12 @@ with tab_rounds_v2:
                                     format_func=lambda key: supplier_labels.get(key, str(key)),
                                     key=f"rounds_v2_supplier_key_{selected_sheet_v2}",
                                 )
+                                source_mode = rounds_supplier_long.loc[
+                                    rounds_supplier_long["supplier_key"] == selected_supplier_key,
+                                    "mapping_source",
+                                ].mode()
+                                if not source_mode.empty:
+                                    st.caption(f"Způsob spárování: {source_mode.iloc[0]}")
                                 supplier_frame = rounds_supplier_long[
                                     rounds_supplier_long["supplier_key"] == selected_supplier_key
                                 ].copy()
