@@ -15226,39 +15226,157 @@ with tab_rounds_v2:
 
                     else:
                         selected_sheet_v2 = selected_sheets_v2[0]
-                        curve_rows_v2: List[Dict[str, Any]] = []
+                        curve_frames_v2: List[pd.DataFrame] = []
                         for rid, payload in loaded_rounds_v2.items():
                             round_name = payload["meta"].get("round_name", rid)
-                            for raw_name, wb in payload["bids_dict"].items():
-                                if f"{rid}::{raw_name}" not in selected_files_v2:
+                            picked_bids = {
+                                raw: wb
+                                for raw, wb in payload["bids_dict"].items()
+                                if f"{rid}::{raw}" in selected_files_v2
+                            }
+                            if not picked_bids:
+                                continue
+
+                            if compare_mode_v2 == "with_master" and payload.get("master_wb") is not None:
+                                master_sheet = payload["master_wb"].sheets.get(selected_sheet_v2, {})
+                                master_table = (
+                                    master_sheet.get("table")
+                                    if isinstance(master_sheet, dict)
+                                    else pd.DataFrame()
+                                )
+                                if not isinstance(master_table, pd.DataFrame) or master_table.empty:
                                     continue
-                                alias = payload["alias_map"].get(raw_name, raw_name)
-                                sheet_obj = wb.sheets.get(selected_sheet_v2, {})
-                                table = sheet_obj.get("table") if isinstance(sheet_obj, dict) else None
-                                if not isinstance(table, pd.DataFrame) or table.empty:
+
+                                master_subset = subset_workbook_sheets(payload["master_wb"], [selected_sheet_v2])
+                                bids_subset = {
+                                    raw: subset_workbook_sheets(wb, [selected_sheet_v2])
+                                    for raw, wb in picked_bids.items()
+                                }
+                                bids_subset = {k: v for k, v in bids_subset.items() if v is not None}
+                                if master_subset is None or not master_subset.sheets or not bids_subset:
                                     continue
-                                prepared = _prepare_table_for_join(table.copy())
-                                if prepared.empty:
+
+                                compare_raw = compare(master_subset, bids_subset, join_mode="auto")
+                                renamed_compare = {
+                                    sheet: rename_comparison_columns(df, payload["alias_map"])
+                                    for sheet, df in compare_raw.items()
+                                }
+                                dataset = build_comparison_datasets(renamed_compare).get(selected_sheet_v2)
+                                if dataset is None:
                                     continue
-                                values = pd.to_numeric(prepared.get("total_price"), errors="coerce")
-                                values = values.dropna()
-                                if values.empty:
+
+                                for raw_name, wb in picked_bids.items():
+                                    alias = payload["alias_map"].get(raw_name, raw_name)
+                                    supplier_sheet = wb.sheets.get(selected_sheet_v2, {})
+                                    supplier_table = (
+                                        supplier_sheet.get("table")
+                                        if isinstance(supplier_sheet, dict)
+                                        else pd.DataFrame()
+                                    )
+                                    if not isinstance(supplier_table, pd.DataFrame) or supplier_table.empty:
+                                        continue
+
+                                    master_join_keys = (
+                                        dataset.master_join_key_map.get(alias)
+                                        if isinstance(dataset.master_join_key_map, dict)
+                                        else None
+                                    )
+                                    supplier_join_keys = (
+                                        dataset.supplier_join_key_map.get(alias)
+                                        if isinstance(dataset.supplier_join_key_map, dict)
+                                        else None
+                                    )
+
+                                    master_prepared = _prepare_table_for_join(
+                                        master_table,
+                                        join_keys=master_join_keys,
+                                    )
+                                    supplier_prepared = _prepare_table_for_join(
+                                        supplier_table.copy(),
+                                        join_keys=supplier_join_keys,
+                                    )
+                                    supplier_curve = _build_supplier_curve_points(
+                                        master_prepared,
+                                        supplier_prepared,
+                                        alias,
+                                    )
+                                    if supplier_curve.empty:
+                                        continue
+                                    supplier_curve["Kolo"] = round_name
+                                    curve_frames_v2.append(supplier_curve)
+                            else:
+                                supplier_dataset = build_supplier_only_dataset(
+                                    selected_sheet_v2,
+                                    picked_bids,
+                                    payload["alias_map"],
+                                )
+                                if supplier_dataset.long_df.empty or supplier_dataset.totals_wide.empty:
                                     continue
-                                values = values.sort_values().reset_index(drop=True)
-                                running = values.cumsum()
-                                for idx, value in enumerate(running, start=1):
-                                    curve_rows_v2.append(
+                                consensus = supplier_dataset.consensus_df
+                                if consensus.empty:
+                                    continue
+                                totals = supplier_dataset.totals_wide
+                                order_lookup = consensus.get("order", pd.Series(dtype=float))
+                                code_lookup = consensus.get("code", pd.Series(dtype=object))
+                                description_lookup = consensus.get("description", pd.Series(dtype=object))
+
+                                for raw_name in picked_bids.keys():
+                                    alias = payload["alias_map"].get(raw_name, raw_name)
+                                    if alias not in totals.columns:
+                                        continue
+                                    supplier_values = pd.to_numeric(
+                                        totals[alias],
+                                        errors="coerce",
+                                    )
+                                    supplier_values = supplier_values.reindex(order_lookup.index)
+                                    positions = order_lookup.reindex(supplier_values.index)
+                                    positions = positions.fillna(np.arange(1, len(supplier_values) + 1))
+                                    curve_frame = pd.DataFrame(
                                         {
-                                            "Kolo": round_name,
-                                            "Dodavatel": alias,
-                                            "Pořadí položky": idx,
-                                            "Kumulovaná cena": value,
+                                            "supplier": alias,
+                                            "code": code_lookup.reindex(supplier_values.index).values,
+                                            "description": description_lookup.reindex(supplier_values.index).values,
+                                            "total": supplier_values.values,
+                                            "__curve_position__": pd.to_numeric(positions, errors="coerce"),
                                         }
                                     )
-                        if not curve_rows_v2:
+                                    curve_frame = curve_frame.dropna(subset=["total", "__curve_position__"])
+                                    if curve_frame.empty:
+                                        continue
+                                    curve_frame["Kolo"] = round_name
+                                    curve_frames_v2.append(curve_frame)
+
+                        if not curve_frames_v2:
                             st.info("Pro vybraná data nelze vykreslit spojitou nabídkovou křivku.")
                         else:
-                            curve_df_v2 = pd.DataFrame(curve_rows_v2)
+                            curve_df_v2 = pd.concat(curve_frames_v2, ignore_index=True, sort=False)
+                            curve_df_v2["__curve_position__"] = pd.to_numeric(
+                                curve_df_v2.get("__curve_position__"),
+                                errors="coerce",
+                            )
+                            curve_df_v2["total"] = pd.to_numeric(curve_df_v2.get("total"), errors="coerce")
+                            curve_df_v2 = curve_df_v2.dropna(subset=["__curve_position__", "total"])
+                            curve_df_v2["__curve_position__"] = curve_df_v2["__curve_position__"].astype(int)
+                            curve_df_v2["description"] = (
+                                curve_df_v2.get("description", "").fillna("").astype(str).str.strip()
+                            )
+                            curve_df_v2["code"] = curve_df_v2.get("code", "").fillna("").astype(str).str.strip()
+                            missing_description = curve_df_v2["description"] == ""
+                            curve_df_v2.loc[missing_description, "description"] = (
+                                "Položka " + curve_df_v2.loc[missing_description, "__curve_position__"].astype(str)
+                            )
+                            curve_df_v2["Dodavatel"] = curve_df_v2["supplier"]
+                            curve_df_v2["Pořadí položky"] = curve_df_v2["__curve_position__"]
+                            curve_df_v2["Cena položky"] = curve_df_v2["total"]
+                            curve_df_v2.sort_values(
+                                by=["Kolo", "Dodavatel", "Pořadí položky"],
+                                inplace=True,
+                                kind="stable",
+                            )
+                            curve_df_v2["Kumulovaná cena"] = curve_df_v2.groupby(
+                                ["Kolo", "Dodavatel"]
+                            )["Cena položky"].cumsum()
+
                             fig_curve_v2 = px.line(
                                 curve_df_v2,
                                 x="Pořadí položky",
@@ -15266,9 +15384,36 @@ with tab_rounds_v2:
                                 color="Dodavatel",
                                 line_dash="Kolo",
                                 title="Spojitá nabídková křivka napříč koly",
+                                hover_data={
+                                    "Kolo": True,
+                                    "Dodavatel": True,
+                                    "Pořadí položky": False,
+                                    "description": True,
+                                    "code": True,
+                                    "Cena položky": ":.2f",
+                                    "Kumulovaná cena": ":.2f",
+                                },
                             )
                             st.plotly_chart(fig_curve_v2, use_container_width=True)
-                            st.dataframe(curve_df_v2, use_container_width=True)
+                            st.dataframe(
+                                curve_df_v2[
+                                    [
+                                        "Kolo",
+                                        "Dodavatel",
+                                        "Pořadí položky",
+                                        "description",
+                                        "code",
+                                        "Cena položky",
+                                        "Kumulovaná cena",
+                                    ]
+                                ].rename(
+                                    columns={
+                                        "description": "Název položky",
+                                        "code": "Kód položky",
+                                    }
+                                ),
+                                use_container_width=True,
+                            )
 
 st.markdown("---")
 st.caption("© 2025 BoQ Bid Studio — MVP. Doporučení: používat jednotné Item ID pro precizní párování.")
