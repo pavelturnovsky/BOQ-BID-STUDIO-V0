@@ -1744,10 +1744,11 @@ def build_rounds_supplier_long_dataset(
     for rid, payload in loaded_rounds.items():
         round_name = str(payload.get("meta", {}).get("round_name", rid))
         alias_map = payload.get("alias_map", {}) if isinstance(payload, Mapping) else {}
+        upload_id_map = payload.get("upload_id_map", {}) if isinstance(payload, Mapping) else {}
         supplier_id_map = payload.get("supplier_id_map", {}) if isinstance(payload, Mapping) else {}
         bids_dict = payload.get("bids_dict", {}) if isinstance(payload, Mapping) else {}
         picked_bids = {
-            raw: wb for raw, wb in bids_dict.items() if f"{rid}::{raw}" in selected_files
+            raw: wb for raw, wb in bids_dict.items() if f"{rid}::{upload_id_map.get(raw, raw)}" in selected_files
         }
         if not picked_bids:
             continue
@@ -1783,6 +1784,7 @@ def build_rounds_supplier_long_dataset(
 
             for raw_name in picked_bids.keys():
                 alias = alias_map.get(raw_name, raw_name)
+                upload_id = str(upload_id_map.get(raw_name, raw_name))
                 supplier_id = supplier_id_map.get(raw_name) or generate_supplier_id(supplier_identity_source(raw_name, {"alias": alias}))
                 supplier_join_keys = (
                     dataset.supplier_join_key_map.get(alias)
@@ -1797,6 +1799,7 @@ def build_rounds_supplier_long_dataset(
                     {
                         "round_id": rid,
                         "round_name": round_name,
+                        "upload_id": upload_id,
                         "supplier_id": str(supplier_id),
                         "supplier_alias": alias,
                         "join_key": join_key_series,
@@ -1832,8 +1835,25 @@ def build_rounds_supplier_long_dataset(
             source["round_id"] = rid
             source["round_name"] = round_name
             source["supplier_alias"] = source.get("supplier", pd.Series(dtype=object)).astype(str)
+            source["upload_id"] = source["supplier_alias"].map(
+                lambda alias: next(
+                    (
+                        str(upload_id_map.get(raw_name, raw_name))
+                        for raw_name, mapped_alias in alias_map.items()
+                        if str(mapped_alias) == str(alias)
+                    ),
+                    str(alias),
+                )
+            )
             source["supplier_id"] = source["supplier_alias"].map(
-                lambda alias: generate_supplier_id(str(alias))
+                lambda alias: next(
+                    (
+                        str(supplier_id_map.get(raw_name, ""))
+                        for raw_name, mapped_alias in alias_map.items()
+                        if str(mapped_alias) == str(alias) and supplier_id_map.get(raw_name)
+                    ),
+                    generate_supplier_id(str(alias)),
+                )
             )
             source.rename(
                 columns={
@@ -1849,6 +1869,7 @@ def build_rounds_supplier_long_dataset(
             needed = [
                 "round_id",
                 "round_name",
+                "upload_id",
                 "supplier_id",
                 "supplier_alias",
                 "join_key",
@@ -1870,7 +1891,7 @@ def build_rounds_supplier_long_dataset(
     if supplier_cluster_map:
         map_series = result.apply(
             lambda row: supplier_cluster_map.get(
-                f"{row.get('round_id','')}::{row.get('supplier_alias','')}",
+                f"{row.get('round_id','')}::{row.get('upload_id','')}",
                 supplier_cluster_map.get(
                     f"{row.get('round_id','')}::{row.get('supplier_id','')}",
                     "",
@@ -1898,16 +1919,19 @@ def resolve_supplier_cluster_map(
     supplier_rows: List[Dict[str, str]] = []
     for rid, payload in loaded_rounds.items():
         alias_map = payload.get("alias_map", {}) if isinstance(payload, Mapping) else {}
+        upload_id_map = payload.get("upload_id_map", {}) if isinstance(payload, Mapping) else {}
         supplier_id_map = payload.get("supplier_id_map", {}) if isinstance(payload, Mapping) else {}
         for raw_name in payload.get("bids_dict", {}).keys():
-            option_id = f"{rid}::{raw_name}"
+            option_id = f"{rid}::{payload.get('upload_id_map', {}).get(raw_name, raw_name)}"
             if option_id not in selected_files:
                 continue
             alias = str(alias_map.get(raw_name, raw_name))
+            upload_id = str(upload_id_map.get(raw_name, raw_name))
             supplier_rows.append(
                 {
                     "round_id": str(rid),
                     "raw_name": str(raw_name),
+                    "upload_id": upload_id,
                     "alias": alias,
                     "supplier_id": str(supplier_id_map.get(raw_name, "")),
                     "canonical": canonical_supplier_name(alias) or canonical_supplier_name(raw_name),
@@ -1930,17 +1954,17 @@ def resolve_supplier_cluster_map(
         ]
         is_ambiguous_short_name = len(rows) == 1 and len(possible_expansions) >= 2
         if is_ambiguous_short_name:
-            unresolved.append(f"{rows[0]['round_id']}::{rows[0]['alias']}")
+            unresolved.append(f"{rows[0]['round_id']}::{rows[0]['upload_id']}")
             continue
 
         ids = {r["supplier_id"] for r in rows if r.get("supplier_id")}
         cluster_id = sorted(ids)[0] if ids else generate_supplier_id(canonical)
         for row in rows:
-            auto_map[f"{row['round_id']}::{row['alias']}"] = cluster_id
+            auto_map[f"{row['round_id']}::{row['upload_id']}"] = cluster_id
             auto_map[f"{row['round_id']}::{row['supplier_id']}"] = cluster_id
 
     for row in supplier_rows:
-        key = f"{row['round_id']}::{row['alias']}"
+        key = f"{row['round_id']}::{row['upload_id']}"
         if key in auto_map:
             continue
         target = row["canonical"]
@@ -15378,17 +15402,28 @@ with tab_rounds_v2:
                         stored_meta = supplier_list_to_metadata(round_meta.get("supplier_list", []))
                     reconciled_meta = reconcile_supplier_metadata(stored_meta, bid_names)
                     alias_map: Dict[str, str] = {}
+                    upload_id_map: Dict[str, str] = {}
                     supplier_id_map: Dict[str, str] = {}
-                    for raw_name in bid_names:
+                    used_supplier_ids: Set[str] = set()
+                    for idx, raw_name in enumerate(bid_names):
                         entry = reconciled_meta.get(raw_name, {})
+                        upload_id = f"{round_id}::{idx}::{sanitize_key('upload', raw_name)}"
+                        upload_id_map[raw_name] = upload_id
                         alias_map[raw_name] = (
                             entry.get("alias_display")
                             or entry.get("alias")
                             or supplier_default_alias(raw_name)
                         )
-                        supplier_id_map[raw_name] = str(
+                        base_supplier_id = str(
                             entry.get("supplier_id") or generate_supplier_id(supplier_identity_source(raw_name, entry))
                         )
+                        supplier_id = base_supplier_id
+                        dedupe_index = 2
+                        while supplier_id in used_supplier_ids:
+                            supplier_id = f"{base_supplier_id}_{dedupe_index}"
+                            dedupe_index += 1
+                        used_supplier_ids.add(supplier_id)
+                        supplier_id_map[raw_name] = supplier_id
 
                     bids_dict_v2: Dict[str, WorkbookData] = {}
                     sheet_set: Set[str] = set()
@@ -15419,6 +15454,7 @@ with tab_rounds_v2:
                         "master_wb": master_wb_v2,
                         "bids_dict": bids_dict_v2,
                         "alias_map": alias_map,
+                        "upload_id_map": upload_id_map,
                         "supplier_id_map": supplier_id_map,
                     }
 
@@ -15435,7 +15471,7 @@ with tab_rounds_v2:
                     round_name = payload["meta"].get("round_name", rid)
                     for raw_name in payload["bids_dict"].keys():
                         alias = payload["alias_map"].get(raw_name, raw_name)
-                        option_id = f"{rid}::{raw_name}"
+                        option_id = f"{rid}::{payload.get('upload_id_map', {}).get(raw_name, raw_name)}"
                         file_options_v2.append(option_id)
                         file_labels_v2[option_id] = f"{round_name} • {alias} ({raw_name})"
 
@@ -15474,7 +15510,7 @@ with tab_rounds_v2:
                                     section_id=f"round2_master_{rid}",
                                 )
                             for raw_name, wb in payload["bids_dict"].items():
-                                option_id = f"{rid}::{raw_name}"
+                                option_id = f"{rid}::{payload.get('upload_id_map', {}).get(raw_name, raw_name)}"
                                 if option_id not in selected_files_v2:
                                     continue
                                 alias = payload["alias_map"].get(raw_name, raw_name)
@@ -15497,7 +15533,7 @@ with tab_rounds_v2:
                             round_name = payload["meta"].get("round_name", rid)
                             st.markdown(f"### {round_name}")
                             for raw_name, wb in payload["bids_dict"].items():
-                                option_id = f"{rid}::{raw_name}"
+                                option_id = f"{rid}::{payload.get('upload_id_map', {}).get(raw_name, raw_name)}"
                                 if option_id not in selected_files_v2:
                                     continue
                                 alias = payload["alias_map"].get(raw_name, raw_name)
@@ -15553,11 +15589,12 @@ with tab_rounds_v2:
                                         continue
                                     round_name = payload.get("meta", {}).get("round_name", rid)
                                     for raw_name in payload.get("bids_dict", {}).keys():
-                                        option_id = f"{rid}::{raw_name}"
+                                        option_id = f"{rid}::{payload.get('upload_id_map', {}).get(raw_name, raw_name)}"
                                         if option_id not in set(selected_files_v2):
                                             continue
                                         alias = payload.get("alias_map", {}).get(raw_name, raw_name)
-                                        supplier_entries.append((f"{rid}::{alias}", f"{round_name} • {alias}"))
+                                        upload_id = str(payload.get("upload_id_map", {}).get(raw_name, raw_name))
+                                        supplier_entries.append((f"{rid}::{upload_id}", f"{round_name} • {alias}"))
 
                                 cluster_options = sorted(set(auto_cluster_map.values()) | set(manual_map.values()))
                                 display_options = ["(auto)", "(nový společný dodavatel)"] + cluster_options
@@ -15619,7 +15656,7 @@ with tab_rounds_v2:
                                     empty_supplier_id, "supplier_alias"
                                 ].map(lambda value: generate_supplier_id(canonical_supplier_name(str(value)) or str(value)))
                                 rounds_supplier_long["mapping_source"] = rounds_supplier_long.apply(
-                                    lambda row: "manuální" if f"{row.get('round_id','')}::{row.get('supplier_alias','')}" in manual_map else "automatické",
+                                    lambda row: "manuální" if f"{row.get('round_id','')}::{row.get('upload_id','')}" in manual_map else "automatické",
                                     axis=1,
                                 )
 
@@ -15814,7 +15851,7 @@ with tab_rounds_v2:
                                 picked_bids = {
                                     raw: wb
                                     for raw, wb in payload["bids_dict"].items()
-                                    if f"{rid}::{raw}" in selected_files_v2
+                                    if f"{rid}::{payload.get('upload_id_map', {}).get(raw, raw)}" in selected_files_v2
                                 }
                                 if not picked_bids:
                                     continue
@@ -16000,7 +16037,7 @@ with tab_rounds_v2:
                             picked_bids = {
                                 raw: wb
                                 for raw, wb in payload["bids_dict"].items()
-                                if f"{rid}::{raw}" in selected_files_v2
+                                if f"{rid}::{payload.get('upload_id_map', {}).get(raw, raw)}" in selected_files_v2
                             }
                             if not picked_bids:
                                 continue
