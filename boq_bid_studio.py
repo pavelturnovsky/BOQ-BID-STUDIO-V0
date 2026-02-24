@@ -1659,6 +1659,141 @@ def build_supplier_only_dataset(
     )
 
 
+def build_rounds_supplier_long_dataset(
+    sheet: str,
+    loaded_rounds: Mapping[str, Mapping[str, Any]],
+    selected_files: Set[str],
+    compare_mode: str,
+) -> pd.DataFrame:
+    """Build a long-form supplier dataset across rounds for inter-round comparison."""
+    metric_columns = ["total", "quantity", "unit_price_material", "unit_price_install"]
+    records: List[Dict[str, Any]] = []
+
+    for rid, payload in loaded_rounds.items():
+        round_name = str(payload.get("meta", {}).get("round_name", rid))
+        alias_map = payload.get("alias_map", {}) if isinstance(payload, Mapping) else {}
+        supplier_id_map = payload.get("supplier_id_map", {}) if isinstance(payload, Mapping) else {}
+        bids_dict = payload.get("bids_dict", {}) if isinstance(payload, Mapping) else {}
+        picked_bids = {
+            raw: wb for raw, wb in bids_dict.items() if f"{rid}::{raw}" in selected_files
+        }
+        if not picked_bids:
+            continue
+
+        if compare_mode == "with_master" and payload.get("master_wb") is not None:
+            master_subset = subset_workbook_sheets(payload["master_wb"], [sheet])
+            bids_subset = {
+                raw: subset_workbook_sheets(wb, [sheet]) for raw, wb in picked_bids.items()
+            }
+            bids_subset = {k: v for k, v in bids_subset.items() if v is not None}
+            if master_subset is None or not master_subset.sheets or not bids_subset:
+                continue
+
+            compare_raw = compare(master_subset, bids_subset, join_mode="auto")
+            renamed_compare = {
+                local_sheet: rename_comparison_columns(df, alias_map)
+                for local_sheet, df in compare_raw.items()
+            }
+            dataset = build_comparison_datasets(renamed_compare).get(sheet)
+            if dataset is None or dataset.analysis_df.empty:
+                continue
+
+            analysis_df = dataset.analysis_df.copy()
+            description_series = _series_or_default(analysis_df, "description", "")
+            description_clean = description_series.astype(str).str.strip()
+            valid_rows = description_clean.ne("") & ~description_clean.str.contains(
+                UNMAPPED_ROW_LABEL,
+                case=False,
+                na=False,
+            )
+            if not valid_rows.any():
+                continue
+
+            for raw_name in picked_bids.keys():
+                alias = alias_map.get(raw_name, raw_name)
+                supplier_id = supplier_id_map.get(raw_name) or generate_supplier_id(raw_name)
+                supplier_join_keys = (
+                    dataset.supplier_join_key_map.get(alias)
+                    if isinstance(dataset.supplier_join_key_map, dict)
+                    else None
+                )
+                join_key_series = pd.Series("", index=analysis_df.index, dtype=object)
+                if isinstance(supplier_join_keys, pd.Series):
+                    join_key_series = supplier_join_keys.reindex(analysis_df.index).astype(str)
+
+                local_frame = pd.DataFrame(
+                    {
+                        "round_id": rid,
+                        "round_name": round_name,
+                        "supplier_id": str(supplier_id),
+                        "supplier_alias": alias,
+                        "join_key": join_key_series,
+                        "Kód": _series_or_default(analysis_df, "code", ""),
+                        "Popis": description_series,
+                        "Oddíl": _series_or_default(analysis_df, "Oddíl", ""),
+                    },
+                    index=analysis_df.index,
+                )
+
+                for metric in metric_columns:
+                    supplier_col = f"{alias} {metric}"
+                    local_frame[metric] = (
+                        pd.to_numeric(analysis_df[supplier_col], errors="coerce")
+                        if supplier_col in analysis_df.columns
+                        else np.nan
+                    )
+
+                local_frame = local_frame[valid_rows].copy()
+                local_frame["join_key"] = local_frame["join_key"].astype(str).replace("nan", "")
+                local_frame.loc[
+                    local_frame["join_key"].str.strip() == "", "join_key"
+                ] = local_frame.index.astype(str)
+                metric_any = local_frame[metric_columns].notna().any(axis=1)
+                local_frame = local_frame[metric_any]
+                if not local_frame.empty:
+                    records.extend(local_frame.to_dict("records"))
+        else:
+            supplier_dataset = build_supplier_only_dataset(sheet, picked_bids, alias_map)
+            if supplier_dataset.long_df.empty:
+                continue
+            source = supplier_dataset.long_df.copy()
+            source["round_id"] = rid
+            source["round_name"] = round_name
+            source["supplier_alias"] = source.get("supplier", pd.Series(dtype=object)).astype(str)
+            source["supplier_id"] = source["supplier_alias"].map(
+                lambda alias: generate_supplier_id(str(alias))
+            )
+            source.rename(
+                columns={
+                    "join_key": "join_key",
+                    "code": "Kód",
+                    "description": "Popis",
+                    "section": "Oddíl",
+                },
+                inplace=True,
+            )
+            source["unit_price_material"] = np.nan
+            source["unit_price_install"] = np.nan
+            needed = [
+                "round_id",
+                "round_name",
+                "supplier_id",
+                "supplier_alias",
+                "join_key",
+                "Kód",
+                "Popis",
+                "Oddíl",
+                "total",
+                "quantity",
+                "unit_price_material",
+                "unit_price_install",
+            ]
+            source = source.reindex(columns=needed)
+            records.extend(source.to_dict("records"))
+
+    return pd.DataFrame(records)
+
+
 def build_supplier_only_summary(
     dataset: SupplierOnlyDataset,
     *,
@@ -15048,12 +15183,16 @@ with tab_rounds_v2:
                         stored_meta = supplier_list_to_metadata(round_meta.get("supplier_list", []))
                     reconciled_meta = reconcile_supplier_metadata(stored_meta, bid_names)
                     alias_map: Dict[str, str] = {}
+                    supplier_id_map: Dict[str, str] = {}
                     for raw_name in bid_names:
                         entry = reconciled_meta.get(raw_name, {})
                         alias_map[raw_name] = (
                             entry.get("alias_display")
                             or entry.get("alias")
                             or supplier_default_alias(raw_name)
+                        )
+                        supplier_id_map[raw_name] = str(
+                            entry.get("supplier_id") or generate_supplier_id(raw_name)
                         )
 
                     bids_dict_v2: Dict[str, WorkbookData] = {}
@@ -15085,6 +15224,7 @@ with tab_rounds_v2:
                         "master_wb": master_wb_v2,
                         "bids_dict": bids_dict_v2,
                         "alias_map": alias_map,
+                        "supplier_id_map": supplier_id_map,
                     }
 
                 if load_errors_v2:
@@ -15183,186 +15323,371 @@ with tab_rounds_v2:
                             "unit_price_material": "Jednotková cena materiál",
                             "unit_price_install": "Jednotková cena montáž",
                         }
-                        for rid, payload in loaded_rounds_v2.items():
-                            round_name = payload["meta"].get("round_name", rid)
-                            picked_bids = {
-                                raw: wb
-                                for raw, wb in payload["bids_dict"].items()
-                                if f"{rid}::{raw}" in selected_files_v2
-                            }
-                            if not picked_bids:
-                                continue
-                            if compare_mode_v2 == "with_master" and payload.get("master_wb") is not None:
-                                master_subset = subset_workbook_sheets(payload["master_wb"], [selected_sheet_v2])
-                                bids_subset = {
-                                    raw: subset_workbook_sheets(wb, [selected_sheet_v2])
-                                    for raw, wb in picked_bids.items()
-                                }
-                                bids_subset = {k: v for k, v in bids_subset.items() if v is not None}
-                                if master_subset is None or not master_subset.sheets:
-                                    continue
-                                compare_raw = compare(master_subset, bids_subset, join_mode="auto")
-                                renamed_compare = {
-                                    sheet: rename_comparison_columns(df, payload["alias_map"])
-                                    for sheet, df in compare_raw.items()
-                                }
-                                dataset = build_comparison_datasets(renamed_compare).get(selected_sheet_v2)
-                                if dataset is None or dataset.analysis_df.empty:
-                                    continue
-                                analysis_df = dataset.analysis_df.copy()
-                                description_series = _series_or_default(analysis_df, "description", "")
-                                description_clean = description_series.astype(str).str.strip()
-                                valid_rows = description_clean.ne("") & ~description_clean.str.contains(
-                                    UNMAPPED_ROW_LABEL,
-                                    case=False,
-                                    na=False,
-                                )
-                                if not valid_rows.any():
-                                    continue
+                        compare_type_options = ["supplier_inter_round", "supplier_vs_master"]
+                        compare_type_default = "supplier_inter_round"
+                        compare_type_v2 = st.radio(
+                            "Typ porovnání",
+                            options=compare_type_options,
+                            format_func=lambda key: (
+                                "Dodavatel mezi koly"
+                                if key == "supplier_inter_round"
+                                else "Dodavatel vs Master"
+                            ),
+                            index=compare_type_options.index(compare_type_default),
+                            horizontal=True,
+                            key=f"rounds_v2_compare_type_{selected_sheet_v2}",
+                        )
 
-                                base_df = pd.DataFrame(
-                                    {
-                                        "Kód": _series_or_default(analysis_df, "code", ""),
-                                        "Popis": description_series,
-                                        "Oddíl": _series_or_default(analysis_df, "Oddíl", ""),
-                                    },
-                                    index=analysis_df.index,
-                                )
-                                working_df = base_df.copy()
-                                selected_aliases = [
-                                    payload["alias_map"].get(raw, raw)
-                                    for raw in picked_bids.keys()
-                                ]
-                                available_metrics_v2: List[str] = []
-                                for metric_key, metric_label in metric_catalog_v2.items():
-                                    master_col = (
-                                        dataset.master_column
-                                        if metric_key == "total"
-                                        else f"Master {metric_key}"
-                                    )
-                                    if master_col not in analysis_df.columns:
-                                        continue
-                                    supplier_cols = [
-                                        f"{alias} {metric_key}"
-                                        for alias in selected_aliases
-                                        if f"{alias} {metric_key}" in analysis_df.columns
-                                    ]
-                                    if not supplier_cols:
-                                        continue
-                                    available_metrics_v2.append(metric_key)
-                                    working_df[f"{metric_label} — Master"] = analysis_df[master_col]
-                                    for alias in selected_aliases:
-                                        supplier_col = f"{alias} {metric_key}"
-                                        if supplier_col not in analysis_df.columns:
-                                            continue
-                                        working_df[f"{metric_label} — {alias}"] = analysis_df[supplier_col]
-
-                                if not available_metrics_v2:
-                                    continue
-
-                                st.markdown(f"### {round_name}")
-                                selected_metric_v2 = st.selectbox(
-                                    f"Parametr pro filtr — {round_name}",
-                                    options=available_metrics_v2,
-                                    format_func=lambda key: metric_catalog_v2.get(key, key),
-                                    key=f"rounds_v2_metric_{rid}_{selected_sheet_v2}",
-                                )
-                                show_different_only_v2 = st.toggle(
-                                    "Pouze rozdílné položky vůči Master",
-                                    value=False,
-                                    key=f"rounds_v2_diff_only_{rid}_{selected_sheet_v2}",
-                                )
-
-                                metric_label_selected = metric_catalog_v2.get(
-                                    selected_metric_v2,
-                                    selected_metric_v2,
-                                )
-                                master_metric_col = f"{metric_label_selected} — Master"
-                                row_mask = valid_rows.copy()
-                                diff_cols_v2: List[str] = []
-                                pct_cols_v2: List[str] = []
-                                if master_metric_col in working_df.columns:
-                                    master_values = pd.to_numeric(
-                                        working_df[master_metric_col], errors="coerce"
-                                    )
-                                    for alias in selected_aliases:
-                                        supplier_metric_col = f"{metric_label_selected} — {alias}"
-                                        if supplier_metric_col not in working_df.columns:
-                                            continue
-                                        supplier_values = pd.to_numeric(
-                                            working_df[supplier_metric_col], errors="coerce"
-                                        )
-                                        diff_col = f"Rozdíl {alias} vs Master ({metric_label_selected})"
-                                        pct_col = f"Δ (%) {alias} vs Master ({metric_label_selected})"
-                                        working_df[diff_col] = supplier_values - master_values
-                                        working_df[pct_col] = compute_percent_difference(
-                                            supplier_values,
-                                            master_values,
-                                        )
-                                        diff_cols_v2.append(diff_col)
-                                        pct_cols_v2.append(pct_col)
-
-                                    if show_different_only_v2 and diff_cols_v2:
-                                        diff_presence = pd.Series(False, index=working_df.index)
-                                        for diff_col in diff_cols_v2:
-                                            diff_presence |= pd.to_numeric(
-                                                working_df[diff_col], errors="coerce"
-                                            ).fillna(0).abs() > 0
-                                        row_mask &= diff_presence
-
-                                table_v2 = working_df.loc[row_mask].reset_index(drop=True)
-                                if table_v2.empty:
-                                    st.info("Pro vybraný filtr nejsou dostupné žádné položky.")
-                                    continue
-
-                                ordered_cols = ["Kód", "Popis", "Oddíl"]
-                                for metric_key in available_metrics_v2:
-                                    metric_label = metric_catalog_v2.get(metric_key, metric_key)
-                                    metric_cols = [
-                                        col
-                                        for col in table_v2.columns
-                                        if col.startswith(f"{metric_label} — ")
-                                    ]
-                                    ordered_cols.extend(metric_cols)
-                                ordered_cols.extend(diff_cols_v2)
-                                ordered_cols.extend(pct_cols_v2)
-                                ordered_cols = [
-                                    col for col in ordered_cols if col in table_v2.columns
-                                ] + [
-                                    col for col in table_v2.columns if col not in ordered_cols
-                                ]
-
-                                rendered_any_round = True
-                                st.dataframe(
-                                    table_v2.reindex(columns=ordered_cols),
-                                    use_container_width=True,
-                                    hide_index=True,
-                                )
+                        if compare_type_v2 == "supplier_inter_round":
+                            rounds_supplier_long = build_rounds_supplier_long_dataset(
+                                selected_sheet_v2,
+                                loaded_rounds_v2,
+                                set(selected_files_v2),
+                                compare_mode_v2,
+                            )
+                            if rounds_supplier_long.empty:
+                                st.info("Pro mezikolové porovnání nejsou dostupná data.")
                             else:
-                                supplier_dataset = build_supplier_only_dataset(
-                                    selected_sheet_v2,
-                                    picked_bids,
-                                    payload["alias_map"],
-                                )
-                                if supplier_dataset.consensus_df.empty:
-                                    continue
+                                rounds_supplier_long["supplier_key"] = rounds_supplier_long[
+                                    "supplier_id"
+                                ].astype(str)
+                                empty_supplier_id = (
+                                    rounds_supplier_long["supplier_key"].str.strip() == ""
+                                ) | rounds_supplier_long["supplier_key"].eq("nan")
+                                rounds_supplier_long.loc[empty_supplier_id, "supplier_key"] = rounds_supplier_long.loc[
+                                    empty_supplier_id, "supplier_alias"
+                                ].map(lambda value: generate_supplier_id(str(value)))
 
-                                consensus = supplier_dataset.consensus_df.copy()
-                                totals = supplier_dataset.totals_wide.copy()
-                                if totals.empty:
+                                supplier_labels = {
+                                    key: (
+                                        f"{group['supplier_alias'].mode().iloc[0]} [{key}]"
+                                        if not group.empty
+                                        else key
+                                    )
+                                    for key, group in rounds_supplier_long.groupby("supplier_key", sort=False)
+                                }
+                                supplier_options = list(supplier_labels.keys())
+                                selected_supplier_key = st.selectbox(
+                                    "Dodavatel",
+                                    options=supplier_options,
+                                    format_func=lambda key: supplier_labels.get(key, str(key)),
+                                    key=f"rounds_v2_supplier_key_{selected_sheet_v2}",
+                                )
+                                supplier_frame = rounds_supplier_long[
+                                    rounds_supplier_long["supplier_key"] == selected_supplier_key
+                                ].copy()
+                                round_order = list(dict.fromkeys(selected_round_ids_v2))
+                                available_round_ids = [
+                                    rid
+                                    for rid in round_order
+                                    if rid in supplier_frame["round_id"].astype(str).unique().tolist()
+                                ]
+                                if len(available_round_ids) < 2:
+                                    st.info("Vybraný dodavatel nemá data alespoň ve dvou kolech.")
+                                else:
+                                    all_rounds_toggle = st.toggle(
+                                        "Porovnat všechna kola",
+                                        value=False,
+                                        key=f"rounds_v2_all_rounds_{selected_sheet_v2}",
+                                    )
+                                    metric_key_v2 = st.selectbox(
+                                        "Metrika",
+                                        options=[
+                                            key
+                                            for key in metric_catalog_v2.keys()
+                                            if key in supplier_frame.columns
+                                        ],
+                                        format_func=lambda key: metric_catalog_v2.get(key, key),
+                                        key=f"rounds_v2_cross_metric_{selected_sheet_v2}",
+                                    )
+                                    metric_label_selected = metric_catalog_v2.get(
+                                        metric_key_v2, metric_key_v2
+                                    )
+                                    show_diff_only_v2 = st.toggle(
+                                        "Pouze rozdílné položky",
+                                        value=False,
+                                        key=f"rounds_v2_cross_diff_only_{selected_sheet_v2}",
+                                    )
+
+                                    base_cols = ["join_key", "Kód", "Popis", "Oddíl"]
+                                    wide = (
+                                        supplier_frame[base_cols + ["round_name", metric_key_v2]]
+                                        .drop_duplicates(subset=["join_key", "round_name"], keep="first")
+                                        .pivot_table(
+                                            index=base_cols,
+                                            columns="round_name",
+                                            values=metric_key_v2,
+                                            aggfunc="first",
+                                        )
+                                        .reset_index()
+                                    )
+                                    wide.columns.name = None
+
+                                    if all_rounds_toggle:
+                                        selected_round_names = [
+                                            name
+                                            for name in supplier_frame["round_name"].dropna().astype(str).unique().tolist()
+                                            if name in wide.columns
+                                        ]
+                                        if len(selected_round_names) < 2:
+                                            st.info("Pro porovnání všech kol nejsou dostupná alespoň dvě kola.")
+                                        else:
+                                            base_round_name = selected_round_names[0]
+                                            for round_name in selected_round_names:
+                                                round_col_name = f"{metric_label_selected} — {supplier_labels.get(selected_supplier_key, selected_supplier_key)} — {round_name}"
+                                                wide[round_col_name] = pd.to_numeric(
+                                                    wide.get(round_name), errors="coerce"
+                                                )
+                                            for round_name in selected_round_names[1:]:
+                                                diff_col = (
+                                                    f"Rozdíl {supplier_labels.get(selected_supplier_key, selected_supplier_key)} "
+                                                    f"({round_name} vs {base_round_name})"
+                                                )
+                                                pct_col = (
+                                                    f"Δ (%) {supplier_labels.get(selected_supplier_key, selected_supplier_key)} "
+                                                    f"({round_name} vs {base_round_name})"
+                                                )
+                                                left = pd.to_numeric(wide.get(base_round_name), errors="coerce")
+                                                right = pd.to_numeric(wide.get(round_name), errors="coerce")
+                                                wide[diff_col] = right - left
+                                                wide[pct_col] = compute_percent_difference(right, left)
+                                            if show_diff_only_v2:
+                                                diff_cols = [
+                                                    col
+                                                    for col in wide.columns
+                                                    if col.startswith("Rozdíl ")
+                                                ]
+                                                if diff_cols:
+                                                    mask = pd.Series(False, index=wide.index)
+                                                    for col in diff_cols:
+                                                        mask |= pd.to_numeric(
+                                                            wide[col], errors="coerce"
+                                                        ).fillna(0).abs() > 0
+                                                    wide = wide[mask]
+                                    else:
+                                        round_name_map = {
+                                            rid: loaded_rounds_v2[rid]["meta"].get("round_name", rid)
+                                            for rid in available_round_ids
+                                        }
+                                        round_a = st.selectbox(
+                                            "Kolo A",
+                                            options=available_round_ids,
+                                            format_func=lambda rid: round_name_map.get(rid, rid),
+                                            key=f"rounds_v2_round_a_{selected_sheet_v2}",
+                                        )
+                                        round_b_candidates = [rid for rid in available_round_ids if rid != round_a]
+                                        round_b = st.selectbox(
+                                            "Kolo B",
+                                            options=round_b_candidates,
+                                            format_func=lambda rid: round_name_map.get(rid, rid),
+                                            key=f"rounds_v2_round_b_{selected_sheet_v2}",
+                                        )
+                                        round_a_name = round_name_map.get(round_a, round_a)
+                                        round_b_name = round_name_map.get(round_b, round_b)
+                                        a_values = pd.to_numeric(wide.get(round_a_name), errors="coerce")
+                                        b_values = pd.to_numeric(wide.get(round_b_name), errors="coerce")
+                                        supplier_label = supplier_labels.get(selected_supplier_key, selected_supplier_key)
+                                        wide[f"{metric_label_selected} — {supplier_label} — {round_a_name}"] = a_values
+                                        wide[f"{metric_label_selected} — {supplier_label} — {round_b_name}"] = b_values
+                                        diff_col = f"Rozdíl {supplier_label} ({round_b_name} vs {round_a_name})"
+                                        pct_col = f"Δ (%) {supplier_label} ({round_b_name} vs {round_a_name})"
+                                        wide[diff_col] = b_values - a_values
+                                        wide[pct_col] = compute_percent_difference(b_values, a_values)
+                                        if show_diff_only_v2:
+                                            wide = wide[pd.to_numeric(wide[diff_col], errors="coerce").fillna(0).abs() > 0]
+
+                                    if wide.empty:
+                                        st.info("Pro vybrané parametry nejsou dostupná data.")
+                                    else:
+                                        display_cols = ["Kód", "Popis", "Oddíl"] + [
+                                            col for col in wide.columns if col not in {"join_key", "Kód", "Popis", "Oddíl"}
+                                        ]
+                                        st.dataframe(
+                                            wide.reindex(columns=display_cols),
+                                            use_container_width=True,
+                                            hide_index=True,
+                                        )
+                        else:
+                            for rid, payload in loaded_rounds_v2.items():
+                                round_name = payload["meta"].get("round_name", rid)
+                                picked_bids = {
+                                    raw: wb
+                                    for raw, wb in payload["bids_dict"].items()
+                                    if f"{rid}::{raw}" in selected_files_v2
+                                }
+                                if not picked_bids:
                                     continue
-                                base = pd.DataFrame(
-                                    {
-                                        "Kód": consensus.get("code", pd.Series(dtype=object)),
-                                        "Popis": consensus.get("description", pd.Series(dtype=object)),
-                                        "Oddíl": consensus.get("section", pd.Series(dtype=object)),
+                                if compare_mode_v2 == "with_master" and payload.get("master_wb") is not None:
+                                    master_subset = subset_workbook_sheets(payload["master_wb"], [selected_sheet_v2])
+                                    bids_subset = {
+                                        raw: subset_workbook_sheets(wb, [selected_sheet_v2])
+                                        for raw, wb in picked_bids.items()
                                     }
-                                )
-                                merged = base.join(totals, how="left")
-                                rendered_any_round = True
-                                st.markdown(f"### {round_name}")
-                                st.dataframe(merged, use_container_width=True, hide_index=True)
-
+                                    bids_subset = {k: v for k, v in bids_subset.items() if v is not None}
+                                    if master_subset is None or not master_subset.sheets:
+                                        continue
+                                    compare_raw = compare(master_subset, bids_subset, join_mode="auto")
+                                    renamed_compare = {
+                                        sheet: rename_comparison_columns(df, payload["alias_map"])
+                                        for sheet, df in compare_raw.items()
+                                    }
+                                    dataset = build_comparison_datasets(renamed_compare).get(selected_sheet_v2)
+                                    if dataset is None or dataset.analysis_df.empty:
+                                        continue
+                                    analysis_df = dataset.analysis_df.copy()
+                                    description_series = _series_or_default(analysis_df, "description", "")
+                                    description_clean = description_series.astype(str).str.strip()
+                                    valid_rows = description_clean.ne("") & ~description_clean.str.contains(
+                                        UNMAPPED_ROW_LABEL,
+                                        case=False,
+                                        na=False,
+                                    )
+                                    if not valid_rows.any():
+                                        continue
+    
+                                    base_df = pd.DataFrame(
+                                        {
+                                            "Kód": _series_or_default(analysis_df, "code", ""),
+                                            "Popis": description_series,
+                                            "Oddíl": _series_or_default(analysis_df, "Oddíl", ""),
+                                        },
+                                        index=analysis_df.index,
+                                    )
+                                    working_df = base_df.copy()
+                                    selected_aliases = [
+                                        payload["alias_map"].get(raw, raw)
+                                        for raw in picked_bids.keys()
+                                    ]
+                                    available_metrics_v2: List[str] = []
+                                    for metric_key, metric_label in metric_catalog_v2.items():
+                                        master_col = (
+                                            dataset.master_column
+                                            if metric_key == "total"
+                                            else f"Master {metric_key}"
+                                        )
+                                        if master_col not in analysis_df.columns:
+                                            continue
+                                        supplier_cols = [
+                                            f"{alias} {metric_key}"
+                                            for alias in selected_aliases
+                                            if f"{alias} {metric_key}" in analysis_df.columns
+                                        ]
+                                        if not supplier_cols:
+                                            continue
+                                        available_metrics_v2.append(metric_key)
+                                        working_df[f"{metric_label} — Master"] = analysis_df[master_col]
+                                        for alias in selected_aliases:
+                                            supplier_col = f"{alias} {metric_key}"
+                                            if supplier_col not in analysis_df.columns:
+                                                continue
+                                            working_df[f"{metric_label} — {alias}"] = analysis_df[supplier_col]
+    
+                                    if not available_metrics_v2:
+                                        continue
+    
+                                    st.markdown(f"### {round_name}")
+                                    selected_metric_v2 = st.selectbox(
+                                        f"Parametr pro filtr — {round_name}",
+                                        options=available_metrics_v2,
+                                        format_func=lambda key: metric_catalog_v2.get(key, key),
+                                        key=f"rounds_v2_metric_{rid}_{selected_sheet_v2}",
+                                    )
+                                    show_different_only_v2 = st.toggle(
+                                        "Pouze rozdílné položky vůči Master",
+                                        value=False,
+                                        key=f"rounds_v2_diff_only_{rid}_{selected_sheet_v2}",
+                                    )
+    
+                                    metric_label_selected = metric_catalog_v2.get(
+                                        selected_metric_v2,
+                                        selected_metric_v2,
+                                    )
+                                    master_metric_col = f"{metric_label_selected} — Master"
+                                    row_mask = valid_rows.copy()
+                                    diff_cols_v2: List[str] = []
+                                    pct_cols_v2: List[str] = []
+                                    if master_metric_col in working_df.columns:
+                                        master_values = pd.to_numeric(
+                                            working_df[master_metric_col], errors="coerce"
+                                        )
+                                        for alias in selected_aliases:
+                                            supplier_metric_col = f"{metric_label_selected} — {alias}"
+                                            if supplier_metric_col not in working_df.columns:
+                                                continue
+                                            supplier_values = pd.to_numeric(
+                                                working_df[supplier_metric_col], errors="coerce"
+                                            )
+                                            diff_col = f"Rozdíl {alias} vs Master ({metric_label_selected})"
+                                            pct_col = f"Δ (%) {alias} vs Master ({metric_label_selected})"
+                                            working_df[diff_col] = supplier_values - master_values
+                                            working_df[pct_col] = compute_percent_difference(
+                                                supplier_values,
+                                                master_values,
+                                            )
+                                            diff_cols_v2.append(diff_col)
+                                            pct_cols_v2.append(pct_col)
+    
+                                        if show_different_only_v2 and diff_cols_v2:
+                                            diff_presence = pd.Series(False, index=working_df.index)
+                                            for diff_col in diff_cols_v2:
+                                                diff_presence |= pd.to_numeric(
+                                                    working_df[diff_col], errors="coerce"
+                                                ).fillna(0).abs() > 0
+                                            row_mask &= diff_presence
+    
+                                    table_v2 = working_df.loc[row_mask].reset_index(drop=True)
+                                    if table_v2.empty:
+                                        st.info("Pro vybraný filtr nejsou dostupné žádné položky.")
+                                        continue
+    
+                                    ordered_cols = ["Kód", "Popis", "Oddíl"]
+                                    for metric_key in available_metrics_v2:
+                                        metric_label = metric_catalog_v2.get(metric_key, metric_key)
+                                        metric_cols = [
+                                            col
+                                            for col in table_v2.columns
+                                            if col.startswith(f"{metric_label} — ")
+                                        ]
+                                        ordered_cols.extend(metric_cols)
+                                    ordered_cols.extend(diff_cols_v2)
+                                    ordered_cols.extend(pct_cols_v2)
+                                    ordered_cols = [
+                                        col for col in ordered_cols if col in table_v2.columns
+                                    ] + [
+                                        col for col in table_v2.columns if col not in ordered_cols
+                                    ]
+    
+                                    rendered_any_round = True
+                                    st.dataframe(
+                                        table_v2.reindex(columns=ordered_cols),
+                                        use_container_width=True,
+                                        hide_index=True,
+                                    )
+                                else:
+                                    supplier_dataset = build_supplier_only_dataset(
+                                        selected_sheet_v2,
+                                        picked_bids,
+                                        payload["alias_map"],
+                                    )
+                                    if supplier_dataset.consensus_df.empty:
+                                        continue
+    
+                                    consensus = supplier_dataset.consensus_df.copy()
+                                    totals = supplier_dataset.totals_wide.copy()
+                                    if totals.empty:
+                                        continue
+                                    base = pd.DataFrame(
+                                        {
+                                            "Kód": consensus.get("code", pd.Series(dtype=object)),
+                                            "Popis": consensus.get("description", pd.Series(dtype=object)),
+                                            "Oddíl": consensus.get("section", pd.Series(dtype=object)),
+                                        }
+                                    )
+                                    merged = base.join(totals, how="left")
+                                    rendered_any_round = True
+                                    st.markdown(f"### {round_name}")
+                                    st.dataframe(merged, use_container_width=True, hide_index=True)
+    
                         if not rendered_any_round:
                             st.info("Pro zvolená data nelze připravit Porovnání 2.")
 
