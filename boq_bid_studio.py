@@ -375,6 +375,13 @@ def describe_fingerprint_reason(
     return reasons
 
 
+def is_round_eligible_for_comparison(meta: Mapping[str, Any]) -> bool:
+    """Return True for rounds that can be compared in saved/locked workflows."""
+
+    status = meta.get("status")
+    return status in ("saved", "locked") or (status is None and bool(meta.get("locked")))
+
+
 def build_compare_cache_key(
     comparison_fingerprint: Tuple[Any, ...],
     mapping_signature: str,
@@ -9596,10 +9603,7 @@ else:
 if project_selection and round_options:
     st.subheader("📈 Porovnat všechna kola najednou")
     eligible_rounds = [
-        r
-        for r in round_options
-        if r.get("status") in ("saved", "locked")
-        or (r.get("status") is None and r.get("locked"))
+        r for r in round_options if is_round_eligible_for_comparison(r)
     ]
     rounds_df = pd.DataFrame(eligible_rounds)
     if not rounds_df.empty:
@@ -14126,9 +14130,7 @@ with tab_rounds:
         else:
             draft_rounds = [r for r in available_rounds if r.get("status") == "draft"]
             eligible_rounds = [
-                r
-                for r in available_rounds
-                if r.get("status") in ("saved", "locked")
+                r for r in available_rounds if is_round_eligible_for_comparison(r)
             ]
             if draft_rounds:
                 draft_labels = ", ".join(
@@ -14977,16 +14979,14 @@ with tab_rounds:
 with tab_rounds_v2:
     st.subheader("Porovnání kol 2")
     if not project_selection:
-        st.info("Vyber projekt v horní části pro práci s uzavřenými koly.")
+        st.info("Vyber projekt v horní části pro práci s uloženými/uzamčenými koly.")
     else:
         all_rounds = project_storage.list_rounds(project_selection)
         closed_rounds = [
-            r
-            for r in all_rounds
-            if r.get("status") == "locked" or bool(r.get("locked"))
+            r for r in all_rounds if is_round_eligible_for_comparison(r)
         ]
         if not closed_rounds:
-            st.info("Projekt zatím neobsahuje uzavřená kola.")
+            st.info("Projekt zatím neobsahuje uložená/uzamčená kola.")
         else:
             round_labels_v2 = {
                 r.get("round_id"): (
@@ -15005,7 +15005,7 @@ with tab_rounds_v2:
             )
 
             if len(selected_round_ids_v2) < 2:
-                st.info("Vyber minimálně dvě uzavřená kola.")
+                st.info("Vyber minimálně dvě uložená/uzamčená kola.")
             else:
                 selected_round_meta_v2 = [
                     r for r in closed_rounds if r.get("round_id") in selected_round_ids_v2
