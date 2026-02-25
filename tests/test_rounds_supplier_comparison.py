@@ -46,7 +46,7 @@ def test_rounds_v2_has_inter_round_supplier_mode() -> None:
 
 def test_rounds_v2_uses_supplier_id_map_for_cross_round_matching() -> None:
     assert '"supplier_id_map"' in SOURCE
-    assert 'supplier_id_map[raw_name]' in SOURCE
+    assert 'supplier_id_map[bid_key]' in SOURCE
     assert 'selected_supplier_key' in SOURCE
     assert 'Rozdíl {supplier_label} ({round_b_name} vs {round_a_name})' in SOURCE
 
@@ -78,7 +78,7 @@ def test_resolve_supplier_cluster_map_auto_matches_gemo_across_rounds() -> None:
     )
 
     assert unresolved == []
-    assert auto_map["r1::GEMO 1.kolo"] == auto_map["r2::GEMO 2.kolo"]
+    assert auto_map["r1::GEMO 1.kolo.xlsx"] == auto_map["r2::GEMO 2.kolo.xlsx"]
 
 
 def test_resolve_supplier_cluster_map_reports_conflict_for_ambiguous_names() -> None:
@@ -109,5 +109,38 @@ def test_resolve_supplier_cluster_map_reports_conflict_for_ambiguous_names() -> 
         },
     )
 
-    assert "r2::GEMO" in unresolved
-    assert "r2::GEMO" not in auto_map
+    assert "r2::GEMO.xlsx" in unresolved
+    assert "r2::GEMO.xlsx" not in auto_map
+
+
+def test_resolve_supplier_cluster_map_handles_duplicate_raw_names_with_bid_records() -> None:
+    loaded_rounds = {
+        "r1": {
+            "bid_records": [
+                {
+                    "bid_key": "bid::0::same",
+                    "raw_name": "nabidka.xlsx",
+                    "alias": "Dodavatel A",
+                    "upload_id": "r1::0::upload_nabidka_xlsx",
+                    "supplier_id": "sup_a",
+                },
+                {
+                    "bid_key": "bid::1::same",
+                    "raw_name": "nabidka.xlsx",
+                    "alias": "Dodavatel B",
+                    "upload_id": "r1::1::upload_nabidka_xlsx",
+                    "supplier_id": "sup_b",
+                },
+            ],
+            "meta": {"round_name": "Kolo 1"},
+        }
+    }
+
+    auto_map, unresolved = module.resolve_supplier_cluster_map(
+        loaded_rounds,
+        {"r1::r1::0::upload_nabidka_xlsx", "r1::r1::1::upload_nabidka_xlsx"},
+    )
+
+    assert unresolved == []
+    assert auto_map["r1::r1::0::upload_nabidka_xlsx"] == "sup_a"
+    assert auto_map["r1::r1::1::upload_nabidka_xlsx"] == "sup_b"
