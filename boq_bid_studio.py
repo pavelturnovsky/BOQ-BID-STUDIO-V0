@@ -2002,6 +2002,16 @@ def resolve_supplier_cluster_map(
             auto_map[f"{row['round_id']}::{row['upload_id']}"] = cluster_id
             auto_map[f"{row['round_id']}::{row['supplier_id']}"] = cluster_id
 
+    representative_names: Dict[str, str] = {}
+    for row in supplier_rows:
+        upload_key = f"{row['round_id']}::{row['upload_id']}"
+        cluster_id = auto_map.get(upload_key)
+        if not cluster_id:
+            continue
+        canonical_name = row.get("canonical", "")
+        if canonical_name and cluster_id not in representative_names:
+            representative_names[cluster_id] = canonical_name
+
     for row in supplier_rows:
         key = f"{row['round_id']}::{row['upload_id']}"
         if key in auto_map:
@@ -2010,9 +2020,7 @@ def resolve_supplier_cluster_map(
         best_score = 0.0
         best_cluster = ""
         tie = False
-        for existing_key, cluster_id in auto_map.items():
-            _, _, candidate_name = existing_key.partition("::")
-            candidate = canonical_supplier_name(candidate_name)
+        for cluster_id, candidate in representative_names.items():
             score = supplier_similarity_score(target, candidate)
             if score > best_score:
                 best_score = score
@@ -2023,6 +2031,8 @@ def resolve_supplier_cluster_map(
         if best_cluster and best_score >= similarity_threshold and not tie:
             auto_map[key] = best_cluster
             auto_map[f"{row['round_id']}::{row['supplier_id']}"] = best_cluster
+            if best_cluster not in representative_names and target:
+                representative_names[best_cluster] = target
         else:
             unresolved.append(key)
 
