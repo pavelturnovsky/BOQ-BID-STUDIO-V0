@@ -113,6 +113,52 @@ def test_resolve_supplier_cluster_map_reports_conflict_for_ambiguous_names() -> 
     assert "r2::GEMO.xlsx" not in auto_map
 
 
+
+
+def test_resolve_supplier_cluster_map_does_not_cross_match_unselected_files() -> None:
+    loaded_rounds = {
+        "r1": {
+            "bid_records": [
+                {
+                    "bid_key": "bid::0::alpha",
+                    "raw_name": "alpha.xlsx",
+                    "alias": "Alpha s.r.o.",
+                    "upload_id": "upload_alpha",
+                    "supplier_id": "sup_alpha",
+                },
+                {
+                    "bid_key": "bid::1::beta",
+                    "raw_name": "beta.xlsx",
+                    "alias": "Beta s.r.o.",
+                    "upload_id": "upload_beta",
+                    "supplier_id": "sup_beta",
+                },
+            ],
+            "meta": {"round_name": "Kolo 1"},
+        },
+        "r2": {
+            "bid_records": [
+                {
+                    "bid_key": "bid::0::alfas",
+                    "raw_name": "alfa.xlsx",
+                    "alias": "Alpha s.r.o.",
+                    "upload_id": "upload_alfa",
+                    "supplier_id": "sup_alfa",
+                }
+            ],
+            "meta": {"round_name": "Kolo 2"},
+        },
+    }
+
+    auto_map, unresolved = module.resolve_supplier_cluster_map(
+        loaded_rounds,
+        {"r1::upload_alpha", "r2::upload_alfa"},
+    )
+
+    assert unresolved == []
+    assert auto_map["r1::upload_alpha"] == auto_map["r2::upload_alfa"]
+    assert auto_map["r1::upload_alpha"] != "sup_beta"
+
 def test_resolve_supplier_cluster_map_handles_duplicate_raw_names_with_bid_records() -> None:
     loaded_rounds = {
         "r1": {
