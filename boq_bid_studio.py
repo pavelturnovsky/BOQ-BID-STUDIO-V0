@@ -15628,9 +15628,228 @@ with tab_rounds_v2:
                                         st.dataframe(prepare_preview_table(table), use_container_width=True)
 
                     elif view_mode_v2 == "Porovnání 2":
-                        st.info(
-                            "Režim Porovnání 2 je dočasně vypnutý a připravuje se jeho nová implementace."
+                        selected_sheet_compare_v2 = st.selectbox(
+                            "List pro Porovnání 2",
+                            options=selected_sheets_v2,
+                            key="rounds_v2_compare_sheet",
                         )
+
+                        compare_candidates_v2: List[Dict[str, Any]] = []
+                        for rid, payload in loaded_rounds_v2.items():
+                            round_name = payload["meta"].get("round_name", rid)
+                            for entry in _round_selected_bid_records(payload, rid):
+                                bid_key = str(entry.get("bid_key", ""))
+                                alias = str(
+                                    entry.get("alias")
+                                    or payload.get("alias_map", {}).get(bid_key, bid_key)
+                                )
+                                compare_candidates_v2.append(
+                                    {
+                                        "rid": rid,
+                                        "round_name": round_name,
+                                        "bid_key": bid_key,
+                                        "alias": alias,
+                                        "entry": entry,
+                                    }
+                                )
+
+                        if len(compare_candidates_v2) < 2:
+                            st.info("Pro Porovnání 2 vyber alespoň dvě nabídky.")
+                        else:
+                            option_ids_v2 = [
+                                f"{item['rid']}::{item['bid_key']}" for item in compare_candidates_v2
+                            ]
+                            option_labels_v2 = {
+                                f"{item['rid']}::{item['bid_key']}": (
+                                    f"{item['round_name']} • {item['alias']}"
+                                )
+                                for item in compare_candidates_v2
+                            }
+
+                            col_base_v2, col_target_v2 = st.columns(2)
+                            selected_base_id_v2 = col_base_v2.selectbox(
+                                "Základní nabídka",
+                                options=option_ids_v2,
+                                format_func=lambda value: option_labels_v2.get(value, value),
+                                key="rounds_v2_compare_base",
+                            )
+                            target_options_v2 = [
+                                value for value in option_ids_v2 if value != selected_base_id_v2
+                            ]
+                            selected_target_id_v2 = col_target_v2.selectbox(
+                                "Porovnat s",
+                                options=target_options_v2,
+                                format_func=lambda value: option_labels_v2.get(value, value),
+                                key="rounds_v2_compare_target",
+                            )
+
+                            selected_pair_v2 = {
+                                selected_base_id_v2,
+                                selected_target_id_v2,
+                            }
+                            pair_entries_v2 = []
+                            for item in compare_candidates_v2:
+                                option_id = f"{item['rid']}::{item['bid_key']}"
+                                if option_id not in selected_pair_v2:
+                                    continue
+                                pair_entry = dict(item)
+                                pair_entry["option_id"] = option_id
+                                pair_entries_v2.append(pair_entry)
+
+                            pair_bids_v2 = {
+                                item["option_id"]: item["entry"].get("workbook")
+                                for item in pair_entries_v2
+                                if item["entry"].get("workbook") is not None
+                            }
+                            pair_alias_v2 = {
+                                item["option_id"]: option_labels_v2.get(
+                                    item["option_id"], item["alias"]
+                                )
+                                for item in pair_entries_v2
+                            }
+
+                            pair_dataset_v2 = build_supplier_only_dataset(
+                                selected_sheet_compare_v2,
+                                pair_bids_v2,
+                                pair_alias_v2,
+                            )
+                            if pair_dataset_v2.long_df.empty or pair_dataset_v2.totals_wide.empty:
+                                st.info("Pro zvolený list nejsou dostupné porovnatelné položky.")
+                            else:
+                                consensus_v2 = pair_dataset_v2.consensus_df
+                                if consensus_v2.empty:
+                                    st.info("Pro zvolený list nejsou dostupné porovnatelné položky.")
+                                else:
+                                    base_supplier_v2 = pair_alias_v2.get(selected_base_id_v2)
+                                    target_supplier_v2 = pair_alias_v2.get(selected_target_id_v2)
+                                    if (
+                                        not base_supplier_v2
+                                        or not target_supplier_v2
+                                        or base_supplier_v2 not in pair_dataset_v2.totals_wide.columns
+                                        or target_supplier_v2 not in pair_dataset_v2.totals_wide.columns
+                                    ):
+                                        st.info("Vybrané nabídky neobsahují společné oceněné položky.")
+                                    else:
+                                        base_label_v2 = option_labels_v2.get(
+                                            selected_base_id_v2,
+                                            selected_base_id_v2,
+                                        )
+                                        target_label_v2 = option_labels_v2.get(
+                                            selected_target_id_v2,
+                                            selected_target_id_v2,
+                                        )
+
+                                        order_index_v2 = consensus_v2.index.tolist()
+                                        totals_wide_v2 = pair_dataset_v2.totals_wide.reindex(order_index_v2)
+                                        base_series_v2 = pd.to_numeric(
+                                            totals_wide_v2.get(base_supplier_v2),
+                                            errors="coerce",
+                                        )
+                                        target_series_v2 = pd.to_numeric(
+                                            totals_wide_v2.get(target_supplier_v2),
+                                            errors="coerce",
+                                        )
+                                        diff_series_v2 = target_series_v2 - base_series_v2
+                                        with np.errstate(divide="ignore", invalid="ignore"):
+                                            diff_pct_v2 = diff_series_v2 / base_series_v2
+                                        diff_pct_v2[~np.isfinite(diff_pct_v2)] = np.nan
+
+                                        compare_df_v2 = pd.DataFrame(
+                                            {
+                                                "Kód": consensus_v2.get("code"),
+                                                "Popis": consensus_v2.get("description"),
+                                                "Jednotka": consensus_v2.get("unit"),
+                                                f"{base_label_v2} ({currency})": base_series_v2,
+                                                f"{target_label_v2} ({currency})": target_series_v2,
+                                                "Rozdíl": diff_series_v2,
+                                                "Rozdíl (%)": diff_pct_v2 * 100.0,
+                                            }
+                                        ).reset_index(drop=True)
+                                        compare_df_v2["Směr změny"] = np.select(
+                                            [
+                                                compare_df_v2["Rozdíl"] > 0,
+                                                compare_df_v2["Rozdíl"] < 0,
+                                            ],
+                                            ["Zvýšení", "Snížení"],
+                                            default="Beze změny",
+                                        )
+
+                                        filter_col_v2, threshold_col_v2 = st.columns([2, 1])
+                                        with filter_col_v2:
+                                            direction_filter_v2 = st.radio(
+                                                "Filtrovat změny",
+                                                options=[
+                                                    "Vše",
+                                                    "Pouze zvýšení",
+                                                    "Pouze snížení",
+                                                    "Pouze změny",
+                                                ],
+                                                horizontal=True,
+                                                key="rounds_v2_compare_direction",
+                                            )
+                                        with threshold_col_v2:
+                                            threshold_v2 = st.slider(
+                                                "Min. rozdíl (%)",
+                                                min_value=0.0,
+                                                max_value=200.0,
+                                                value=0.0,
+                                                step=0.5,
+                                                key="rounds_v2_compare_threshold",
+                                            )
+
+                                        filtered_compare_df_v2 = compare_df_v2.copy()
+                                        if direction_filter_v2 == "Pouze zvýšení":
+                                            filtered_compare_df_v2 = filtered_compare_df_v2[
+                                                filtered_compare_df_v2["Rozdíl"] > 0
+                                            ]
+                                        elif direction_filter_v2 == "Pouze snížení":
+                                            filtered_compare_df_v2 = filtered_compare_df_v2[
+                                                filtered_compare_df_v2["Rozdíl"] < 0
+                                            ]
+                                        elif direction_filter_v2 == "Pouze změny":
+                                            filtered_compare_df_v2 = filtered_compare_df_v2[
+                                                filtered_compare_df_v2["Rozdíl"] != 0
+                                            ]
+
+                                        if threshold_v2 > 0:
+                                            filtered_compare_df_v2 = filtered_compare_df_v2[
+                                                filtered_compare_df_v2["Rozdíl (%)"].abs()
+                                                >= threshold_v2
+                                            ]
+
+                                        if filtered_compare_df_v2.empty:
+                                            st.info(
+                                                "Žádné položky neodpovídají aktuálnímu nastavení filtru."
+                                            )
+                                        else:
+                                            st.caption(
+                                                f"Zobrazeno položek: {len(filtered_compare_df_v2)} z {len(compare_df_v2)}"
+                                            )
+                                            st.dataframe(
+                                                filtered_compare_df_v2.style.format(
+                                                    {
+                                                        f"{base_label_v2} ({currency})": (
+                                                            lambda x: format_currency_label(
+                                                                x, currency
+                                                            )
+                                                        ),
+                                                        f"{target_label_v2} ({currency})": (
+                                                            lambda x: format_currency_label(
+                                                                x, currency
+                                                            )
+                                                        ),
+                                                        "Rozdíl": lambda x: format_currency_label(
+                                                            x, currency
+                                                        ),
+                                                        "Rozdíl (%)": lambda x: (
+                                                            f"{float(x):+.1f} %"
+                                                            if pd.notna(x)
+                                                            else "–"
+                                                        ),
+                                                    }
+                                                ),
+                                                use_container_width=True,
+                                            )
                     else:
                         selected_sheet_v2 = selected_sheets_v2[0]
                         curve_frames_v2: List[pd.DataFrame] = []
