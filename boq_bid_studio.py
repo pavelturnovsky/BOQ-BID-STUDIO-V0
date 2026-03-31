@@ -767,92 +767,90 @@ def build_login_news_digest(limit: int = 5) -> List[Dict[str, str]]:
 
 
 def render_login_market_and_news_panel() -> None:
-    """Render market snapshot and construction news on the login page."""
+    """Render market snapshot in the right-side panel on the login page."""
 
     snapshot_date = date.today()
     market_df, rates = build_login_market_snapshot(snapshot_date=snapshot_date, history_days=14)
-    st.markdown("#### Denní přehled stavebního trhu")
-    st.caption(
-        f"Poslední aktualizace: {snapshot_date.strftime('%d.%m.%Y')} | Kurz: 1 EUR = {1 / rates['rates']['EUR']:.4f} CZK, 1 USD = {1 / rates['rates']['USD']:.4f} CZK"
+    st.markdown(
+        """
+        <div class="market-panel-title">Denní přehled stavebního trhu</div>
+        """,
+        unsafe_allow_html=True,
     )
-    market_cols = st.columns(2)
-    for idx, row in market_df.iterrows():
-        col = market_cols[idx % len(market_cols)]
-        with col:
-            daily_change = float(row["D/D"])
-            weekly_change = float(row["W/W"])
-            glow_class = "trend-up" if daily_change >= 0 else "trend-down"
-            st.markdown(
-                f"""
-                <div class="market-card {glow_class}">
-                    <div class="market-title">{row["Materiál"]}</div>
-                    <div class="market-price">{row["Cena_CZK"]:,.2f} CZK/{row["Jednotka"]}</div>
-                    <div class="market-delta">D/D {daily_change:+.2f} % | W/W {weekly_change:+.2f} %</div>
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
-            trend_df = pd.DataFrame({"den": list(range(1, len(row["Trend14"]) + 1)), "cena": row["Trend14"]})
-            fig = px.line(trend_df, x="den", y="cena")
-            fig.update_layout(height=130, margin=dict(l=0, r=0, t=0, b=0), showlegend=False)
-            fig.update_traces(line=dict(color="#00e676" if daily_change >= 0 else "#ff5252", width=2))
-            fig.update_xaxes(visible=False)
-            fig.update_yaxes(visible=False)
-            st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
-
-    st.markdown("#### Aktuální zprávy a zajímavosti ze stavebnictví")
-    for news in build_login_news_digest():
-        st.markdown(f"**{news['category']}** — {news['headline']}")
-        st.caption(f"{news['impact']} Zdroj: {news['source']}")
-        st.markdown(f"[Otevřít článek]({news['url']})")
+    st.caption(
+        f"Aktualizace {snapshot_date.strftime('%d.%m.%Y')} • 1 EUR = {1 / rates['rates']['EUR']:.4f} CZK • 1 USD = {1 / rates['rates']['USD']:.4f} CZK"
+    )
+    for _, row in market_df.iterrows():
+        daily_change = float(row["D/D"])
+        weekly_change = float(row["W/W"])
+        change_class = "trend-up" if daily_change >= 0 else "trend-down"
+        day_arrow = "▲" if daily_change >= 0 else "▼"
+        week_arrow = "▲" if weekly_change >= 0 else "▼"
+        st.markdown(
+            f"""
+            <div class="market-card {change_class}">
+                <div class="market-title">{row["Materiál"]}</div>
+                <div class="market-price">{row["Cena_CZK"]:,.2f} CZK/{row["Jednotka"]}</div>
+                <div class="market-delta">{daily_change:+.2f}% {day_arrow} • dnes {weekly_change:+.2f}% {week_arrow}</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+    st.button("Zobrazit detailní analýzu", key="open_market_analysis", use_container_width=True)
 
 
 def inject_login_modern_theme() -> None:
-    """Inject modern 2026 visual style for the homepage."""
+    """Inject polished visual style for the homepage login screen."""
 
     st.markdown(
         """
         <style>
-            .hero-panel, .login-panel, .market-panel {
-                border-radius: 20px;
-                padding: 1.1rem 1.3rem;
-                border: 1px solid rgba(129, 140, 248, 0.35);
+            .stApp {
                 background:
-                    radial-gradient(circle at top right, rgba(56, 189, 248, 0.18), rgba(15, 23, 42, 0.96) 58%),
-                    linear-gradient(160deg, #0b1220 0%, #111a2f 100%);
-                box-shadow: 0 14px 34px rgba(15, 23, 42, 0.35);
+                    linear-gradient(180deg, rgba(243, 247, 255, 0.96) 0%, rgba(233, 241, 251, 0.90) 100%),
+                    radial-gradient(circle at 15% 90%, rgba(125, 211, 252, 0.20), transparent 40%),
+                    radial-gradient(circle at 95% 12%, rgba(253, 224, 71, 0.20), transparent 35%);
+            }
+            .hero-panel, .login-panel, .market-panel {
+                border-radius: 22px;
+                padding: 1.2rem 1.4rem;
+                border: 1px solid rgba(148, 163, 184, 0.28);
+                background: rgba(255, 255, 255, 0.82);
+                backdrop-filter: blur(6px);
+                box-shadow: 0 10px 30px rgba(15, 23, 42, 0.12);
                 margin-bottom: 1rem;
             }
-            .hero-title {
-                font-size: 2rem;
-                font-weight: 800;
-                line-height: 1.1;
-                color: #f8fafc;
-                letter-spacing: 0.4px;
-            }
             .hero-subtitle {
-                color: #bfdbfe;
-                margin-top: 0.35rem;
-                margin-bottom: 0.15rem;
+                color: #4b5563;
+                font-size: 1.08rem;
+                margin: 0.2rem 0;
+            }
+            .market-panel-title {
+                font-size: 1.95rem;
+                font-weight: 800;
+                color: #f8fafc;
+                line-height: 1.15;
+                background: linear-gradient(90deg, #4a7d52 0%, #e3c845 100%);
+                border-radius: 14px;
+                padding: 0.75rem 1rem;
+                margin-bottom: 0.25rem;
             }
             .market-card {
-                border: 1px solid rgba(148, 163, 184, 0.25);
+                border: 1px solid rgba(148, 163, 184, 0.20);
                 border-radius: 16px;
-                padding: 0.65rem 0.8rem;
-                margin-bottom: 0.45rem;
-                background: rgba(15, 23, 42, 0.78);
+                padding: 0.8rem 1rem;
+                margin-bottom: 0.55rem;
+                background: rgba(255, 255, 255, 0.95);
             }
             .market-card.trend-up {
-                box-shadow: 0 0 22px rgba(34, 197, 94, 0.36);
-                border-color: rgba(34, 197, 94, 0.48);
+                border-left: 5px solid rgba(132, 204, 22, 0.85);
             }
             .market-card.trend-down {
-                box-shadow: 0 0 22px rgba(248, 113, 113, 0.35);
-                border-color: rgba(248, 113, 113, 0.45);
+                border-left: 5px solid rgba(248, 113, 113, 0.85);
             }
-            .market-title { color: #e2e8f0; font-weight: 700; }
-            .market-price { color: #f8fafc; font-size: 1.15rem; font-weight: 700; margin-top: 0.2rem; }
-            .market-delta { color: #cbd5e1; margin-top: 0.15rem; font-size: 0.88rem; }
+            .market-title { color: #1f2937; font-weight: 800; font-size: 1.05rem; }
+            .market-price { color: #111827; font-size: 1.95rem; font-weight: 800; margin-top: 0.15rem; line-height: 1.1; }
+            .market-delta { color: #6b7280; margin-top: 0.15rem; font-size: 0.92rem; font-weight: 600; }
         </style>
         """,
         unsafe_allow_html=True,
@@ -861,18 +859,17 @@ def inject_login_modern_theme() -> None:
 
 def render_login_view(auth_service: AuthService) -> None:
     inject_login_modern_theme()
-    left_col, right_col = st.columns([2, 3], gap="large")
+    st.markdown(
+        """
+        <div class="hero-panel">
+            <div class="hero-subtitle">Moderní platforma pro propojení nákladů, rozpočtů a daty – kompletní jednotný panel.</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    left_col, right_col = st.columns([1, 2], gap="large")
 
     with left_col:
-        st.markdown(
-            """
-            <div class="hero-panel">
-                <div class="hero-title">BoQ Bid Studio</div>
-                <div class="hero-subtitle">Moderní platforma pro porovnání nabídek, rozpočty a tržní kontext v jednom panelu.</div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
         st.markdown('<div class="login-panel">', unsafe_allow_html=True)
         st.header("Přihlášení do aplikace")
         st.caption("Pro přístup ke svým projektům se prosím přihlaste.")
