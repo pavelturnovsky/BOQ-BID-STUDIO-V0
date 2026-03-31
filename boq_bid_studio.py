@@ -14,11 +14,15 @@ import time
 import unicodedata
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from decimal import Decimal
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple, Union
 from string import Template
+from urllib.error import URLError
+from urllib.request import Request, urlopen
+from urllib.parse import quote_plus
+import xml.etree.ElementTree as ET
 
 import numpy as np
 import pandas as pd
@@ -49,8 +53,8 @@ from core.excel_outline import build_outline_nodes, read_outline_levels
 from core.export import dataframe_to_excel_bytes_with_outline
 
 # ------------- App Config -------------
-st.set_page_config(page_title="BoQ Bid Studio V.04", layout="wide")
-st.title("🏗️ BoQ Bid Studio V.04")
+st.set_page_config(page_title="BoQ Bid Studio", layout="wide")
+st.title("🏗️ BoQ Bid Studio")
 st.caption("Jedna aplikace pro nahrání, mapování, porovnání nabídek a vizualizace — bez exportů do Excelu.")
 
 # ------------- Helpers -------------
@@ -647,110 +651,229 @@ LOGIN_MARKET_ITEMS: Sequence[Dict[str, Any]] = [
     {"name": "Plyn", "unit": "EUR/MWh", "base_price": 41.0},
 ]
 
-LOGIN_NEWS_ITEMS: Sequence[Dict[str, str]] = [
+LOGIN_NEWS_FALLBACK: Sequence[Dict[str, str]] = [
     {
-        "category": "Trh",
-        "headline": "Evropský trh oceli hlásí zvýšenou volatilitu vstupních cen.",
-        "impact": "Doporučení: ověřte cenovou rezervu u položek s vyšším podílem oceli.",
-    },
-    {
-        "category": "Veřejné zakázky",
-        "headline": "Roste důraz na transparentní indexaci cen u delších kontraktů.",
-        "impact": "Doporučení: sjednotit metodiku sledování indexů napříč projekty.",
-    },
-    {
-        "category": "Energie",
-        "headline": "Ceny energií se drží v pásmu, regionální odchylky přetrvávají.",
-        "impact": "Doporučení: u výrobních položek průběžně aktualizujte energetický koeficient.",
-    },
-    {
-        "category": "Materiály",
-        "headline": "Dodavatelé hlásí delší dodací lhůty u vybraných kovových komponent.",
-        "impact": "Doporučení: ověřte časové rezervy harmonogramu pro klíčové položky.",
-    },
-    {
-        "category": "Legislativa",
-        "headline": "Stoupá tlak na digitální auditovatelnost změn v rozpočtech staveb.",
-        "impact": "Doporučení: evidovat důvod změny ceny a zdroj dat u významných odchylek.",
-    },
-    {
-        "category": "Technologie",
-        "headline": "Automatizované porovnání nabídek zkracuje přípravnou fázi tendrů.",
-        "impact": "Doporučení: zvýšit četnost kontrolních revizí během prvních kol soutěže.",
-    },
-    {
-        "category": "Makro",
-        "headline": "Měnové pohyby CZK/EUR a USD/CZK ovlivňují importní položky rozpočtů.",
-        "impact": "Doporučení: sledovat kurzové riziko u položek v cizí měně.",
+        "category": "Stavebnictví",
+        "headline": "Stavebnictví v EU hledá rovnováhu mezi cenami energií a investicemi.",
+        "impact": "Sledujte vývoj energií a cen kovů kvůli dopadu do rozpočtů.",
+        "url": "https://ec.europa.eu/eurostat/web/main/data/database",
+        "source": "Eurostat",
     },
 ]
 
 
-def build_login_market_snapshot(snapshot_date: Optional[date] = None) -> pd.DataFrame:
-    """Return deterministic daily market snapshot for the login overview panel."""
+def get_daily_fx_rates(base: str = "CZK") -> Dict[str, Any]:
+    """Fetch live FX rates for conversion into CZK with resilient fallback."""
+
+    fallback = {
+        "base": base,
+        "date": date.today().isoformat(),
+        "rates": {"EUR": 24.85, "USD": 22.95, "CZK": 1.0},
+    }
+    try:
+        req = Request(
+            f"https://open.er-api.com/v6/latest/{base}",
+            headers={"User-Agent": "BoQ-Bid-Studio/2026"},
+        )
+        with urlopen(req, timeout=6) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        rates = payload.get("rates", {})
+        if isinstance(rates, dict) and rates.get("EUR") and rates.get("USD"):
+            return {
+                "base": payload.get("base_code", base),
+                "date": payload.get("time_last_update_utc", fallback["date"]),
+                "rates": {"EUR": float(rates["EUR"]), "USD": float(rates["USD"]), "CZK": 1.0},
+            }
+    except (URLError, TimeoutError, ValueError, json.JSONDecodeError):
+        pass
+    return fallback
+
+
+def build_login_market_snapshot(
+    snapshot_date: Optional[date] = None,
+    history_days: int = 14,
+) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    """Return market snapshot with at least 14 days of history converted to CZK."""
 
     target_date = snapshot_date or date.today()
-    ordinal = target_date.toordinal()
+    history_days = max(14, int(history_days))
+    rates = get_daily_fx_rates(base="CZK")
     rows: List[Dict[str, Any]] = []
     for item in LOGIN_MARKET_ITEMS:
-        key = f"{item['name']}-{ordinal}"
-        digest = hashlib.sha256(key.encode("utf-8")).hexdigest()
-        day_change = ((int(digest[:6], 16) % 501) - 250) / 100.0  # -2.50 % až +2.50 %
-        week_change = day_change * (1.8 + ((int(digest[6:10], 16) % 80) / 100.0))
-        trend_bias = (((ordinal % 30) - 15) / 1000.0)
-        last_price = item["base_price"] * (1 + trend_bias) * (1 + day_change / 100.0)
+        history: List[float] = []
+        for offset in range(history_days):
+            day = target_date - timedelta(days=(history_days - offset - 1))
+            key = f"{item['name']}-{day.toordinal()}"
+            digest = hashlib.sha256(key.encode("utf-8")).hexdigest()
+            daily_noise = ((int(digest[:6], 16) % 501) - 250) / 100.0
+            trend_bias = (((day.toordinal() % 30) - 15) / 1200.0)
+            price = item["base_price"] * (1 + trend_bias) * (1 + daily_noise / 100.0)
+            history.append(float(price))
+
+        unit = str(item["unit"])
+        source_currency = unit.split("/")[0]
+        fx_rate = float(rates["rates"].get(source_currency, 1.0))
+        converted_history = [value / fx_rate for value in history]
+        last_price = converted_history[-1]
+        prev_price = converted_history[-2] if len(converted_history) >= 2 else converted_history[-1]
+        week_price = converted_history[-8] if len(converted_history) >= 8 else converted_history[0]
+        day_change = ((last_price / prev_price) - 1) * 100 if prev_price else 0.0
+        week_change = ((last_price / week_price) - 1) * 100 if week_price else 0.0
         rows.append(
             {
                 "Materiál": item["name"],
-                "Cena": f"{last_price:,.2f} {item['unit']}",
+                "Jednotka": unit.split("/")[-1],
+                "Cena_CZK": last_price,
                 "D/D": day_change,
                 "W/W": week_change,
+                "Trend14": converted_history,
             }
         )
-    return pd.DataFrame(rows)
+    return pd.DataFrame(rows), rates
 
 
-def build_login_news_digest(snapshot_date: Optional[date] = None, limit: int = 4) -> List[Dict[str, str]]:
-    """Return a rotating daily list of short construction news items."""
+def build_login_news_digest(limit: int = 5) -> List[Dict[str, str]]:
+    """Fetch latest construction news with source links for the login panel."""
 
-    target_date = snapshot_date or date.today()
-    if not LOGIN_NEWS_ITEMS:
-        return []
-    start_idx = target_date.toordinal() % len(LOGIN_NEWS_ITEMS)
-    ordered = list(LOGIN_NEWS_ITEMS[start_idx:]) + list(LOGIN_NEWS_ITEMS[:start_idx])
-    return ordered[: max(limit, 1)]
+    query = quote_plus("stavebnictví OR stavební trh")
+    endpoint = f"https://news.google.com/rss/search?q={query}&hl=cs&gl=CZ&ceid=CZ:cs"
+    try:
+        req = Request(endpoint, headers={"User-Agent": "BoQ-Bid-Studio/2026"})
+        with urlopen(req, timeout=6) as response:
+            xml_bytes = response.read()
+        root = ET.fromstring(xml_bytes)
+        items = root.findall("./channel/item")
+        output: List[Dict[str, str]] = []
+        for item in items[: max(limit, 1)]:
+            title = (item.findtext("title") or "").strip()
+            link = (item.findtext("link") or "").strip()
+            source = (item.findtext("source") or "Google News").strip()
+            if not title or not link:
+                continue
+            output.append(
+                {
+                    "category": "Stavebnictví",
+                    "headline": title,
+                    "impact": "Přečtěte detail článku na uvedeném odkazu.",
+                    "url": link,
+                    "source": source,
+                }
+            )
+        if output:
+            return output
+    except (URLError, TimeoutError, ET.ParseError):
+        pass
+    return list(LOGIN_NEWS_FALLBACK)[: max(limit, 1)]
 
 
 def render_login_market_and_news_panel() -> None:
     """Render market snapshot and construction news on the login page."""
 
     snapshot_date = date.today()
-    st.subheader("Denní přehled stavebního trhu")
-    st.caption(f"Poslední aktualizace dat: {snapshot_date.strftime('%d.%m.%Y')} (automatická denní synchronizace)")
-
-    market_df = build_login_market_snapshot(snapshot_date)
+    market_df, rates = build_login_market_snapshot(snapshot_date=snapshot_date, history_days=14)
+    st.markdown("#### Denní přehled stavebního trhu")
+    st.caption(
+        f"Poslední aktualizace: {snapshot_date.strftime('%d.%m.%Y')} | Kurz: 1 EUR = {1 / rates['rates']['EUR']:.4f} CZK, 1 USD = {1 / rates['rates']['USD']:.4f} CZK"
+    )
     market_cols = st.columns(2)
     for idx, row in market_df.iterrows():
         col = market_cols[idx % len(market_cols)]
-        delta_color = "normal" if float(row["D/D"]) >= 0 else "inverse"
         with col:
-            st.metric(
-                label=str(row["Materiál"]),
-                value=str(row["Cena"]),
-                delta=f"{float(row['D/D']):+.2f} % D/D | {float(row['W/W']):+.2f} % W/W",
-                delta_color=delta_color,
+            daily_change = float(row["D/D"])
+            weekly_change = float(row["W/W"])
+            glow_class = "trend-up" if daily_change >= 0 else "trend-down"
+            st.markdown(
+                f"""
+                <div class="market-card {glow_class}">
+                    <div class="market-title">{row["Materiál"]}</div>
+                    <div class="market-price">{row["Cena_CZK"]:,.2f} CZK/{row["Jednotka"]}</div>
+                    <div class="market-delta">D/D {daily_change:+.2f} % | W/W {weekly_change:+.2f} %</div>
+                </div>
+                """,
+                unsafe_allow_html=True,
             )
+            trend_df = pd.DataFrame({"den": list(range(1, len(row["Trend14"]) + 1)), "cena": row["Trend14"]})
+            fig = px.line(trend_df, x="den", y="cena")
+            fig.update_layout(height=130, margin=dict(l=0, r=0, t=0, b=0), showlegend=False)
+            fig.update_traces(line=dict(color="#00e676" if daily_change >= 0 else "#ff5252", width=2))
+            fig.update_xaxes(visible=False)
+            fig.update_yaxes(visible=False)
+            st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
 
     st.markdown("#### Aktuální zprávy a zajímavosti ze stavebnictví")
-    for news in build_login_news_digest(snapshot_date):
+    for news in build_login_news_digest():
         st.markdown(f"**{news['category']}** — {news['headline']}")
-        st.caption(news["impact"])
+        st.caption(f"{news['impact']} Zdroj: {news['source']}")
+        st.markdown(f"[Otevřít článek]({news['url']})")
+
+
+def inject_login_modern_theme() -> None:
+    """Inject modern 2026 visual style for the homepage."""
+
+    st.markdown(
+        """
+        <style>
+            .hero-panel, .login-panel, .market-panel {
+                border-radius: 20px;
+                padding: 1.1rem 1.3rem;
+                border: 1px solid rgba(129, 140, 248, 0.35);
+                background:
+                    radial-gradient(circle at top right, rgba(56, 189, 248, 0.18), rgba(15, 23, 42, 0.96) 58%),
+                    linear-gradient(160deg, #0b1220 0%, #111a2f 100%);
+                box-shadow: 0 14px 34px rgba(15, 23, 42, 0.35);
+                margin-bottom: 1rem;
+            }
+            .hero-title {
+                font-size: 2rem;
+                font-weight: 800;
+                line-height: 1.1;
+                color: #f8fafc;
+                letter-spacing: 0.4px;
+            }
+            .hero-subtitle {
+                color: #bfdbfe;
+                margin-top: 0.35rem;
+                margin-bottom: 0.15rem;
+            }
+            .market-card {
+                border: 1px solid rgba(148, 163, 184, 0.25);
+                border-radius: 16px;
+                padding: 0.65rem 0.8rem;
+                margin-bottom: 0.45rem;
+                background: rgba(15, 23, 42, 0.78);
+            }
+            .market-card.trend-up {
+                box-shadow: 0 0 22px rgba(34, 197, 94, 0.36);
+                border-color: rgba(34, 197, 94, 0.48);
+            }
+            .market-card.trend-down {
+                box-shadow: 0 0 22px rgba(248, 113, 113, 0.35);
+                border-color: rgba(248, 113, 113, 0.45);
+            }
+            .market-title { color: #e2e8f0; font-weight: 700; }
+            .market-price { color: #f8fafc; font-size: 1.15rem; font-weight: 700; margin-top: 0.2rem; }
+            .market-delta { color: #cbd5e1; margin-top: 0.15rem; font-size: 0.88rem; }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
 
 
 def render_login_view(auth_service: AuthService) -> None:
+    inject_login_modern_theme()
     left_col, right_col = st.columns([2, 3], gap="large")
 
     with left_col:
+        st.markdown(
+            """
+            <div class="hero-panel">
+                <div class="hero-title">BoQ Bid Studio</div>
+                <div class="hero-subtitle">Moderní platforma pro porovnání nabídek, rozpočty a tržní kontext v jednom panelu.</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        st.markdown('<div class="login-panel">', unsafe_allow_html=True)
         st.header("Přihlášení do aplikace")
         st.caption("Pro přístup ke svým projektům se prosím přihlaste.")
         username = st.text_input("Uživatelské jméno nebo e-mail", key="login_username")
@@ -782,9 +905,12 @@ def render_login_view(auth_service: AuthService) -> None:
             args=("forgot",),
             key="goto_forgot",
         )
+        st.markdown("</div>", unsafe_allow_html=True)
 
     with right_col:
+        st.markdown('<div class="market-panel">', unsafe_allow_html=True)
         render_login_market_and_news_panel()
+        st.markdown("</div>", unsafe_allow_html=True)
 
 
 def render_register_view(auth_service: AuthService) -> None:
