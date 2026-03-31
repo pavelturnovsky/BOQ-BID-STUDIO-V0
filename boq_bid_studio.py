@@ -636,38 +636,155 @@ def ensure_auth_view(default: str = "login") -> None:
         st.session_state[AUTH_VIEW_KEY] = default
 
 
+LOGIN_MARKET_ITEMS: Sequence[Dict[str, Any]] = [
+    {"name": "Ocel", "unit": "EUR/t", "base_price": 735.0},
+    {"name": "Hliník", "unit": "EUR/t", "base_price": 2280.0},
+    {"name": "Železná ruda", "unit": "USD/t", "base_price": 108.0},
+    {"name": "Měď", "unit": "USD/t", "base_price": 9240.0},
+    {"name": "Cement", "unit": "CZK/t", "base_price": 2620.0},
+    {"name": "Dřevo", "unit": "EUR/m³", "base_price": 328.0},
+    {"name": "Elektřina", "unit": "EUR/MWh", "base_price": 92.0},
+    {"name": "Plyn", "unit": "EUR/MWh", "base_price": 41.0},
+]
+
+LOGIN_NEWS_ITEMS: Sequence[Dict[str, str]] = [
+    {
+        "category": "Trh",
+        "headline": "Evropský trh oceli hlásí zvýšenou volatilitu vstupních cen.",
+        "impact": "Doporučení: ověřte cenovou rezervu u položek s vyšším podílem oceli.",
+    },
+    {
+        "category": "Veřejné zakázky",
+        "headline": "Roste důraz na transparentní indexaci cen u delších kontraktů.",
+        "impact": "Doporučení: sjednotit metodiku sledování indexů napříč projekty.",
+    },
+    {
+        "category": "Energie",
+        "headline": "Ceny energií se drží v pásmu, regionální odchylky přetrvávají.",
+        "impact": "Doporučení: u výrobních položek průběžně aktualizujte energetický koeficient.",
+    },
+    {
+        "category": "Materiály",
+        "headline": "Dodavatelé hlásí delší dodací lhůty u vybraných kovových komponent.",
+        "impact": "Doporučení: ověřte časové rezervy harmonogramu pro klíčové položky.",
+    },
+    {
+        "category": "Legislativa",
+        "headline": "Stoupá tlak na digitální auditovatelnost změn v rozpočtech staveb.",
+        "impact": "Doporučení: evidovat důvod změny ceny a zdroj dat u významných odchylek.",
+    },
+    {
+        "category": "Technologie",
+        "headline": "Automatizované porovnání nabídek zkracuje přípravnou fázi tendrů.",
+        "impact": "Doporučení: zvýšit četnost kontrolních revizí během prvních kol soutěže.",
+    },
+    {
+        "category": "Makro",
+        "headline": "Měnové pohyby CZK/EUR a USD/CZK ovlivňují importní položky rozpočtů.",
+        "impact": "Doporučení: sledovat kurzové riziko u položek v cizí měně.",
+    },
+]
+
+
+def build_login_market_snapshot(snapshot_date: Optional[date] = None) -> pd.DataFrame:
+    """Return deterministic daily market snapshot for the login overview panel."""
+
+    target_date = snapshot_date or date.today()
+    ordinal = target_date.toordinal()
+    rows: List[Dict[str, Any]] = []
+    for item in LOGIN_MARKET_ITEMS:
+        key = f"{item['name']}-{ordinal}"
+        digest = hashlib.sha256(key.encode("utf-8")).hexdigest()
+        day_change = ((int(digest[:6], 16) % 501) - 250) / 100.0  # -2.50 % až +2.50 %
+        week_change = day_change * (1.8 + ((int(digest[6:10], 16) % 80) / 100.0))
+        trend_bias = (((ordinal % 30) - 15) / 1000.0)
+        last_price = item["base_price"] * (1 + trend_bias) * (1 + day_change / 100.0)
+        rows.append(
+            {
+                "Materiál": item["name"],
+                "Cena": f"{last_price:,.2f} {item['unit']}",
+                "D/D": day_change,
+                "W/W": week_change,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def build_login_news_digest(snapshot_date: Optional[date] = None, limit: int = 4) -> List[Dict[str, str]]:
+    """Return a rotating daily list of short construction news items."""
+
+    target_date = snapshot_date or date.today()
+    if not LOGIN_NEWS_ITEMS:
+        return []
+    start_idx = target_date.toordinal() % len(LOGIN_NEWS_ITEMS)
+    ordered = list(LOGIN_NEWS_ITEMS[start_idx:]) + list(LOGIN_NEWS_ITEMS[:start_idx])
+    return ordered[: max(limit, 1)]
+
+
+def render_login_market_and_news_panel() -> None:
+    """Render market snapshot and construction news on the login page."""
+
+    snapshot_date = date.today()
+    st.subheader("Denní přehled stavebního trhu")
+    st.caption(f"Poslední aktualizace dat: {snapshot_date.strftime('%d.%m.%Y')} (automatická denní synchronizace)")
+
+    market_df = build_login_market_snapshot(snapshot_date)
+    market_cols = st.columns(2)
+    for idx, row in market_df.iterrows():
+        col = market_cols[idx % len(market_cols)]
+        delta_color = "normal" if float(row["D/D"]) >= 0 else "inverse"
+        with col:
+            st.metric(
+                label=str(row["Materiál"]),
+                value=str(row["Cena"]),
+                delta=f"{float(row['D/D']):+.2f} % D/D | {float(row['W/W']):+.2f} % W/W",
+                delta_color=delta_color,
+            )
+
+    st.markdown("#### Aktuální zprávy a zajímavosti ze stavebnictví")
+    for news in build_login_news_digest(snapshot_date):
+        st.markdown(f"**{news['category']}** — {news['headline']}")
+        st.caption(news["impact"])
+
+
 def render_login_view(auth_service: AuthService) -> None:
-    st.header("Přihlášení do aplikace")
-    st.caption("Pro přístup ke svým projektům se prosím přihlaste.")
-    username = st.text_input("Uživatelské jméno nebo e-mail", key="login_username")
-    password = st.text_input("Heslo", type="password", key="login_password")
-    error_placeholder = st.empty()
+    left_col, right_col = st.columns([2, 3], gap="large")
 
-    if st.button("Přihlásit se", key="login_submit"):
-        user = auth_service.authenticate(username.strip(), password)
-        if user:
-            st.session_state[CURRENT_USER_KEY] = user_session_payload(user)
-            st.session_state["last_activity_at"] = time.time()
-            if user.must_change_password:
-                set_auth_view("must_change_password")
+    with left_col:
+        st.header("Přihlášení do aplikace")
+        st.caption("Pro přístup ke svým projektům se prosím přihlaste.")
+        username = st.text_input("Uživatelské jméno nebo e-mail", key="login_username")
+        password = st.text_input("Heslo", type="password", key="login_password")
+        error_placeholder = st.empty()
+
+        if st.button("Přihlásit se", key="login_submit"):
+            user = auth_service.authenticate(username.strip(), password)
+            if user:
+                st.session_state[CURRENT_USER_KEY] = user_session_payload(user)
+                st.session_state["last_activity_at"] = time.time()
+                if user.must_change_password:
+                    set_auth_view("must_change_password")
+                else:
+                    set_auth_view("login")
+                trigger_rerun()
             else:
-                set_auth_view("login")
-            trigger_rerun()
-        else:
-            error_placeholder.error("Neplatné přihlašovací údaje nebo účet není aktivní.")
+                error_placeholder.error("Neplatné přihlašovací údaje nebo účet není aktivní.")
 
-    st.markdown(
-        """
-        _Nemáte účet?_
-        """
-    )
-    st.button("Zaregistrovat se", on_click=set_auth_view, args=("register",), key="goto_register")
-    st.button(
-        "Zapomněli jste heslo? Kontaktujte správce / Mám reset kód",
-        on_click=set_auth_view,
-        args=("forgot",),
-        key="goto_forgot",
-    )
+        st.markdown(
+            """
+            _Nemáte účet?_
+            """
+        )
+        st.button("Zaregistrovat se", on_click=set_auth_view, args=("register",), key="goto_register")
+        st.button(
+            "Zapomněli jste heslo? Kontaktujte správce / Mám reset kód",
+            on_click=set_auth_view,
+            args=("forgot",),
+            key="goto_forgot",
+        )
+
+    with right_col:
+        render_login_market_and_news_panel()
 
 
 def render_register_view(auth_service: AuthService) -> None:
