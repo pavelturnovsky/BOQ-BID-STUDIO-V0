@@ -54,8 +54,6 @@ from core.export import dataframe_to_excel_bytes_with_outline
 
 # ------------- App Config -------------
 st.set_page_config(page_title="BoQ Bid Studio", layout="wide")
-st.title("🏗️ BoQ Bid Studio")
-st.caption("Jedna aplikace pro nahrání, mapování, porovnání nabídek a vizualizace — bez exportů do Excelu.")
 
 # ------------- Helpers -------------
 
@@ -645,6 +643,7 @@ LOGIN_MARKET_ITEMS: Sequence[Dict[str, Any]] = [
     {"name": "Hliník", "unit": "EUR/t", "base_price": 2280.0},
     {"name": "Železná ruda", "unit": "USD/t", "base_price": 108.0},
     {"name": "Měď", "unit": "USD/t", "base_price": 9240.0},
+    {"name": "Beton", "unit": "CZK/m³", "base_price": 3450.0},
     {"name": "Cement", "unit": "CZK/t", "base_price": 2620.0},
     {"name": "Dřevo", "unit": "EUR/m³", "base_price": 328.0},
     {"name": "Elektřina", "unit": "EUR/MWh", "base_price": 92.0},
@@ -796,7 +795,35 @@ def render_login_market_and_news_panel() -> None:
             """,
             unsafe_allow_html=True,
         )
-    st.button("Zobrazit detailní analýzu", key="open_market_analysis", use_container_width=True)
+        trend_series = pd.DataFrame(
+            {
+                "Den": pd.date_range(end=snapshot_date, periods=len(row["Trend14"]), freq="D"),
+                "Cena": row["Trend14"],
+            }
+        )
+        fig = px.line(trend_series, x="Den", y="Cena")
+        fig.update_layout(
+            height=170,
+            margin=dict(l=8, r=8, t=8, b=8),
+            paper_bgcolor="rgba(0,0,0,0)",
+            plot_bgcolor="rgba(249,250,251,0.7)",
+            xaxis_title=None,
+            yaxis_title=None,
+            showlegend=False,
+        )
+        fig.update_traces(line=dict(color="#0f766e", width=2.4))
+        st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+
+    st.markdown("### Aktuální informace a odkazy")
+    for news_item in build_login_news_digest(limit=5):
+        source = news_item.get("source") or "Zdroj"
+        headline = news_item.get("headline") or "Aktualita"
+        impact = news_item.get("impact") or ""
+        url = news_item.get("url")
+        if url:
+            st.markdown(f"- **{source}:** [{headline}]({url})  \n  {impact}")
+        else:
+            st.markdown(f"- **{source}:** {headline}  \n  {impact}")
 
 
 def inject_login_modern_theme() -> None:
@@ -811,7 +838,7 @@ def inject_login_modern_theme() -> None:
                     radial-gradient(circle at 15% 90%, rgba(125, 211, 252, 0.20), transparent 40%),
                     radial-gradient(circle at 95% 12%, rgba(253, 224, 71, 0.20), transparent 35%);
             }
-            .hero-panel, .login-panel, .market-panel {
+            .hero-panel, .intro-panel, .login-panel, .market-panel {
                 border-radius: 22px;
                 padding: 1.2rem 1.4rem;
                 border: 1px solid rgba(148, 163, 184, 0.28);
@@ -820,10 +847,16 @@ def inject_login_modern_theme() -> None:
                 box-shadow: 0 10px 30px rgba(15, 23, 42, 0.12);
                 margin-bottom: 1rem;
             }
-            .hero-subtitle {
+            .hero-logo {
+                max-width: 520px;
+                width: 100%;
+                height: auto;
+                display: block;
+            }
+            .intro-text {
                 color: #4b5563;
                 font-size: 1.08rem;
-                margin: 0.2rem 0;
+                margin: 0;
             }
             .market-panel-title {
                 font-size: 1.95rem;
@@ -859,10 +892,14 @@ def inject_login_modern_theme() -> None:
 
 def render_login_view(auth_service: AuthService) -> None:
     inject_login_modern_theme()
+    st.markdown('<div class="hero-panel">', unsafe_allow_html=True)
+    st.image("assets/boq_bid_studio_logo.svg", use_container_width=False, width=520)
+    st.markdown("</div>", unsafe_allow_html=True)
+
     st.markdown(
         """
-        <div class="hero-panel">
-            <div class="hero-subtitle">Moderní platforma pro propojení nákladů, rozpočtů a daty – kompletní jednotný panel.</div>
+        <div class="intro-panel">
+            <div class="intro-text">Jedna aplikace pro mapování, porovnání nabídek a vizualizace nabídek.</div>
         </div>
         """,
         unsafe_allow_html=True,
