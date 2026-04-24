@@ -886,6 +886,10 @@ def inject_login_modern_theme() -> None:
             .stApp {
                 background: #f5f7fa;
             }
+            .auth-panels-wrap {
+                margin-top: 0.25rem;
+                margin-bottom: 0.5rem;
+            }
             .intro-panel, .login-panel, .market-panel {
                 border-radius: 12px;
                 padding: 1.15rem 1.2rem;
@@ -893,6 +897,16 @@ def inject_login_modern_theme() -> None:
                 background: #ffffff;
                 box-shadow: 0 2px 10px rgba(15, 23, 42, 0.05);
                 margin-bottom: 0.9rem;
+            }
+            .login-panel, .market-panel {
+                border-radius: 16px;
+                border: 1px solid #cfd8e3;
+                padding: 1.35rem 1.4rem;
+                box-shadow: 0 10px 26px rgba(15, 23, 42, 0.10);
+                background: linear-gradient(180deg, #ffffff 0%, #f8fafc 100%);
+            }
+            .login-panel {
+                border-top: 4px solid #2563eb;
             }
             .intro-title {
                 color: #111827;
@@ -956,6 +970,11 @@ def inject_login_modern_theme() -> None:
                 padding: 0.65rem 0.75rem;
                 margin-bottom: 0.45rem;
                 background: #ffffff;
+                box-shadow: 0 1px 4px rgba(15, 23, 42, 0.04);
+            }
+            .login-panel .stButton > button {
+                width: 100%;
+                border-radius: 10px;
             }
             .market-card.trend-up { border-left: 4px solid #16a34a; }
             .market-card.trend-down { border-left: 4px solid #dc2626; }
@@ -980,6 +999,7 @@ def render_login_view(auth_service: AuthService) -> None:
         """,
         unsafe_allow_html=True,
     )
+    st.markdown('<div class="auth-panels-wrap">', unsafe_allow_html=True)
     left_col, right_col = st.columns([2, 3], gap="medium")
 
     with left_col:
@@ -1021,6 +1041,7 @@ def render_login_view(auth_service: AuthService) -> None:
         st.markdown('<div class="market-panel">', unsafe_allow_html=True)
         render_login_market_and_news_panel()
         st.markdown("</div>", unsafe_allow_html=True)
+    st.markdown("</div>", unsafe_allow_html=True)
 
 
 def render_register_view(auth_service: AuthService) -> None:
