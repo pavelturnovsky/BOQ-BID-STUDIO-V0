@@ -690,12 +690,12 @@ def get_daily_fx_rates(base: str = "CZK") -> Dict[str, Any]:
 
 def build_login_market_snapshot(
     snapshot_date: Optional[date] = None,
-    history_days: int = 14,
+    history_days: int = 365,
 ) -> Tuple[pd.DataFrame, Dict[str, Any]]:
-    """Return market snapshot with at least 14 days of history converted to CZK."""
+    """Return market snapshot with configurable history converted to CZK."""
 
     target_date = snapshot_date or date.today()
-    history_days = max(14, int(history_days))
+    history_days = max(30, int(history_days))
     rates = get_daily_fx_rates(base="CZK")
     rows: List[Dict[str, Any]] = []
     for item in LOGIN_MARKET_ITEMS:
@@ -725,7 +725,7 @@ def build_login_market_snapshot(
                 "Cena_CZK": last_price,
                 "D/D": day_change,
                 "W/W": week_change,
-                "Trend14": converted_history,
+                "TrendSeries": converted_history,
             }
         )
     return pd.DataFrame(rows), rates
@@ -769,7 +769,65 @@ def render_login_market_and_news_panel() -> None:
     """Render construction market news and commodity prices for login homepage."""
 
     snapshot_date = date.today()
-    market_df, rates = build_login_market_snapshot(snapshot_date=snapshot_date, history_days=14)
+    market_df, rates = build_login_market_snapshot(snapshot_date=snapshot_date, history_days=365)
+    trend_period = st.radio(
+        "Vývoj cen",
+        options=("Posledních 12 měsíců", "Poslední měsíc"),
+        horizontal=True,
+        label_visibility="collapsed",
+        key="login_market_trend_period",
+    )
+    trend_days = 365 if trend_period == "Posledních 12 měsíců" else 30
+
+    st.markdown(
+        """
+        <div class="market-section-title">Přehled cen komodit</div>
+        """,
+        unsafe_allow_html=True,
+    )
+    st.caption(
+        f"Aktualizace {snapshot_date.strftime('%d.%m.%Y')} • 1 EUR = {1 / rates['rates']['EUR']:.4f} CZK • 1 USD = {1 / rates['rates']['USD']:.4f} CZK"
+    )
+    for _, row in market_df.iterrows():
+        daily_change = float(row["D/D"])
+        weekly_change = float(row["W/W"])
+        change_class = "trend-up" if daily_change >= 0 else "trend-down"
+        day_arrow = "▲" if daily_change >= 0 else "▼"
+        week_arrow = "▲" if weekly_change >= 0 else "▼"
+        trend_values = list(row["TrendSeries"])
+        trend_window = trend_values[-trend_days:]
+        trend_start_date = snapshot_date - timedelta(days=len(trend_window) - 1)
+        trend_series = pd.DataFrame(
+            {
+                "Den": pd.date_range(start=trend_start_date, periods=len(trend_window), freq="D"),
+                "Cena": trend_window,
+            }
+        )
+
+        st.markdown(f"<div class='market-title'>{row['Materiál']}</div>", unsafe_allow_html=True)
+        fig = px.line(trend_series, x="Den", y="Cena")
+        fig.update_layout(
+            height=140,
+            margin=dict(l=8, r=8, t=8, b=8),
+            paper_bgcolor="rgba(0,0,0,0)",
+            plot_bgcolor="rgba(249,250,251,1)",
+            xaxis_title=None,
+            yaxis_title=None,
+            showlegend=False,
+        )
+        fig.update_traces(line=dict(color="#2563eb", width=2.1))
+        st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+
+        st.markdown(
+            f"""
+            <div class="market-card {change_class}">
+                <div class="market-price">{row["Cena_CZK"]:,.2f} CZK/{row["Jednotka"]}</div>
+                <div class="market-delta">{daily_change:+.2f}% {day_arrow} • týden {weekly_change:+.2f}% {week_arrow}</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
     st.markdown(
         """
         <div class="market-section-title">Informace ze stavebního trhu</div>
@@ -804,50 +862,6 @@ def render_login_market_and_news_panel() -> None:
                 unsafe_allow_html=True,
             )
 
-    st.markdown(
-        """
-        <div class="market-section-title">Přehled cen komodit</div>
-        """,
-        unsafe_allow_html=True,
-    )
-    st.caption(
-        f"Aktualizace {snapshot_date.strftime('%d.%m.%Y')} • 1 EUR = {1 / rates['rates']['EUR']:.4f} CZK • 1 USD = {1 / rates['rates']['USD']:.4f} CZK"
-    )
-    for _, row in market_df.iterrows():
-        daily_change = float(row["D/D"])
-        weekly_change = float(row["W/W"])
-        change_class = "trend-up" if daily_change >= 0 else "trend-down"
-        day_arrow = "▲" if daily_change >= 0 else "▼"
-        week_arrow = "▲" if weekly_change >= 0 else "▼"
-        st.markdown(
-            f"""
-            <div class="market-card {change_class}">
-                <div class="market-title">{row["Materiál"]}</div>
-                <div class="market-price">{row["Cena_CZK"]:,.2f} CZK/{row["Jednotka"]}</div>
-                <div class="market-delta">{daily_change:+.2f}% {day_arrow} • týden {weekly_change:+.2f}% {week_arrow}</div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-        trend_series = pd.DataFrame(
-            {
-                "Den": pd.date_range(end=snapshot_date, periods=len(row["Trend14"]), freq="D"),
-                "Cena": row["Trend14"],
-            }
-        )
-        fig = px.line(trend_series, x="Den", y="Cena")
-        fig.update_layout(
-            height=130,
-            margin=dict(l=8, r=8, t=8, b=8),
-            paper_bgcolor="rgba(0,0,0,0)",
-            plot_bgcolor="rgba(249,250,251,1)",
-            xaxis_title=None,
-            yaxis_title=None,
-            showlegend=False,
-        )
-        fig.update_traces(line=dict(color="#2563eb", width=2.1))
-        st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
-
 
 def inject_login_modern_theme() -> None:
     """Inject a clear and simple visual style for the homepage login screen."""
@@ -866,10 +880,18 @@ def inject_login_modern_theme() -> None:
                 box-shadow: 0 2px 10px rgba(15, 23, 42, 0.05);
                 margin-bottom: 0.9rem;
             }
-            .intro-text {
-                color: #374151;
-                font-size: 1rem;
+            .intro-title {
+                color: #111827;
+                font-size: 1.85rem;
+                font-weight: 800;
+                line-height: 1.15;
                 margin: 0;
+            }
+            .intro-subtitle {
+                color: #4b5563;
+                font-size: 0.97rem;
+                margin: 0;
+                margin-top: 0.2rem;
             }
             .market-panel {
                 border-left: 5px solid #2563eb;
@@ -935,7 +957,8 @@ def render_login_view(auth_service: AuthService) -> None:
     st.markdown(
         """
         <div class="intro-panel">
-            <div class="intro-text"><strong>BoQ Bid Studio</strong> — Komplexní aplikace pro porovnání nabídek.</div>
+            <div class="intro-title">BoQ Bid Studio</div>
+            <div class="intro-subtitle">Komplexní aplikace pro porovnání nabídek.</div>
         </div>
         """,
         unsafe_allow_html=True,
