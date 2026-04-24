@@ -886,14 +886,6 @@ def inject_login_modern_theme() -> None:
             .stApp {
                 background: #f5f7fa;
             }
-            .auth-column-panel {
-                border-radius: 16px;
-                padding: 1rem;
-                border: 1px solid #d5dce8;
-                background: #ffffff;
-                box-shadow: 0 10px 26px rgba(15, 23, 42, 0.08);
-                margin-bottom: 1rem;
-            }
             .intro-panel, .login-panel, .market-panel {
                 border-radius: 12px;
                 padding: 1.15rem 1.2rem;
@@ -901,16 +893,6 @@ def inject_login_modern_theme() -> None:
                 background: #ffffff;
                 box-shadow: 0 2px 10px rgba(15, 23, 42, 0.05);
                 margin-bottom: 0.9rem;
-            }
-            .auth-column-panel .intro-panel,
-            .auth-column-panel .login-panel,
-            .auth-column-panel .market-panel {
-                border: 1px solid #e2e8f0;
-                box-shadow: none;
-                margin-bottom: 0.8rem;
-            }
-            .auth-column-panel .market-panel {
-                margin-bottom: 0;
             }
             .intro-title {
                 color: #111827;
@@ -989,19 +971,18 @@ def inject_login_modern_theme() -> None:
 
 def render_login_view(auth_service: AuthService) -> None:
     inject_login_modern_theme()
+    st.markdown(
+        """
+        <div class="intro-panel">
+            <div class="intro-title">BoQ Bid Studio</div>
+            <div class="intro-subtitle">Komplexní aplikace pro porovnání nabídek.</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
     left_col, right_col = st.columns([2, 3], gap="medium")
 
     with left_col:
-        st.markdown('<div class="auth-column-panel">', unsafe_allow_html=True)
-        st.markdown(
-            """
-            <div class="intro-panel">
-                <div class="intro-title">BoQ Bid Studio</div>
-                <div class="intro-subtitle">Komplexní aplikace pro porovnání nabídek.</div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
         st.markdown('<div class="login-panel">', unsafe_allow_html=True)
         st.header("Přihlášení do aplikace")
         st.caption("Pro přístup ke svým projektům se prosím přihlaste.")
@@ -1035,13 +1016,10 @@ def render_login_view(auth_service: AuthService) -> None:
             key="goto_forgot",
         )
         st.markdown("</div>", unsafe_allow_html=True)
-        st.markdown("</div>", unsafe_allow_html=True)
 
     with right_col:
-        st.markdown('<div class="auth-column-panel">', unsafe_allow_html=True)
         st.markdown('<div class="market-panel">', unsafe_allow_html=True)
         render_login_market_and_news_panel()
-        st.markdown("</div>", unsafe_allow_html=True)
         st.markdown("</div>", unsafe_allow_html=True)
 
 
