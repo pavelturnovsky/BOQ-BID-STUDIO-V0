@@ -803,8 +803,32 @@ def render_login_market_and_news_panel() -> None:
                 "Cena": trend_window,
             }
         )
+        if trend_period == "Posledních 12 měsíců" and not trend_series.empty:
+            grouped = trend_series.groupby(trend_series["Den"].dt.to_period("M"), sort=True)
+            sampled_frames: List[pd.DataFrame] = []
+            for _, month_data in grouped:
+                month_len = len(month_data)
+                sample_positions = sorted({0, month_len // 2, month_len - 1})
+                sampled_frames.append(month_data.iloc[sample_positions])
+            if sampled_frames:
+                trend_series = (
+                    pd.concat(sampled_frames, ignore_index=True)
+                    .drop_duplicates(subset=["Den"])
+                    .sort_values("Den")
+                )
 
         st.markdown(f"<div class='market-title'>{row['Materiál']}</div>", unsafe_allow_html=True)
+        st.markdown(
+            f"""
+            <div class="market-card {change_class}">
+                <div class="market-summary-title">Denní přehled</div>
+                <div class="market-price">{row["Cena_CZK"]:,.2f} CZK/{row["Jednotka"]}</div>
+                <div class="market-delta">{daily_change:+.2f}% {day_arrow} • týden {weekly_change:+.2f}% {week_arrow}</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
         fig = px.line(trend_series, x="Den", y="Cena")
         fig.update_layout(
             height=140,
@@ -817,16 +841,6 @@ def render_login_market_and_news_panel() -> None:
         )
         fig.update_traces(line=dict(color="#2563eb", width=2.1))
         st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
-
-        st.markdown(
-            f"""
-            <div class="market-card {change_class}">
-                <div class="market-price">{row["Cena_CZK"]:,.2f} CZK/{row["Jednotka"]}</div>
-                <div class="market-delta">{daily_change:+.2f}% {day_arrow} • týden {weekly_change:+.2f}% {week_arrow}</div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
 
     st.markdown(
         """
@@ -897,7 +911,7 @@ def inject_login_modern_theme() -> None:
                 border-left: 5px solid #2563eb;
             }
             .market-section-title {
-                font-size: 1.1rem;
+                font-size: 1.28rem;
                 font-weight: 700;
                 color: #0f172a;
                 margin: 0.35rem 0 0.6rem 0;
@@ -921,6 +935,8 @@ def inject_login_modern_theme() -> None:
                 margin-top: 0.2rem;
                 font-weight: 700;
                 color: #111827;
+                font-size: 1.02rem;
+                line-height: 1.25;
             }
             .info-headline a {
                 color: #1d4ed8;
@@ -943,7 +959,8 @@ def inject_login_modern_theme() -> None:
             }
             .market-card.trend-up { border-left: 4px solid #16a34a; }
             .market-card.trend-down { border-left: 4px solid #dc2626; }
-            .market-title { color: #1f2937; font-weight: 700; font-size: 0.95rem; }
+            .market-title { color: #1f2937; font-weight: 700; font-size: 1.08rem; margin-top: 0.4rem; }
+            .market-summary-title { color: #334155; font-size: 0.82rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.02em; }
             .market-price { color: #111827; font-size: 1.25rem; font-weight: 700; margin-top: 0.1rem; line-height: 1.2; }
             .market-delta { color: #6b7280; margin-top: 0.1rem; font-size: 0.86rem; font-weight: 600; }
         </style>
