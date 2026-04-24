@@ -766,13 +766,47 @@ def build_login_news_digest(limit: int = 5) -> List[Dict[str, str]]:
 
 
 def render_login_market_and_news_panel() -> None:
-    """Render market snapshot in the right-side panel on the login page."""
+    """Render construction market news and commodity prices for login homepage."""
 
     snapshot_date = date.today()
     market_df, rates = build_login_market_snapshot(snapshot_date=snapshot_date, history_days=14)
     st.markdown(
         """
-        <div class="market-panel-title">Denní přehled stavebního trhu</div>
+        <div class="market-section-title">Informace ze stavebního trhu</div>
+        """,
+        unsafe_allow_html=True,
+    )
+    for news_item in build_login_news_digest(limit=5):
+        source = news_item.get("source") or "Zdroj"
+        headline = news_item.get("headline") or "Aktualita"
+        impact = news_item.get("impact") or ""
+        url = news_item.get("url")
+        if url:
+            st.markdown(
+                f"""
+                <div class="info-card">
+                    <div class="info-source">{source}</div>
+                    <div class="info-headline"><a href="{url}" target="_blank">{headline}</a></div>
+                    <div class="info-impact">{impact}</div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+        else:
+            st.markdown(
+                f"""
+                <div class="info-card">
+                    <div class="info-source">{source}</div>
+                    <div class="info-headline">{headline}</div>
+                    <div class="info-impact">{impact}</div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+    st.markdown(
+        """
+        <div class="market-section-title">Přehled cen komodit</div>
         """,
         unsafe_allow_html=True,
     )
@@ -790,7 +824,7 @@ def render_login_market_and_news_panel() -> None:
             <div class="market-card {change_class}">
                 <div class="market-title">{row["Materiál"]}</div>
                 <div class="market-price">{row["Cena_CZK"]:,.2f} CZK/{row["Jednotka"]}</div>
-                <div class="market-delta">{daily_change:+.2f}% {day_arrow} • dnes {weekly_change:+.2f}% {week_arrow}</div>
+                <div class="market-delta">{daily_change:+.2f}% {day_arrow} • týden {weekly_change:+.2f}% {week_arrow}</div>
             </div>
             """,
             unsafe_allow_html=True,
@@ -803,87 +837,99 @@ def render_login_market_and_news_panel() -> None:
         )
         fig = px.line(trend_series, x="Den", y="Cena")
         fig.update_layout(
-            height=170,
+            height=130,
             margin=dict(l=8, r=8, t=8, b=8),
             paper_bgcolor="rgba(0,0,0,0)",
-            plot_bgcolor="rgba(249,250,251,0.7)",
+            plot_bgcolor="rgba(249,250,251,1)",
             xaxis_title=None,
             yaxis_title=None,
             showlegend=False,
         )
-        fig.update_traces(line=dict(color="#0f766e", width=2.4))
+        fig.update_traces(line=dict(color="#2563eb", width=2.1))
         st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
-
-    st.markdown("### Aktuální informace a odkazy")
-    for news_item in build_login_news_digest(limit=5):
-        source = news_item.get("source") or "Zdroj"
-        headline = news_item.get("headline") or "Aktualita"
-        impact = news_item.get("impact") or ""
-        url = news_item.get("url")
-        if url:
-            st.markdown(f"- **{source}:** [{headline}]({url})  \n  {impact}")
-        else:
-            st.markdown(f"- **{source}:** {headline}  \n  {impact}")
 
 
 def inject_login_modern_theme() -> None:
-    """Inject polished visual style for the homepage login screen."""
+    """Inject a clear and simple visual style for the homepage login screen."""
 
     st.markdown(
         """
         <style>
             .stApp {
-                background:
-                    linear-gradient(180deg, rgba(243, 247, 255, 0.96) 0%, rgba(233, 241, 251, 0.90) 100%),
-                    radial-gradient(circle at 15% 90%, rgba(125, 211, 252, 0.20), transparent 40%),
-                    radial-gradient(circle at 95% 12%, rgba(253, 224, 71, 0.20), transparent 35%);
+                background: #f5f7fa;
             }
             .hero-panel, .intro-panel, .login-panel, .market-panel {
-                border-radius: 22px;
-                padding: 1.2rem 1.4rem;
-                border: 1px solid rgba(148, 163, 184, 0.28);
-                background: rgba(255, 255, 255, 0.82);
-                backdrop-filter: blur(6px);
-                box-shadow: 0 10px 30px rgba(15, 23, 42, 0.12);
-                margin-bottom: 1rem;
+                border-radius: 12px;
+                padding: 1.15rem 1.2rem;
+                border: 1px solid #d9dee8;
+                background: #ffffff;
+                box-shadow: 0 2px 10px rgba(15, 23, 42, 0.05);
+                margin-bottom: 0.9rem;
             }
             .hero-logo {
-                max-width: 520px;
+                max-width: 460px;
                 width: 100%;
                 height: auto;
                 display: block;
             }
             .intro-text {
-                color: #4b5563;
-                font-size: 1.08rem;
+                color: #374151;
+                font-size: 1rem;
                 margin: 0;
             }
-            .market-panel-title {
-                font-size: 1.95rem;
-                font-weight: 800;
-                color: #f8fafc;
-                line-height: 1.15;
-                background: linear-gradient(90deg, #4a7d52 0%, #e3c845 100%);
-                border-radius: 14px;
-                padding: 0.75rem 1rem;
-                margin-bottom: 0.25rem;
+            .market-panel {
+                border-left: 5px solid #2563eb;
+            }
+            .market-section-title {
+                font-size: 1.1rem;
+                font-weight: 700;
+                color: #0f172a;
+                margin: 0.35rem 0 0.6rem 0;
+                padding-bottom: 0.4rem;
+                border-bottom: 1px solid #e5e7eb;
+            }
+            .info-card {
+                border: 1px solid #e5e7eb;
+                border-radius: 10px;
+                padding: 0.65rem 0.75rem;
+                margin-bottom: 0.5rem;
+                background: #fafafa;
+            }
+            .info-source {
+                color: #4b5563;
+                font-size: 0.8rem;
+                font-weight: 600;
+                text-transform: uppercase;
+            }
+            .info-headline {
+                margin-top: 0.2rem;
+                font-weight: 700;
+                color: #111827;
+            }
+            .info-headline a {
+                color: #1d4ed8;
+                text-decoration: none;
+            }
+            .info-headline a:hover {
+                text-decoration: underline;
+            }
+            .info-impact {
+                color: #4b5563;
+                margin-top: 0.2rem;
+                font-size: 0.88rem;
             }
             .market-card {
-                border: 1px solid rgba(148, 163, 184, 0.20);
-                border-radius: 16px;
-                padding: 0.8rem 1rem;
-                margin-bottom: 0.55rem;
-                background: rgba(255, 255, 255, 0.95);
+                border: 1px solid #e5e7eb;
+                border-radius: 10px;
+                padding: 0.65rem 0.75rem;
+                margin-bottom: 0.45rem;
+                background: #ffffff;
             }
-            .market-card.trend-up {
-                border-left: 5px solid rgba(132, 204, 22, 0.85);
-            }
-            .market-card.trend-down {
-                border-left: 5px solid rgba(248, 113, 113, 0.85);
-            }
-            .market-title { color: #1f2937; font-weight: 800; font-size: 1.05rem; }
-            .market-price { color: #111827; font-size: 1.95rem; font-weight: 800; margin-top: 0.15rem; line-height: 1.1; }
-            .market-delta { color: #6b7280; margin-top: 0.15rem; font-size: 0.92rem; font-weight: 600; }
+            .market-card.trend-up { border-left: 4px solid #16a34a; }
+            .market-card.trend-down { border-left: 4px solid #dc2626; }
+            .market-title { color: #1f2937; font-weight: 700; font-size: 0.95rem; }
+            .market-price { color: #111827; font-size: 1.25rem; font-weight: 700; margin-top: 0.1rem; line-height: 1.2; }
+            .market-delta { color: #6b7280; margin-top: 0.1rem; font-size: 0.86rem; font-weight: 600; }
         </style>
         """,
         unsafe_allow_html=True,
@@ -893,18 +939,18 @@ def inject_login_modern_theme() -> None:
 def render_login_view(auth_service: AuthService) -> None:
     inject_login_modern_theme()
     st.markdown('<div class="hero-panel">', unsafe_allow_html=True)
-    st.image("assets/boq_bid_studio_logo.svg", use_container_width=False, width=520)
+    st.image("assets/boq_bid_studio_logo.svg", use_container_width=False, width=460)
     st.markdown("</div>", unsafe_allow_html=True)
 
     st.markdown(
         """
         <div class="intro-panel">
-            <div class="intro-text">Jedna aplikace pro mapování, porovnání nabídek a vizualizace nabídek.</div>
+            <div class="intro-text"><strong>BoQ Bid Studio</strong> — Komplexní aplikace pro porovnání nabídek.</div>
         </div>
         """,
         unsafe_allow_html=True,
     )
-    left_col, right_col = st.columns([1, 2], gap="large")
+    left_col, right_col = st.columns([2, 3], gap="medium")
 
     with left_col:
         st.markdown('<div class="login-panel">', unsafe_allow_html=True)
