@@ -858,19 +858,13 @@ def inject_login_modern_theme() -> None:
             .stApp {
                 background: #f5f7fa;
             }
-            .hero-panel, .intro-panel, .login-panel, .market-panel {
+            .intro-panel, .login-panel, .market-panel {
                 border-radius: 12px;
                 padding: 1.15rem 1.2rem;
                 border: 1px solid #d9dee8;
                 background: #ffffff;
                 box-shadow: 0 2px 10px rgba(15, 23, 42, 0.05);
                 margin-bottom: 0.9rem;
-            }
-            .hero-logo {
-                max-width: 460px;
-                width: 100%;
-                height: auto;
-                display: block;
             }
             .intro-text {
                 color: #374151;
@@ -938,10 +932,6 @@ def inject_login_modern_theme() -> None:
 
 def render_login_view(auth_service: AuthService) -> None:
     inject_login_modern_theme()
-    st.markdown('<div class="hero-panel">', unsafe_allow_html=True)
-    st.image("assets/boq_bid_studio_logo.svg", use_container_width=False, width=460)
-    st.markdown("</div>", unsafe_allow_html=True)
-
     st.markdown(
         """
         <div class="intro-panel">
