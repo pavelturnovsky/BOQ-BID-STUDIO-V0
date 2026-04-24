@@ -886,11 +886,11 @@ def inject_login_modern_theme() -> None:
             .stApp {
                 background: #f5f7fa;
             }
-            .auth-panels-wrap {
+            .st-key-auth_panels_wrap {
                 margin-top: 0.25rem;
                 margin-bottom: 0.5rem;
             }
-            .intro-panel, .login-panel, .market-panel {
+            .intro-panel {
                 border-radius: 12px;
                 padding: 1.15rem 1.2rem;
                 border: 1px solid #d9dee8;
@@ -898,14 +898,14 @@ def inject_login_modern_theme() -> None:
                 box-shadow: 0 2px 10px rgba(15, 23, 42, 0.05);
                 margin-bottom: 0.9rem;
             }
-            .login-panel, .market-panel {
+            .st-key-auth_panels_wrap [data-testid="column"] > [data-testid="stVerticalBlock"] {
                 border-radius: 16px;
                 border: 1px solid #cfd8e3;
                 padding: 1.35rem 1.4rem;
                 box-shadow: 0 10px 26px rgba(15, 23, 42, 0.10);
                 background: linear-gradient(180deg, #ffffff 0%, #f8fafc 100%);
             }
-            .login-panel {
+            .st-key-auth_panels_wrap [data-testid="column"]:first-child > [data-testid="stVerticalBlock"] {
                 border-top: 4px solid #2563eb;
             }
             .intro-title {
@@ -921,7 +921,7 @@ def inject_login_modern_theme() -> None:
                 margin: 0;
                 margin-top: 0.2rem;
             }
-            .market-panel {
+            .st-key-auth_panels_wrap [data-testid="column"]:nth-child(2) > [data-testid="stVerticalBlock"] {
                 border-left: 5px solid #2563eb;
             }
             .market-section-title {
@@ -972,7 +972,7 @@ def inject_login_modern_theme() -> None:
                 background: #ffffff;
                 box-shadow: 0 1px 4px rgba(15, 23, 42, 0.04);
             }
-            .login-panel .stButton > button {
+            .st-key-auth_panels_wrap [data-testid="column"]:first-child .stButton > button {
                 width: 100%;
                 border-radius: 10px;
             }
@@ -999,11 +999,10 @@ def render_login_view(auth_service: AuthService) -> None:
         """,
         unsafe_allow_html=True,
     )
-    st.markdown('<div class="auth-panels-wrap">', unsafe_allow_html=True)
-    left_col, right_col = st.columns([2, 3], gap="medium")
+    panels_wrap = st.container(key="auth_panels_wrap")
+    left_col, right_col = panels_wrap.columns([2, 3], gap="medium")
 
     with left_col:
-        st.markdown('<div class="login-panel">', unsafe_allow_html=True)
         st.header("Přihlášení do aplikace")
         st.caption("Pro přístup ke svým projektům se prosím přihlaste.")
         username = st.text_input("Uživatelské jméno nebo e-mail", key="login_username")
@@ -1035,13 +1034,9 @@ def render_login_view(auth_service: AuthService) -> None:
             args=("forgot",),
             key="goto_forgot",
         )
-        st.markdown("</div>", unsafe_allow_html=True)
 
     with right_col:
-        st.markdown('<div class="market-panel">', unsafe_allow_html=True)
         render_login_market_and_news_panel()
-        st.markdown("</div>", unsafe_allow_html=True)
-    st.markdown("</div>", unsafe_allow_html=True)
 
 
 def render_register_view(auth_service: AuthService) -> None:
