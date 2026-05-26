@@ -1,4 +1,5 @@
 
+import base64
 import hashlib
 from collections import Counter
 from difflib import SequenceMatcher
@@ -60,11 +61,12 @@ st.set_page_config(page_title="BoQ Bid Studio", layout="wide")
 
 
 
-def get_inline_svg_data_uri(path: Union[str, Path]) -> str:
-    """Return SVG file content as a data URI for inline HTML rendering."""
+def get_inline_image_data_uri(path: Union[str, Path], mime_type: str = "image/png") -> str:
+    """Return image file content as a base64 data URI for inline HTML rendering."""
 
-    svg_text = Path(path).read_text(encoding="utf-8")
-    return f"data:image/svg+xml;utf8,{quote_plus(svg_text)}"
+    image_bytes = Path(path).read_bytes()
+    encoded = base64.b64encode(image_bytes).decode("ascii")
+    return f"data:{mime_type};base64,{encoded}"
 
 
 def trigger_rerun() -> None:
@@ -993,8 +995,9 @@ def inject_login_modern_theme() -> None:
             .market-summary-title { color: #334155; font-size: 0.82rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.02em; }
             .market-price { color: #111827; font-size: 1.25rem; font-weight: 700; margin-top: 0.1rem; line-height: 1.2; }
             .market-delta { color: #6b7280; margin-top: 0.1rem; font-size: 0.86rem; font-weight: 600; }
-            .intro-brand-row {
+            .intro-brand-stack {
                 display: flex;
+                flex-direction: column;
                 align-items: center;
                 justify-content: center;
                 gap: 0.45rem;
@@ -1018,7 +1021,7 @@ def inject_login_modern_theme() -> None:
                 border: 1px solid #dbe2ef;
             }
             .intro-logo-wrap img {
-                height: clamp(2.1rem, 4.5vw, 2.9rem);
+                height: clamp(2.2rem, 5vw, 3rem);
                 width: auto;
                 display: block;
             }
@@ -1030,14 +1033,13 @@ def inject_login_modern_theme() -> None:
 
 def render_login_view(auth_service: AuthService) -> None:
     inject_login_modern_theme()
-    logo_uri = get_inline_svg_data_uri("assets/boq_logo.svg")
+    logo_uri = get_inline_image_data_uri("assets/boq_logo_p.png")
     st.markdown(
         f"""
         <div class="intro-panel">
-            <div class="intro-brand-row">
-                <span class="intro-brand-text">Bo</span>
+            <div class="intro-brand-stack">
                 <span class="intro-logo-wrap"><img src="{logo_uri}" alt="BoQ logo" /></span>
-                <span class="intro-brand-text">Q Bid Studio</span>
+                <span class="intro-brand-text">BOQ Bid Studio</span>
             </div>
             <div class="intro-subtitle">Komplexní aplikace pro porovnání nabídek.</div>
         </div>
