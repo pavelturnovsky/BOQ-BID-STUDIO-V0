@@ -1001,6 +1001,7 @@ def render_login_view(auth_service: AuthService) -> None:
         """,
         unsafe_allow_html=True,
     )
+    st.image("assets/boq_bid_studio_logo.svg", width=180)
     panels_wrap = st.container(key="auth_panels_wrap")
     left_col, right_col = panels_wrap.columns([2, 3], gap="medium")
 
