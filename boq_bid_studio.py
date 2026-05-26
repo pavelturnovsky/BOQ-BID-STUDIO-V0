@@ -906,9 +906,13 @@ def inject_login_modern_theme() -> None:
                 border: 1px solid #d9dee8;
                 background: #ffffff;
                 box-shadow: 0 2px 10px rgba(15, 23, 42, 0.05);
-                margin: 0 auto 0.9rem auto;
-                max-width: 860px;
+                margin: 0 0 0.9rem 0;
+                width: 100vw;
+                max-width: 100vw;
+                margin-left: calc(50% - 50vw);
+                margin-right: calc(50% - 50vw);
                 text-align: center;
+                box-sizing: border-box;
             }
             .st-key-auth_panels_wrap [data-testid="column"] > [data-testid="stVerticalBlock"] {
                 border-radius: 16px;
