@@ -1,0 +1,100 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-labelledby="title desc">
+  <title id="title">BOQ Bid Studio logo</title>
+  <desc id="desc">Stylized lime and green capital letter B logo.</desc>
+
+  <defs>
+    <linearGradient id="mainGradient" x1="120" y1="80" x2="390" y2="430" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#f4ff00"/>
+      <stop offset="0.48" stop-color="#dfff00"/>
+      <stop offset="0.56" stop-color="#8ee326"/>
+      <stop offset="1" stop-color="#078d31"/>
+    </linearGradient>
+
+    <linearGradient id="edgeGradient" x1="80" y1="60" x2="430" y2="460" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#ffff6a"/>
+      <stop offset="0.45" stop-color="#e7ff2a"/>
+      <stop offset="1" stop-color="#006f2a"/>
+    </linearGradient>
+
+    <linearGradient id="shadowGradient" x1="210" y1="160" x2="410" y2="430" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#86a600"/>
+      <stop offset="1" stop-color="#00591f"/>
+    </linearGradient>
+  </defs>
+
+  <path
+    d="M118 78 H316
+       C392 78 440 123 440 190
+       C440 236 415 267 380 282
+       C424 294 456 332 456 384
+       C456 452 405 486 326 486
+       H78
+       L112 442
+       V110
+       Z
+       M206 152 V244 H304
+       C343 244 365 226 365 198
+       C365 170 343 152 304 152
+       Z
+       M206 314 V414 H318
+       C358 414 382 394 382 364
+       C382 334 358 314 318 314
+       Z"
+    fill="url(#mainGradient)"
+    stroke="#bfff18"
+    stroke-width="14"
+    stroke-linejoin="round"
+    fill-rule="evenodd"/>
+
+  <path
+    d="M380 282
+       C424 294 456 332 456 384
+       C456 452 405 486 326 486
+       H78
+       L102 454
+       H318
+       C380 454 421 427 421 381
+       C421 338 389 309 342 304
+       Z"
+    fill="url(#shadowGradient)"
+    opacity="0.42"/>
+
+  <path d="M118 78 L166 110 V442 L78 486 L112 442 V110 Z"
+        fill="#d7ff00" opacity="0.72"/>
+  <path d="M118 78 L166 110 H304 C343 110 388 130 414 164 C394 112 360 78 316 78 Z"
+        fill="#fbff32" opacity="0.75"/>
+  <path d="M166 278 H383 C371 291 356 301 342 304 H166 Z"
+        fill="#f5ff35" opacity="0.62"/>
+
+  <path d="M206 152 H304 C343 152 365 170 365 198 C365 226 343 244 304 244 H206 Z"
+        fill="none"
+        stroke="#567300"
+        stroke-width="14"
+        stroke-linejoin="round"
+        opacity="0.72"/>
+  <path d="M206 314 H318 C358 314 382 334 382 364 C382 394 358 414 318 414 H206 Z"
+        fill="none"
+        stroke="#005b24"
+        stroke-width="14"
+        stroke-linejoin="round"
+        opacity="0.75"/>
+
+  <path d="M126 94 H316 C378 94 422 130 424 188"
+        fill="none"
+        stroke="#ffff83"
+        stroke-width="8"
+        stroke-linecap="round"
+        opacity="0.9"/>
+  <path d="M129 462 H322 C376 462 426 438 430 387"
+        fill="none"
+        stroke="#9bea25"
+        stroke-width="7"
+        stroke-linecap="round"
+        opacity="0.7"/>
+  <path d="M132 102 V430"
+        fill="none"
+        stroke="#ffff7a"
+        stroke-width="8"
+        stroke-linecap="round"
+        opacity="0.75"/>
+</svg>
