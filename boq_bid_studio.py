@@ -984,6 +984,20 @@ def inject_login_modern_theme() -> None:
             .market-summary-title { color: #334155; font-size: 0.82rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.02em; }
             .market-price { color: #111827; font-size: 1.25rem; font-weight: 700; margin-top: 0.1rem; line-height: 1.2; }
             .market-delta { color: #6b7280; margin-top: 0.1rem; font-size: 0.86rem; font-weight: 600; }
+            .intro-brand-row {
+                display: flex;
+                align-items: center;
+                gap: 0.9rem;
+            }
+            .intro-logo-wrap {
+                background: #ffffff;
+                border-radius: 10px;
+                padding: 0.35rem;
+                display: inline-flex;
+                align-items: center;
+                justify-content: center;
+                box-shadow: 0 1px 4px rgba(15, 23, 42, 0.08);
+            }
         </style>
         """,
         unsafe_allow_html=True,
@@ -992,16 +1006,29 @@ def inject_login_modern_theme() -> None:
 
 def render_login_view(auth_service: AuthService) -> None:
     inject_login_modern_theme()
-    st.markdown(
-        """
-        <div class="intro-panel">
-            <div class="intro-title">BoQ Bid Studio</div>
-            <div class="intro-subtitle">Komplexní aplikace pro porovnání nabídek.</div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-    st.image("assets/boq_bid_studio_logo.svg", width=180)
+    logo_candidates = [
+        "assets/boq_bid_studio_logo_new.png",
+        "assets/boq_bid_studio_logo_new.svg",
+        "assets/boq_bid_studio_logo.svg",
+    ]
+    logo_path = next((path for path in logo_candidates if os.path.exists(path)), logo_candidates[-1])
+
+    brand_left_col, brand_right_col = st.columns([1, 7], gap="small")
+    with brand_left_col:
+        st.markdown('<div class="intro-logo-wrap">', unsafe_allow_html=True)
+        st.image(logo_path, width=90)
+        st.markdown('</div>', unsafe_allow_html=True)
+
+    with brand_right_col:
+        st.markdown(
+            """
+            <div class="intro-panel">
+                <div class="intro-title">BoQ Bid Studio</div>
+                <div class="intro-subtitle">Komplexní aplikace pro porovnání nabídek.</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
     panels_wrap = st.container(key="auth_panels_wrap")
     left_col, right_col = panels_wrap.columns([2, 3], gap="medium")
 
