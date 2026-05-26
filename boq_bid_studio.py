@@ -781,6 +781,12 @@ def render_login_market_and_news_panel() -> None:
 
     snapshot_date = date.today()
     market_df, rates = build_login_market_snapshot(snapshot_date=snapshot_date, history_days=365)
+    st.markdown(
+        """
+        <div class="login-panel-main-title">Přehled cen komodit</div>
+        """,
+        unsafe_allow_html=True,
+    )
     trend_period = st.radio(
         "Vývoj cen",
         options=("Posledních 12 měsíců", "Poslední měsíc"),
@@ -789,13 +795,6 @@ def render_login_market_and_news_panel() -> None:
         key="login_market_trend_period",
     )
     trend_days = 365 if trend_period == "Posledních 12 měsíců" else 30
-
-    st.markdown(
-        """
-        <div class="market-section-title">Přehled cen komodit</div>
-        """,
-        unsafe_allow_html=True,
-    )
     st.caption(
         f"Aktualizace {snapshot_date.strftime('%d.%m.%Y')} • 1 EUR = {1 / rates['rates']['EUR']:.4f} CZK • 1 USD = {1 / rates['rates']['USD']:.4f} CZK"
     )
@@ -937,6 +936,13 @@ def inject_login_modern_theme() -> None:
             .st-key-auth_panels_wrap [data-testid="column"]:nth-child(2) > [data-testid="stVerticalBlock"] {
                 border-left: 5px solid #2563eb;
             }
+            .login-panel-main-title {
+                color: #111827;
+                font-size: 2rem;
+                font-weight: 600;
+                line-height: 1.25;
+                margin: 0 0 0.35rem 0;
+            }
             .market-section-title {
                 font-size: 1.28rem;
                 font-weight: 700;
@@ -1021,7 +1027,7 @@ def inject_login_modern_theme() -> None:
                 border: 1px solid #dbe2ef;
             }
             .intro-logo-wrap img {
-                height: clamp(2.2rem, 5vw, 3rem);
+                height: clamp(4.4rem, 10vw, 6rem);
                 width: auto;
                 display: block;
             }
