@@ -1056,7 +1056,7 @@ def render_login_view(auth_service: AuthService) -> None:
     left_col, right_col = panels_wrap.columns([2, 3], gap="medium")
 
     with left_col:
-        st.header("Přihlášení do aplikace")
+        st.markdown('<div class="login-panel-main-title">Přihlášení do aplikace</div>', unsafe_allow_html=True)
         st.caption("Pro přístup ke svým projektům se prosím přihlaste.")
         username = st.text_input("Uživatelské jméno nebo e-mail", key="login_username")
         password = st.text_input("Heslo", type="password", key="login_password")
