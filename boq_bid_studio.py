@@ -892,11 +892,13 @@ def inject_login_modern_theme() -> None:
             }
             .intro-panel {
                 border-radius: 12px;
-                padding: 1.15rem 1.2rem;
+                padding: 1.35rem 1.2rem;
                 border: 1px solid #d9dee8;
                 background: #ffffff;
                 box-shadow: 0 2px 10px rgba(15, 23, 42, 0.05);
-                margin-bottom: 0.9rem;
+                margin: 0 auto 0.9rem auto;
+                max-width: 860px;
+                text-align: center;
             }
             .st-key-auth_panels_wrap [data-testid="column"] > [data-testid="stVerticalBlock"] {
                 border-radius: 16px;
@@ -910,9 +912,9 @@ def inject_login_modern_theme() -> None:
             }
             .intro-title {
                 color: #111827;
-                font-size: 1.85rem;
+                font-size: clamp(2.4rem, 5vw, 3.4rem);
                 font-weight: 800;
-                line-height: 1.15;
+                line-height: 1.1;
                 margin: 0;
             }
             .intro-subtitle {
