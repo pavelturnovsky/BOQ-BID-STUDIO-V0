@@ -58,6 +58,15 @@ st.set_page_config(page_title="BoQ Bid Studio", layout="wide")
 # ------------- Helpers -------------
 
 
+
+
+def get_inline_svg_data_uri(path: Union[str, Path]) -> str:
+    """Return SVG file content as a data URI for inline HTML rendering."""
+
+    svg_text = Path(path).read_text(encoding="utf-8")
+    return f"data:image/svg+xml;utf8,{quote_plus(svg_text)}"
+
+
 def trigger_rerun() -> None:
     """Trigger a Streamlit rerun with backwards compatibility."""
 
@@ -987,16 +996,31 @@ def inject_login_modern_theme() -> None:
             .intro-brand-row {
                 display: flex;
                 align-items: center;
-                gap: 0.9rem;
+                justify-content: center;
+                gap: 0.45rem;
+                margin: 0;
+            }
+            .intro-brand-text {
+                color: #111827;
+                font-size: clamp(2.4rem, 5vw, 3.4rem);
+                font-weight: 800;
+                line-height: 1.05;
+                letter-spacing: 0.01em;
             }
             .intro-logo-wrap {
                 background: #ffffff;
                 border-radius: 10px;
-                padding: 0.35rem;
+                padding: 0.2rem 0.28rem;
                 display: inline-flex;
                 align-items: center;
                 justify-content: center;
                 box-shadow: 0 1px 4px rgba(15, 23, 42, 0.08);
+                border: 1px solid #dbe2ef;
+            }
+            .intro-logo-wrap img {
+                height: clamp(2.1rem, 4.5vw, 2.9rem);
+                width: auto;
+                display: block;
             }
         </style>
         """,
@@ -1006,10 +1030,15 @@ def inject_login_modern_theme() -> None:
 
 def render_login_view(auth_service: AuthService) -> None:
     inject_login_modern_theme()
+    logo_uri = get_inline_svg_data_uri("assets/boq_logo.svg")
     st.markdown(
-        """
+        f"""
         <div class="intro-panel">
-            <div class="intro-title">BoQ Bid Studio</div>
+            <div class="intro-brand-row">
+                <span class="intro-brand-text">Bo</span>
+                <span class="intro-logo-wrap"><img src="{logo_uri}" alt="BoQ logo" /></span>
+                <span class="intro-brand-text">Q Bid Studio</span>
+            </div>
             <div class="intro-subtitle">Komplexní aplikace pro porovnání nabídek.</div>
         </div>
         """,
