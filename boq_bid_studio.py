@@ -1006,29 +1006,15 @@ def inject_login_modern_theme() -> None:
 
 def render_login_view(auth_service: AuthService) -> None:
     inject_login_modern_theme()
-    logo_candidates = [
-        "assets/boq_bid_studio_logo_new.png",
-        "assets/boq_bid_studio_logo_new.svg",
-        "assets/boq_bid_studio_logo.svg",
-    ]
-    logo_path = next((path for path in logo_candidates if os.path.exists(path)), logo_candidates[-1])
-
-    brand_left_col, brand_right_col = st.columns([1, 7], gap="small")
-    with brand_left_col:
-        st.markdown('<div class="intro-logo-wrap">', unsafe_allow_html=True)
-        st.image(logo_path, width=90)
-        st.markdown('</div>', unsafe_allow_html=True)
-
-    with brand_right_col:
-        st.markdown(
-            """
-            <div class="intro-panel">
-                <div class="intro-title">BoQ Bid Studio</div>
-                <div class="intro-subtitle">Komplexní aplikace pro porovnání nabídek.</div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
+    st.markdown(
+        """
+        <div class="intro-panel">
+            <div class="intro-title">BoQ Bid Studio</div>
+            <div class="intro-subtitle">Komplexní aplikace pro porovnání nabídek.</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
     panels_wrap = st.container(key="auth_panels_wrap")
     left_col, right_col = panels_wrap.columns([2, 3], gap="medium")
 
