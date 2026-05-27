@@ -899,8 +899,17 @@ def inject_login_modern_theme() -> None:
             header[data-testid="stHeader"] {
                 display: none;
             }
+            [data-testid="stAppViewContainer"] {
+                background: #f5f7fa;
+            }
+            [data-testid="stAppViewContainer"] > .main,
+            [data-testid="stAppViewContainer"] > .main > div {
+                padding-top: 0 !important;
+                margin-top: 0 !important;
+            }
             .block-container {
                 padding-top: 0 !important;
+                margin-top: 0 !important;
             }
             .st-key-auth_panels_wrap {
                 margin-top: 0.25rem;
@@ -913,6 +922,7 @@ def inject_login_modern_theme() -> None:
                 background: #ffffff;
                 box-shadow: 0 2px 10px rgba(15, 23, 42, 0.05);
                 margin: 0 0 0.9rem 0;
+                margin-top: 0 !important;
                 width: 100vw;
                 max-width: 100vw;
                 margin-left: calc(50% - 50vw);
