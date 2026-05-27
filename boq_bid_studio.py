@@ -896,6 +896,12 @@ def inject_login_modern_theme() -> None:
             .stApp {
                 background: #f5f7fa;
             }
+            header[data-testid="stHeader"] {
+                display: none;
+            }
+            .block-container {
+                padding-top: 0 !important;
+            }
             .st-key-auth_panels_wrap {
                 margin-top: 0.25rem;
                 margin-bottom: 0.5rem;
