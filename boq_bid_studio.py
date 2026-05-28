@@ -1198,6 +1198,41 @@ def render_must_change_password_view(auth_service: AuthService, user: User) -> N
             st.error(str(exc))
 
 
+
+
+def render_persistent_app_logo() -> None:
+    """Render a persistent app logo in the top-right white content area."""
+
+    logo_uri = get_inline_image_data_uri("assets/boq_logo_p.png")
+    st.markdown(
+        f"""
+        <style>
+        .app-persistent-logo {{
+            position: fixed;
+            top: 0.9rem;
+            right: 1.6rem;
+            z-index: 1000;
+            background: rgba(255, 255, 255, 0.92);
+            border-radius: 10px;
+            padding: 0.2rem 0.45rem;
+            box-shadow: 0 2px 10px rgba(15, 23, 42, 0.12);
+            line-height: 0;
+            pointer-events: none;
+        }}
+
+        .app-persistent-logo img {{
+            display: block;
+            width: 132px;
+            height: auto;
+        }}
+        </style>
+        <div class="app-persistent-logo">
+            <img src="{logo_uri}" alt="BoQ logo" />
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
 def render_account_section(auth_service: AuthService, user: User) -> None:
     with st.sidebar.expander("Můj účet", expanded=False):
         st.caption(f"Přihlášen: {user.full_name or user.username}")
@@ -10263,6 +10298,8 @@ if current_user.must_change_password:
     set_auth_view("must_change_password")
     render_auth_router(auth_service)
     st.stop()
+
+render_persistent_app_logo()
 
 render_account_section(auth_service, current_user)
 st.sidebar.markdown(f"**Přihlášen:** {current_user.full_name or current_user.username}")
