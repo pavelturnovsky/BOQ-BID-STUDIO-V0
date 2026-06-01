@@ -1201,7 +1201,7 @@ def render_must_change_password_view(auth_service: AuthService, user: User) -> N
 
 
 def render_persistent_app_logo() -> None:
-    """Render a persistent app logo in the top-right white content area."""
+    """Render a persistent app logo in the top-left white content area."""
 
     logo_uri = get_inline_image_data_uri("assets/boq_logo_p.png")
     st.markdown(
@@ -1210,7 +1210,7 @@ def render_persistent_app_logo() -> None:
         .app-persistent-logo {{
             position: fixed;
             top: 0.9rem;
-            right: 1.6rem;
+            left: 1.6rem;
             z-index: 1000;
             background: rgba(255, 255, 255, 0.92);
             border-radius: 10px;
@@ -1222,7 +1222,7 @@ def render_persistent_app_logo() -> None:
 
         .app-persistent-logo img {{
             display: block;
-            width: 132px;
+            width: 66px;
             height: auto;
         }}
         </style>
