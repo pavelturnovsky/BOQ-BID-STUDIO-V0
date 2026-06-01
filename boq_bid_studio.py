@@ -1200,6 +1200,31 @@ def render_must_change_password_view(auth_service: AuthService, user: User) -> N
 
 
 
+APP_COPYRIGHT_NOTICE = "© 2026 Pavel Turnovsky. Všechna práva vyhrazena."
+
+
+def render_app_footer() -> None:
+    """Render the shared application copyright footer."""
+
+    st.markdown(
+        f"""
+        <style>
+        .app-copyright-footer {{
+            margin-top: 2.5rem;
+            padding: 0.85rem 0 0.25rem 0;
+            border-top: 1px solid #e5e7eb;
+            color: #6b7280;
+            font-size: 0.82rem;
+            line-height: 1.4;
+            text-align: center;
+        }}
+        </style>
+        <div class="app-copyright-footer">{APP_COPYRIGHT_NOTICE}</div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
 def render_persistent_app_logo() -> None:
     """Render a persistent app logo in the top-left white content area."""
 
@@ -1400,6 +1425,7 @@ def render_auth_router(auth_service: AuthService) -> None:
     else:
         set_auth_view("login")
         render_login_view(auth_service)
+    render_app_footer()
 
 RECAP_CATEGORY_CONFIG = [
     {
@@ -10582,6 +10608,7 @@ if comparison_mode == "Porovnání nabídek bez Master BoQ":
         round_id=round_selection,
         prefill_round_inputs=prefill_round_inputs,
     )
+    render_app_footer()
     st.stop()
 
 stored_master_entries = offer_storage.list_master()
@@ -16533,5 +16560,4 @@ with tab_rounds_v2:
                                 use_container_width=True,
                             )
 
-st.markdown("---")
-st.caption("© 2025 BoQ Bid Studio — MVP. Doporučení: používat jednotné Item ID pro precizní párování.")
+render_app_footer()
