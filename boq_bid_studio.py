@@ -85,6 +85,24 @@ def trigger_rerun() -> None:
     raise AttributeError("Streamlit rerun function is not available")
 
 
+def dataframe_map_cells(df: pd.DataFrame, func: Any) -> pd.DataFrame:
+    """Apply a scalar function to every dataframe cell across pandas versions."""
+
+    mapper = getattr(df, "map", None)
+    if callable(mapper):
+        return mapper(func)
+    return df.apply(lambda column: column.map(func))
+
+
+def styler_map_cells(styler: Any, func: Any, *, subset: Optional[Sequence[str]] = None) -> Any:
+    """Apply a scalar style function across pandas Styler API versions."""
+
+    mapper = getattr(styler, "map", None)
+    if callable(mapper):
+        return mapper(func, subset=subset)
+    return styler.applymap(func, subset=subset)
+
+
 def build_comparison_fingerprint(
     master_file: Optional[Any],
     bid_files: Sequence[Any],
@@ -5226,7 +5244,7 @@ def try_autodetect_mapping(df: pd.DataFrame) -> Tuple[Dict[str, int], int, pd.Da
     """Autodetect header mapping using a sampled, vectorized search."""
     # probe size grows with the dataframe but is capped to keep things fast
     nprobe = min(len(df), 200)
-    sample = df.head(nprobe).astype(str).applymap(normalize_col)
+    sample = dataframe_map_cells(df.head(nprobe).astype(str), normalize_col)
 
     hint_patterns: Dict[str, Dict[str, List[str]]] = {}
     for key, hints in HEADER_HINTS.items():
@@ -6283,10 +6301,7 @@ def show_df(df: pd.DataFrame) -> None:
 
     df_to_show = df.copy()
     df_to_show.attrs = {}
-    try:
-        df_to_show = df_to_show.applymap(_normalize_cell)
-    except Exception:
-        df_to_show = df_to_show.applymap(lambda x: _normalize_cell(x))
+    df_to_show = dataframe_map_cells(df_to_show, _normalize_cell)
 
     helper_cols = [col for col in df_to_show.columns if str(col).startswith("__present__")]
     presence_map: Dict[str, pd.Series] = {}
@@ -12810,7 +12825,7 @@ with tab_compare:
                                             return str(value)
                                         return value
 
-                                    return sanitized.applymap(_sanitize_value)
+                                    return dataframe_map_cells(sanitized, _sanitize_value)
 
                                 def _format_pct(value: Any) -> str:
                                     if pd.isna(value):
@@ -12906,9 +12921,9 @@ with tab_compare:
                                         display_for_style = sanitized_display.copy()
                                         styled_display = display_for_style.style
                                         if diff_columns:
-                                            styled_display = styled_display.applymap(_style_diff, subset=diff_columns)
+                                            styled_display = styler_map_cells(styled_display, _style_diff, subset=diff_columns)
                                         if pct_columns:
-                                            styled_display = styled_display.applymap(_style_pct, subset=pct_columns)
+                                            styled_display = styler_map_cells(styled_display, _style_pct, subset=pct_columns)
 
                                         st.markdown("#### Kompletní přehled")
                                         st.dataframe(
@@ -12926,9 +12941,9 @@ with tab_compare:
                                             differences_for_style = differences_sanitized.copy()
                                             differences_styled = differences_for_style.style
                                             if diff_columns:
-                                                differences_styled = differences_styled.applymap(_style_diff, subset=diff_columns)
+                                                differences_styled = styler_map_cells(differences_styled, _style_diff, subset=diff_columns)
                                             if pct_columns:
-                                                differences_styled = differences_styled.applymap(_style_pct, subset=pct_columns)
+                                                differences_styled = styler_map_cells(differences_styled, _style_pct, subset=pct_columns)
                                             st.dataframe(
                                                 differences_styled,
                                                 use_container_width=True,
