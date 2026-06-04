@@ -1,3 +1,4 @@
+import importlib.util
 import io
 import os
 import sys
@@ -14,7 +15,7 @@ sys.path.append(str(ROOT))
 from workbook import WorkbookData
 
 # Load only helper functions from boq_bid_studio without running Streamlit app
-module_code = (ROOT / "boq_bid_studio.py").read_text().split("# ------------- Sidebar Inputs -------------")[0]
+module_code = (ROOT / "boq_bid_studio.py").read_text().split("# ------------- Auth & Session -------------")[0]
 module = types.ModuleType("boq_bid_helpers")
 exec(module_code, module.__dict__)
 module.try_autodetect_mapping = module.try_autodetect_mapping.__wrapped__
@@ -25,6 +26,7 @@ compare = module.compare
 validate_totals = module.validate_totals
 overview_comparison = module.overview_comparison
 supplier_only_qa_checks = module.supplier_only_qa_checks
+ARROW_STRING_DTYPE = "string[pyarrow]" if importlib.util.find_spec("pyarrow") else "string"
 
 
 def make_workbook(df: pd.DataFrame) -> io.BytesIO:
@@ -105,6 +107,55 @@ def test_rename_value_columns_adds_percent_diff() -> None:
     assert diff_col in renamed.columns
     value = renamed.loc[0, diff_col]
     assert pytest.approx(value, rel=1e-5) == 20.0
+
+
+
+def test_coerce_numeric_handles_arrow_strings_with_nbsp() -> None:
+    values = pd.Series(
+        [
+            "1 234,56",
+            "1\u00A0234,56",
+            "1.234,56",
+            "1,234.56",
+            "Kč 1 234,56",
+            "",
+            np.nan,
+        ],
+        dtype=ARROW_STRING_DTYPE,
+    )
+
+    result = module.coerce_numeric(values)
+
+    assert result.iloc[:5].tolist() == pytest.approx([1234.56] * 5)
+    assert result.iloc[5:].isna().all()
+
+
+def test_build_normalized_table_handles_arrow_numeric_text() -> None:
+    df = pd.DataFrame(
+        {
+            "code": pd.Series(["A"], dtype=ARROW_STRING_DTYPE),
+            "description": ["Položka"],
+            "item_id": ["ROW-1"],
+            "unit": ["ks"],
+            "quantity": pd.Series(["1\u00A0234,56"], dtype=ARROW_STRING_DTYPE),
+            "quantity_supplier": ["2\u00A0345,67"],
+            "unit_price_material": ["Kč 3\u00A0456,78"],
+            "unit_price_install": ["4 567,89 Kč"],
+            "total_price": ["5.678,90"],
+            "summary_total": ["6,789.01"],
+        }
+    )
+    mapping = {name: idx for idx, name in enumerate(df.columns)}
+
+    table = module.build_normalized_table(df, mapping, preserve_summary_totals=True)
+
+    assert table.loc[0, "quantity"] == pytest.approx(1234.56)
+    assert table.loc[0, "quantity_supplier"] == pytest.approx(2345.67)
+    assert table.loc[0, "unit_price_material"] == pytest.approx(3456.78)
+    assert table.loc[0, "unit_price_install"] == pytest.approx(4567.89)
+    assert table.loc[0, "total_price"] == pytest.approx(5678.90)
+    assert table.loc[0, "summary_total"] == pytest.approx(6789.01)
+
 
 def test_multiple_bid_loading() -> None:
     master_df = pd.DataFrame({

@@ -9,7 +9,7 @@ import pytest
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.append(str(ROOT))
 os.environ["BOQ_BID_TEST_MODE"] = "1"
-MODULE_CODE = (ROOT / "boq_bid_studio.py").read_text().split("# ------------- Sidebar Inputs -------------")[0]
+MODULE_CODE = (ROOT / "boq_bid_studio.py").read_text().split("# ------------- Auth & Session -------------")[0]
 module = types.ModuleType("boq_bid_helpers_storage")
 exec(MODULE_CODE, module.__dict__)
 

@@ -6,7 +6,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.append(str(ROOT))
 module_code = (ROOT / "boq_bid_studio.py").read_text().split(
-    "# ------------- Sidebar Inputs -------------"
+    "# ------------- Auth & Session -------------"
 )[0]
 module = types.ModuleType("boq_bid_helpers")
 module.ENGINE_VERSION = "test"
