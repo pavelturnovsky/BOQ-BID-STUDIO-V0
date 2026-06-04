@@ -5319,9 +5319,17 @@ def coerce_numeric(s: pd.Series) -> pd.Series:
     if s.empty:
         return pd.to_numeric(s, errors="coerce")
 
-    cleaned = s.astype(str)
+    # Some Streamlit Cloud/Pandas combinations keep imported Excel/CSV text in
+    # Arrow-backed string arrays. PyArrow's regex engine does not support every
+    # escape sequence accepted by Python's ``re`` module, so normalizing numeric
+    # text via ``Series.str.replace(..., regex=True)`` can raise
+    # ``pyarrow.lib.ArrowInvalid`` before conversion. Force an object-backed
+    # Series of regular Python strings first so every cleanup step below uses
+    # Pandas/Python string handling consistently.
+    cleaned = pd.Series(s.to_numpy(dtype=object), index=s.index, dtype="object")
+    cleaned = cleaned.where(cleaned.notna(), "").map(str)
+    cleaned = cleaned.str.replace("\u00A0", "", regex=False)
     cleaned = cleaned.str.replace(r"\s+", "", regex=True)
-    cleaned = cleaned.str.replace(r"\u00A0", "", regex=True)
     cleaned = cleaned.str.replace(r"(?i)(czk|kč|eur|€|usd|\$|gbp|£)", "", regex=True)
     cleaned = cleaned.str.replace(r"[+-]$", "", regex=True)
     cleaned = cleaned.str.replace(r"[^0-9,\.\-+]", "", regex=True)

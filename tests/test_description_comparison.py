@@ -8,7 +8,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.append(str(ROOT))
 MODULE_CODE = (
     ROOT / "boq_bid_studio.py"
-).read_text().split("# ------------- Sidebar Inputs -------------")[0]
+).read_text().split("# ------------- Auth & Session -------------")[0]
 helpers_module = types.ModuleType("description_helpers")
 exec(MODULE_CODE, helpers_module.__dict__)
 

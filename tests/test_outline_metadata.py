@@ -9,7 +9,7 @@ from core.excel_outline import build_outline_nodes
 # Reuse helper module without triggering full Streamlit app
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.append(str(ROOT))
-module_code = (ROOT / "boq_bid_studio.py").read_text().split("# ------------- Sidebar Inputs -------------")[0]
+module_code = (ROOT / "boq_bid_studio.py").read_text().split("# ------------- Auth & Session -------------")[0]
 outline_module = types.ModuleType("outline_helpers")
 exec(module_code, outline_module.__dict__)
 _attach_outline_metadata = outline_module._attach_outline_metadata
