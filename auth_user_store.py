@@ -4,9 +4,8 @@ import json
 from pathlib import Path
 from typing import Iterable, List, Optional
 
+from app_config import DEFAULT_STORAGE_DIR
 from auth_models import PasswordResetToken, User, utc_now_iso
-
-DEFAULT_STORAGE_DIR = Path.home() / ".boq_bid_studio"
 
 
 class AuthUserStore:

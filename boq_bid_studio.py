@@ -30,6 +30,7 @@ import pandas as pd
 import plotly.express as px
 import streamlit as st
 import streamlit.components.v1 as components
+from app_config import DEFAULT_STORAGE_DIR
 from auth_models import User
 from auth_service import AuthService
 from reportlab.lib import colors
@@ -600,7 +601,6 @@ EXCHANGE_RATE_WIDGET_KEYS = {
     "recap": "recap_exchange_rate",
 }
 RESERVED_ALIAS_NAMES = {"Master", "LOWEST"}
-DEFAULT_STORAGE_DIR = Path.home() / ".boq_bid_studio"
 SCHEMA_VERSION = "1.0"
 ENGINE_VERSION = "0.4"
 SESSION_TIMEOUT_SECONDS = 30 * 60
