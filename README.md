@@ -30,3 +30,9 @@ Aplikace podporuje načtení a zobrazení skupin řádků/sloupců (Excel outlin
 * Outline u souborů **.xls** (BIFF) není podporován.
 * Export s outline vytváří nový sešit bez maker (XLSX). Pro soubory XLSM se makra nepřenášejí.
 * Panel Outline je aktuálně dostupný pouze na záložce **🧾 Kontrola dat**.
+
+## Nasazení na Railway
+
+Postup pro nasazení aplikace, persistentní Railway Volume a propojení domény
+`www.boq-studio.cz` spravované u FORPSI je popsán v
+[`docs/railway_deployment.md`](docs/railway_deployment.md).
