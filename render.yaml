@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: boq-bid-studio
+    runtime: python
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: streamlit run boq_bid_studio.py --server.address 0.0.0.0 --server.port $PORT --server.headless true
+    healthCheckPath: /
+    envVars:
+      - key: BOQ_STORAGE_DIR
+        value: /var/data/boq_bid_studio
+      - key: PYTHON_VERSION
+        value: 3.11.9
+    disk:
+      name: boq-bid-studio-data
+      mountPath: /var/data
+      sizeGB: 1

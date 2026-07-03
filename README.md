@@ -31,6 +31,12 @@ Aplikace podporuje načtení a zobrazení skupin řádků/sloupců (Excel outlin
 * Export s outline vytváří nový sešit bez maker (XLSX). Pro soubory XLSM se makra nepřenášejí.
 * Panel Outline je aktuálně dostupný pouze na záložce **🧾 Kontrola dat**.
 
+## Nasazení na Render
+
+Postup pro nasazení aplikace na Render přes Blueprint, nastavení proměnné
+`BOQ_STORAGE_DIR` a připojení persistentního disku je popsán v
+[`docs/render_deployment.md`](docs/render_deployment.md).
+
 ## Nasazení na Railway
 
 Postup pro nasazení aplikace, persistentní Railway Volume a propojení domény
